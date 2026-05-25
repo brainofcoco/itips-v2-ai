@@ -67,6 +67,34 @@ def register_dashboard(
     def dashboard_assets(filename: str):  # noqa: ANN202
         return send_from_directory(_STATIC_ROOT, filename)
 
+    # JSON-only error responses for /api/* — otherwise Flask's default
+    # 404/500 HTML pages crash `res.json()` in the dashboard JS with
+    # `Unexpected token '<', "<!doctype "...`. Other paths keep their
+    # default HTML behaviour so static assets and the dashboard itself
+    # still render normally.
+    @app.errorhandler(404)
+    def _api_404(err):  # noqa: ANN202
+        if request.path.startswith("/api/"):
+            return jsonify({"ok": False, "error": "not found",
+                            "path": request.path}), 404
+        return err
+
+    @app.errorhandler(405)
+    def _api_405(err):  # noqa: ANN202
+        if request.path.startswith("/api/"):
+            return jsonify({"ok": False, "error": "method not allowed",
+                            "method": request.method,
+                            "path": request.path}), 405
+        return err
+
+    @app.errorhandler(500)
+    def _api_500(err):  # noqa: ANN202
+        if request.path.startswith("/api/"):
+            return jsonify({"ok": False, "error": "server error",
+                            "path": request.path,
+                            "message": str(err)}), 500
+        return err
+
     @app.get("/streams")
     def streams_index():  # noqa: ANN202
         """Stand-alone camera-wall page — just live feeds, no dashboard chrome."""
@@ -211,16 +239,28 @@ def register_dashboard(
 
     @app.get("/api/workers")
     def list_workers():  # noqa: ANN202
+        # Pull the Jetson EmbeddingStore once so each worker row can
+        # carry a `jetson_enrolled` flag. Operators reading the table
+        # need to see "Sam is on the Jetson" separately from "Sam is on
+        # camera N" — those are different fallback paths.
+        jetson_ids: set[str] = set()
+        if face_engine is not None:
+            try:
+                jetson_ids = {r.person_id for r in face_engine._store.list_all()}  # noqa: SLF001
+            except Exception:
+                logger.exception("face_engine store read failed")
         return jsonify({
             "workers": [
                 {
                     "person_id": rec.person_id,
                     "full_name": rec.full_name,
                     "cameras": rec.per_camera,
+                    "jetson_enrolled": rec.person_id in jetson_ids,
                 }
                 for rec in personnel_store.list_all()
             ],
             "available_cameras": dahua_manager.camera_ids(),
+            "jetson_available": face_engine is not None,
         })
 
     @app.get("/api/workers/<int:camera_id>")
@@ -512,6 +552,192 @@ def register_dashboard(
             "plate_engine_ready": plate_ready,
             "behavior_engine_ready": behavior_ready,
             "cameras": capability_router.summary(),
+            "overrides": capability_router.overrides(),
+        })
+
+    @app.post("/api/health/capabilities/<int:camera_id>/<cap>/override")
+    def set_capability_override(camera_id: int, cap: str):  # noqa: ANN202
+        """Force the fallback (or pin to native) for a (camera, capability).
+
+        Body: `{"force_fallback": true|false|null}` — `null` clears the
+        override and the router goes back to following the probe.
+        """
+        if capability_router is None:
+            return jsonify({"ok": False, "error": "capability router not wired"}), 503
+        try:
+            from itips.ml.capability_router import Capability
+            cap_enum = Capability(cap)
+        except (ImportError, ValueError):
+            return jsonify({"ok": False, "error": f"unknown capability {cap!r}"}), 400
+        body = request.get_json(silent=True) or {}
+        if "force_fallback" not in body:
+            return jsonify({"ok": False,
+                            "error": "force_fallback (true|false|null) required"}), 400
+        force = body["force_fallback"]
+        if force is not None and not isinstance(force, bool):
+            return jsonify({"ok": False,
+                            "error": "force_fallback must be boolean or null"}), 400
+        capability_router.set_override(camera_id, cap_enum, force)
+        return jsonify({
+            "ok": True,
+            "camera_id": camera_id,
+            "capability": cap,
+            "force_fallback": force,
+            "effective_needs_fallback": capability_router.needs_fallback(camera_id, cap_enum),
+        })
+
+    # ─── ML Lab — direct engine invocation for testing ─────────────
+    # These routes let an operator exercise the FaceEngine / PlateEngine /
+    # BehaviorEngine with an uploaded image and see what they'd produce —
+    # without waiting for a real camera event to fire. When called with
+    # `?dispatch=1`, the result is ALSO routed through the AlertEngine so
+    # the Alerts tab lights up exactly as if a real camera had triggered
+    # the same fallback.
+
+    @app.get("/api/ml/status")
+    def ml_status():  # noqa: ANN202
+        return jsonify({
+            "face":     _engine_status(face_engine),
+            "plate":    _engine_status(plate_engine),
+            "behavior": _engine_status(behavior_engine),
+        })
+
+    @app.post("/api/ml/warmup")
+    def ml_warmup_all():  # noqa: ANN202
+        for eng in (face_engine, plate_engine, behavior_engine):
+            if eng is not None:
+                try:
+                    eng.warmup_async()
+                except Exception:
+                    logger.exception("ml warmup_async failed")
+        return jsonify({
+            "face":     _engine_status(face_engine),
+            "plate":    _engine_status(plate_engine),
+            "behavior": _engine_status(behavior_engine),
+        })
+
+    @app.get("/api/ml/face/enrolled")
+    def ml_face_enrolled():  # noqa: ANN202
+        if face_engine is None:
+            return jsonify({"available": False, "people": []})
+        try:
+            records = face_engine._store.list_all()  # noqa: SLF001
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"available": True, "error": str(exc), "people": []}), 502
+        return jsonify({
+            "available": True,
+            "count": len(records),
+            "people": [
+                {"person_id": r.person_id, "full_name": r.full_name, "dim": r.dim}
+                for r in records
+            ],
+        })
+
+    @app.post("/api/ml/face/recognize")
+    def ml_face_recognize():  # noqa: ANN202
+        if face_engine is None:
+            return jsonify({"ok": False, "error": "face engine not wired"}), 503
+        frame = _decode_upload(request)
+        if frame is None:
+            return jsonify({"ok": False, "error": "no image provided"}), 400
+        try:
+            result = face_engine.recognize(frame, bbox=None)
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"ok": False, "error": exc.__class__.__name__,
+                            "message": str(exc)}), 502
+        dispatched = False
+        if alert_engine is not None and _truthy(request.args.get("dispatch")):
+            camera_id = int(request.form.get("camera_id", 0) or 0)
+            if result.matched and result.person_id:
+                alert_engine.handle_personnel_seen(
+                    camera_id=camera_id,
+                    person_uid=result.person_id,
+                    group_id="jetson-fallback",
+                    name=result.full_name or "",
+                    similarity=int(round(result.similarity * 100)),
+                )
+            else:
+                alert_engine.handle_face_intruder(
+                    camera_id=camera_id, face_bbox=(0, 0, 0, 0), name="INTRUDER",
+                )
+            dispatched = True
+        return jsonify({
+            "ok": True,
+            "engine_ready": face_engine.is_ready(),
+            "matched": result.matched,
+            "person_id": result.person_id,
+            "full_name": result.full_name,
+            "similarity": round(float(result.similarity), 4),
+            "dispatched": dispatched,
+        })
+
+    @app.post("/api/ml/plate/read")
+    def ml_plate_read():  # noqa: ANN202
+        if plate_engine is None:
+            return jsonify({"ok": False, "error": "plate engine not wired"}), 503
+        frame = _decode_upload(request)
+        if frame is None:
+            return jsonify({"ok": False, "error": "no image provided"}), 400
+        try:
+            result = plate_engine.read_plate(frame)
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"ok": False, "error": exc.__class__.__name__,
+                            "message": str(exc)}), 502
+        dispatched = False
+        if result is not None and alert_engine is not None and _truthy(request.args.get("dispatch")):
+            camera_id = int(request.form.get("camera_id", 0) or 0)
+            alert_engine.handle_plate_capture(
+                camera_id=camera_id,
+                plate_number=result.plate_number,
+                plate_color=None, vehicle_color=None, speed=None,
+            )
+            dispatched = True
+        return jsonify({
+            "ok": True,
+            "engine_ready": plate_engine.is_ready(),
+            "found": result is not None,
+            "plate_number": result.plate_number if result else None,
+            "confidence": round(float(result.confidence), 4) if result else None,
+            "bbox": list(result.bbox) if result else None,
+            "raw_text": result.raw_text if result else None,
+            "dispatched": dispatched,
+        })
+
+    @app.post("/api/ml/behavior/<int:camera_id>/analyse")
+    def ml_behavior_analyse(camera_id: int):  # noqa: ANN202
+        if behavior_engine is None:
+            return jsonify({"ok": False, "error": "behavior engine not wired"}), 503
+        frame = _decode_upload(request)
+        if frame is None:
+            return jsonify({"ok": False, "error": "no image provided"}), 400
+        try:
+            analysis = behavior_engine.analyse_full(camera_id, frame)
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"ok": False, "error": exc.__class__.__name__,
+                            "message": str(exc)}), 502
+        dispatched = 0
+        if alert_engine is not None and _truthy(request.args.get("dispatch")):
+            for a in analysis.alerts:
+                alert_engine.handle_behaviour_alert_simple(
+                    camera_id=camera_id,
+                    alert_type=a.alert_type,
+                    details={**a.details,
+                             "zone_id": a.zone_id, "track_id": a.track_id,
+                             "class_name": a.class_name, "bbox": list(a.bbox)},
+                )
+                dispatched += 1
+        zones = zone_store.for_camera(camera_id) if zone_store else []
+        h, w = frame.shape[:2]
+        return jsonify({
+            "ok": True,
+            "engine_ready": behavior_engine.is_ready(),
+            "camera_id": camera_id,
+            "frame_size": [w, h],
+            "zone_count": len(zones),
+            "zones": [_zone_to_dict(z) for z in zones],
+            "detections": [_detection_to_dict(d, w, h) for d in analysis.detections],
+            "alerts": [_behavior_alert_to_dict(a) for a in analysis.alerts],
+            "dispatched": dispatched,
         })
 
     # ─── zone CRUD for the behavioral fallback ─────────────────────
@@ -568,14 +794,22 @@ def register_dashboard(
 
         def gen():
             cursor = 0
+            yield ": connected\n\n"
+            last_send = time.monotonic()
             # Replay the buffer once so a fresh subscriber gets context.
             initial, cursor = event_tap.since(cursor)
             for ev in initial:
                 yield f"data: {json.dumps(ev)}\n\n"
+                last_send = time.monotonic()
             while True:
                 new_items, cursor = event_tap.since(cursor)
-                for ev in new_items:
-                    yield f"data: {json.dumps(ev)}\n\n"
+                if new_items:
+                    for ev in new_items:
+                        yield f"data: {json.dumps(ev)}\n\n"
+                    last_send = time.monotonic()
+                elif (time.monotonic() - last_send) > 15:
+                    yield ": keepalive\n\n"
+                    last_send = time.monotonic()
                 time.sleep(0.4)
 
         return Response(
@@ -623,9 +857,13 @@ def register_dashboard(
             return jsonify({"ok": False, "error": f"unknown event_type {event_type!r}"}), 400
         return jsonify({"ok": True, "event_type": event_type, "camera_id": camera_id})
 
-    @app.post("/api/test/inbound/<endpoint>")
+    @app.post("/api/test/inbound/<path:endpoint>")
     def test_inbound_proxy(endpoint: str):  # noqa: ANN202
         """Forward to the local 8443 inbound API with the configured bearer.
+
+        `<path:endpoint>` rather than the default string converter so
+        URLs with slashes (`personnel/sync`, `maintenance/window`) reach
+        this handler instead of Flask's HTML 404 page.
 
         The Test Console lives on port 5050; the inbound API is on 8443
         with bearer auth. Calling 8443 directly from the browser would
@@ -771,3 +1009,70 @@ def _zone_from_dict(body: dict):
         direction=str(body.get("direction", "Any")),
         metadata=dict(body.get("metadata") or {}),
     )
+
+
+# ─── ML Lab helpers ──────────────────────────────────────────────────
+
+
+def _truthy(v: str | None) -> bool:
+    return (v or "").lower() in {"1", "true", "yes", "on"}
+
+
+def _engine_status(engine) -> dict:
+    if engine is None:
+        return {"wired": False, "ready": False}
+    try:
+        ready = bool(engine.is_ready())
+    except Exception:
+        ready = False
+    return {"wired": True, "ready": ready}
+
+
+def _decode_upload(request) -> "np.ndarray | None":  # type: ignore[name-defined]
+    """Pull a multipart-upload image out of the request, decode to BGR.
+
+    Accepts the file under either `image` (used by the workers form) or
+    `file` (more generic). Returns None when nothing usable was sent —
+    the route turns that into a 400.
+    """
+    f = request.files.get("image") or request.files.get("file")
+    if f is None:
+        return None
+    blob = f.read()
+    if not blob:
+        return None
+    import cv2
+    import numpy as np
+    buf = np.frombuffer(blob, dtype="uint8")
+    frame = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+    return frame
+
+
+def _behavior_alert_to_dict(a) -> dict:
+    return {
+        "alert_type": a.alert_type,
+        "zone_id": a.zone_id,
+        "zone_name": a.zone_name,
+        "track_id": a.track_id,
+        "class_name": a.class_name,
+        "bbox": list(a.bbox),
+        "details": dict(a.details),
+    }
+
+
+def _detection_to_dict(d, frame_w: int, frame_h: int) -> dict:
+    """Surface what YOLO saw, plus the anchor point we use for region
+    containment. Lets the operator confirm at a glance whether the
+    foot point landed inside any zone they've drawn."""
+    x1, y1, x2, y2 = d.bbox
+    ax, ay = (x1 + x2) / 2.0, y2
+    return {
+        "class_name": d.class_name,
+        "confidence": round(float(d.confidence), 4),
+        "bbox": [round(float(v), 1) for v in d.bbox],
+        "anchor_px": [round(ax, 1), round(ay, 1)],
+        "anchor_norm": [
+            round(ax / max(1, frame_w), 4),
+            round(ay / max(1, frame_h), 4),
+        ],
+    }

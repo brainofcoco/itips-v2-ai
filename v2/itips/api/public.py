@@ -149,10 +149,25 @@ class PublicApiServer(threading.Thread):
 
     def _sse_generator(self):
         cursor = 0
+        last_send = time.monotonic()
+        # Initial tick keeps even silent sites from looking dead — the
+        # browser EventSource flips to `open` only after the first byte
+        # arrives. A comment line is ignored by client code but counts
+        # as a successful read so onopen fires immediately.
+        yield ": connected\n\n"
         while True:
             history = self._alert_engine.history()
             new_items = history[cursor:]
             cursor = len(history)
-            for item in new_items:
-                yield f"data: {json.dumps(item)}\n\n"
+            if new_items:
+                for item in new_items:
+                    yield f"data: {json.dumps(item)}\n\n"
+                last_send = time.monotonic()
+            elif (time.monotonic() - last_send) > 15:
+                # Heartbeat — without this, a quiet site lets the
+                # connection idle long enough for browsers / intermediate
+                # proxies to drop it, and the Alerts tab loops on
+                # "Reconnecting".
+                yield ": keepalive\n\n"
+                last_send = time.monotonic()
             time.sleep(0.5)

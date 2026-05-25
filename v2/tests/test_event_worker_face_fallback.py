@@ -160,3 +160,96 @@ def test_no_router_and_no_engine_keeps_baseline_behavior():
     d = _make_dispatcher(face_engine=None, capability_router=None, alert_engine=alert)
     d._handle_face_detection(_make_event(), _frame())
     alert.handle_behaviour_alert_simple.assert_called_once()
+
+
+# ─── FaceRecognition override path ────────────────────────────────────
+
+
+def _fr_event(*, candidates) -> DahuaEvent:
+    """Camera-native FaceRecognition event with a Candidates list."""
+    return DahuaEvent(
+        camera_id=1, code="FaceRecognition", action="Pulse", index=0,
+        data={"Candidates": candidates,
+              "Face": {"BoundingBox": [100, 100, 200, 200]}},
+        jpeg=None,
+    )
+
+
+def test_face_recognition_trusts_camera_candidates_by_default():
+    """No override → camera's Candidates win, Jetson FR not called."""
+    alert = MagicMock()
+    router = CapabilityRouter()
+    router.set_camera(CapabilitySnapshot(
+        camera_id=1, native={Capability.FACE_RECOGNITION: True},
+    ))
+    engine = MagicMock()
+    d = _make_dispatcher(engine, router, alert)
+    d._handle_face_recognition(
+        _fr_event(candidates=[{
+            "Person": {"UID": "cam-uid-7", "GroupID": "g1", "Name": "Alice"},
+            "Similarity": 92,
+        }]),
+        _frame(),
+    )
+    engine.recognize.assert_not_called()
+    alert.handle_personnel_seen.assert_called_once()
+    kw = alert.handle_personnel_seen.call_args.kwargs
+    assert kw["person_uid"] == "cam-uid-7"
+    assert kw["name"] == "Alice"
+    assert kw["group_id"] == "g1"   # camera's group, not "jetson-fallback"
+    assert kw["similarity"] == 92
+
+
+def test_face_recognition_routes_through_jetson_when_override_forces_fallback():
+    """Operator-forced fallback → ignore camera Candidates, run Jetson FR."""
+    alert = MagicMock()
+    router = CapabilityRouter()
+    router.set_camera(CapabilitySnapshot(
+        camera_id=1, native={Capability.FACE_RECOGNITION: True},
+    ))
+    router.set_override(1, Capability.FACE_RECOGNITION, True)
+    engine = MagicMock()
+    engine.recognize.return_value = RecognitionResult(
+        matched=True, person_id="p-99", full_name="Sam",
+        similarity=0.82, embedding=None,
+    )
+    d = _make_dispatcher(engine, router, alert)
+    d._handle_face_recognition(
+        _fr_event(candidates=[{
+            "Person": {"UID": "stale-cam-uid", "GroupID": "g1", "Name": "WrongPerson"},
+            "Similarity": 51,
+        }]),
+        _frame(),
+    )
+    # Jetson decided identity, not the camera.
+    engine.recognize.assert_called_once()
+    alert.handle_personnel_seen.assert_called_once()
+    kw = alert.handle_personnel_seen.call_args.kwargs
+    assert kw["person_uid"] == "p-99"
+    assert kw["name"] == "Sam"
+    assert kw["group_id"] == "jetson-fallback"
+
+
+def test_face_recognition_override_with_no_jetson_match_fires_intruder():
+    """Forced Jetson FR + Jetson says no match → INTRUDER (not the camera's)."""
+    alert = MagicMock()
+    router = CapabilityRouter()
+    router.set_camera(CapabilitySnapshot(
+        camera_id=1, native={Capability.FACE_RECOGNITION: True},
+    ))
+    router.set_override(1, Capability.FACE_RECOGNITION, True)
+    engine = MagicMock()
+    engine.recognize.return_value = RecognitionResult(
+        matched=False, person_id=None, full_name=None,
+        similarity=0.18, embedding=None,
+    )
+    d = _make_dispatcher(engine, router, alert)
+    d._handle_face_recognition(
+        _fr_event(candidates=[{
+            "Person": {"UID": "cam-thinks-known", "GroupID": "g1", "Name": "GhostMatch"},
+            "Similarity": 70,
+        }]),
+        _frame(),
+    )
+    alert.handle_face_intruder.assert_called_once()
+    alert.handle_personnel_seen.assert_not_called()

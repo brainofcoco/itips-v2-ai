@@ -92,6 +92,7 @@ def _build_deps():
     ml_state = _build_ml_layer(
         embedding_db_path=personnel_store_path.parent / "face_embeddings.sqlite",
         zones_path=personnel_store_path.parent / "zones.json",
+        overrides_path=personnel_store_path.parent / "ml_overrides.json",
     )
 
     deps = WorkerDeps(
@@ -149,7 +150,8 @@ class _MlLayerState:
         self.zone_store = None
 
 
-def _build_ml_layer(*, embedding_db_path, zones_path) -> "_MlLayerState":
+def _build_ml_layer(*, embedding_db_path, zones_path,
+                    overrides_path) -> "_MlLayerState":
     """Best-effort ML wiring.
 
     Every individual engine is allowed to fail independently — if
@@ -168,7 +170,7 @@ def _build_ml_layer(*, embedding_db_path, zones_path) -> "_MlLayerState":
         logger.warning("ml package import failed — running with no fallback layer")
         return state
 
-    state.router = CapabilityRouter()
+    state.router = CapabilityRouter(overrides_path=overrides_path)
 
     # Face fallback — InsightFace SCRFD+ArcFace.
     try:

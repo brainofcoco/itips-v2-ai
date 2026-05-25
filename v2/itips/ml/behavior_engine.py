@@ -80,6 +80,24 @@ class BehaviorAlert:
     details: dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass
+class BehaviorAnalysis:
+    """The richer return shape used by `analyse_full()`.
+
+    `analyse()` keeps returning a plain `list[BehaviorAlert]` so the
+    event worker doesn't have to change. The ML Lab route calls
+    `analyse_full()` so the dashboard can surface what YOLO actually
+    saw — critical when zones are set up correctly but no alert
+    fires, because the operator needs to know if YOLO missed the
+    person, if the person was outside every zone, or if the wrong
+    camera was selected.
+    """
+
+    alerts: list[BehaviorAlert]
+    detections: list[Detection]
+    tracks: list[TrackedObject]
+
+
 class BehaviorEngine:
     """Detect → track → evaluate zones → emit synthetic IVS alerts."""
 
@@ -118,38 +136,58 @@ class BehaviorEngine:
         frame: "np.ndarray",
         ts: Optional[float] = None,
     ) -> list[BehaviorAlert]:
-        ts = float(ts) if ts is not None else time.time()
+        """Production entry point — returns just alerts.
+
+        Skips detection entirely when no zones are configured for the
+        camera (saves the GPU). The event worker calls this from
+        `_handle_motion` once per `VideoMotion` event.
+        """
         zones = self._zones.for_camera(camera_id)
         if not zones:
-            # Nothing to evaluate — skip detection entirely to save GPU.
             return []
+        return self.analyse_full(camera_id, frame, ts=ts).alerts
+
+    def analyse_full(
+        self,
+        camera_id: int,
+        frame: "np.ndarray",
+        ts: Optional[float] = None,
+    ) -> BehaviorAnalysis:
+        """Same pipeline as `analyse()` but returns detections + tracks too.
+
+        Unlike `analyse()`, this DOES run the detector even when there
+        are no zones — so the ML Lab can show an operator "YOLO saw a
+        person here" even before any zones are drawn. That tells them
+        whether the gap is in the detector, the zone placement, or the
+        capability router.
+        """
+        ts = float(ts) if ts is not None else time.time()
+        zones = self._zones.for_camera(camera_id)
 
         detections = self._detector.detect(frame)
         if not detections:
-            return []
+            return BehaviorAnalysis(alerts=[], detections=[], tracks=[])
 
         h, w = frame.shape[:2]
         tracks = self._tracker.update(camera_id, detections, ts)
 
         alerts: list[BehaviorAlert] = []
-        for trk in tracks:
-            # Tracks that didn't get a fresh detection on this frame
-            # shouldn't trigger — they're stale carry-overs the tracker
-            # keeps around for one or two more updates in case of a
-            # brief miss.
-            if abs(trk.last_seen_ts - ts) > 1e-3:
-                continue
-            for zone in zones:
-                if zone.zone_type == ZONE_TYPE_REGION:
-                    alerts.extend(self._evaluate_region(camera_id, trk, zone, ts, w, h))
-                elif zone.zone_type == ZONE_TYPE_LINE:
-                    alerts.extend(self._evaluate_line(trk, zone, w, h))
+        if zones:
+            for trk in tracks:
+                # Tracks that didn't get a fresh detection on this
+                # frame shouldn't trigger — they're stale carry-overs
+                # the tracker keeps around for one or two updates in
+                # case of a brief miss.
+                if abs(trk.last_seen_ts - ts) > 1e-3:
+                    continue
+                for zone in zones:
+                    if zone.zone_type == ZONE_TYPE_REGION:
+                        alerts.extend(self._evaluate_region(camera_id, trk, zone, ts, w, h))
+                    elif zone.zone_type == ZONE_TYPE_LINE:
+                        alerts.extend(self._evaluate_line(trk, zone, w, h))
+            self._gc_dwell(camera_id, alive_tracks=tracks)
 
-        # Stale dwell entries (track left the zone or the tracker
-        # dropped it) need cleanup so we re-fire loitering if the same
-        # person comes back later.
-        self._gc_dwell(camera_id, alive_tracks=tracks)
-        return alerts
+        return BehaviorAnalysis(alerts=alerts, detections=detections, tracks=tracks)
 
     # ─── region zones: intrusion + loitering ──────────────────────────
 
@@ -162,10 +200,16 @@ class BehaviorEngine:
         w: int,
         h: int,
     ) -> list[BehaviorAlert]:
-        # Convert track centroid (in pixels) to the zone's normalised
-        # coord space.
-        cx, cy = trk.centroid
-        nx, ny = cx / max(1, w), cy / max(1, h)
+        # Anchor at the bbox bottom-center — i.e. where the person's
+        # feet actually stand. Region zones are typically drawn on the
+        # floor an operator sees in the snapshot; the bbox centroid
+        # sits at hip level and floats well above any ground-mounted
+        # polygon, which made every "person inside compound" check
+        # silently miss. Using the foot point matches how operators
+        # think about ground zones.
+        x1, _y1, x2, y2 = trk.bbox
+        ax, ay = (x1 + x2) / 2.0, y2
+        nx, ny = ax / max(1, w), ay / max(1, h)
         inside = point_in_polygon(nx, ny, zone.points)
         if not inside:
             self._clear_dwell(camera_id, trk.track_id, zone.zone_id)

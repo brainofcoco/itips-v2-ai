@@ -63,15 +63,32 @@ RUN pip install --no-cache-dir \
 # Jetson swap: replace this entire RUN with the JetPack-matched
 # `torch`, `torchvision`, and `onnxruntime-gpu` wheels published by
 # NVIDIA for the appropriate L4T release.
+# 2a. CPU-only torch + torchvision from pytorch.org's CPU index.
+#     `--index-url` (not `--extra-index-url`) so pip ignores PyPI for
+#     these two — keeps the resolver from accidentally pulling a
+#     CUDA-bundled wheel. Versions left unpinned so the latest
+#     mutually-compatible aarch64 / x86_64 +cpu pair is picked.
 RUN pip install --no-cache-dir \
-        --extra-index-url https://download.pytorch.org/whl/cpu \
-        "torch==2.4.1+cpu" \
-        "torchvision==0.19.1+cpu" \
- && pip install --no-cache-dir \
+        --index-url https://download.pytorch.org/whl/cpu \
+        torch torchvision
+
+# 2b. The rest of the ML stack from PyPI. `insightface==0.7.3` ships
+#     a source distribution (no aarch64 wheel) so we need a C++ compiler
+#     at install time. We install build-essential, build, then purge in
+#     the same RUN layer so the toolchain doesn't bloat the final image.
+#     ultralytics declares a hard `opencv-python` requirement so it'll
+#     install full opencv on top of our headless build — that's fine,
+#     the libgl1 apt dep above covers what full opencv loads on import.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends build-essential \
+    && pip install --no-cache-dir \
         "insightface==0.7.3" \
         "onnxruntime>=1.16,<2" \
         "easyocr>=1.7,<2" \
-        "ultralytics>=8.2,<9"
+        "ultralytics>=8.2,<9" \
+    && apt-get purge -y build-essential \
+    && apt-get autoremove -y \
+    && rm -rf /var/lib/apt/lists/*
 
 # ─── Layer 3: app code ────────────────────────────────────────────────
 COPY pyproject.toml ./

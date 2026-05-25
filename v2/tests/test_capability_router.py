@@ -97,3 +97,70 @@ def test_refresh_replaces_state():
     })]})
     assert r.get(1) is None
     assert r.get(2) is not None
+
+
+# ─── overrides ───────────────────────────────────────────────────────
+
+
+def test_override_forces_fallback_even_when_probe_says_native():
+    r = CapabilityRouter()
+    r.update_from_health({"cameras": [_camera(4, {
+        "face_recognition_db": "ok",
+        "face_group_channel": "ok",
+    })]})
+    assert r.needs_fallback(4, Capability.FACE_RECOGNITION) is False
+    r.set_override(4, Capability.FACE_RECOGNITION, True)
+    assert r.needs_fallback(4, Capability.FACE_RECOGNITION) is True
+
+
+def test_override_can_pin_to_native_even_when_probe_says_missing():
+    r = CapabilityRouter()
+    r.update_from_health({"cameras": [_camera(1, {
+        "face_recognition_db": "missing",
+        "face_group_channel": "missing",
+    })]})
+    assert r.needs_fallback(1, Capability.FACE_RECOGNITION) is True
+    r.set_override(1, Capability.FACE_RECOGNITION, False)
+    assert r.needs_fallback(1, Capability.FACE_RECOGNITION) is False
+
+
+def test_override_clear_falls_back_to_probe():
+    r = CapabilityRouter()
+    r.update_from_health({"cameras": [_camera(2, {
+        "face_recognition_db": "ok",
+        "face_group_channel": "ok",
+    })]})
+    r.set_override(2, Capability.FACE_RECOGNITION, True)
+    r.set_override(2, Capability.FACE_RECOGNITION, None)  # clear
+    assert r.needs_fallback(2, Capability.FACE_RECOGNITION) is False
+
+
+def test_overrides_persist_to_disk(tmp_path):
+    path = tmp_path / "overrides.json"
+    r1 = CapabilityRouter(overrides_path=path)
+    r1.set_override(4, Capability.FACE_RECOGNITION, True)
+    r1.set_override(7, Capability.ANPR, False)
+    # Fresh instance reads back what was written.
+    r2 = CapabilityRouter(overrides_path=path)
+    assert r2.needs_fallback(4, Capability.FACE_RECOGNITION) is True
+    assert r2.needs_fallback(7, Capability.ANPR) is False
+
+
+def test_overrides_dict_shape_matches_dashboard_expectation():
+    r = CapabilityRouter()
+    r.set_override(4, Capability.FACE_RECOGNITION, True)
+    r.set_override(4, Capability.ANPR, False)
+    out = r.overrides()
+    assert out == {4: {"face_recognition": True, "anpr": False}}
+
+
+def test_summary_reflects_override_for_effective_native_flag():
+    r = CapabilityRouter()
+    r.update_from_health({"cameras": [_camera(4, {
+        "face_recognition_db": "ok",
+        "face_group_channel": "ok",
+    })]})
+    # Native says yes, but operator forces fallback → effective="not native".
+    r.set_override(4, Capability.FACE_RECOGNITION, True)
+    summary = r.summary()
+    assert summary[4]["face_recognition"] is False

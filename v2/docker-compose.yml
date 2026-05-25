@@ -40,9 +40,11 @@ services:
       # Persist ML model caches across restarts. First container start
       # downloads ~500 MB of weights (InsightFace buffalo_l, EasyOCR
       # detector + recognizer, YOLOv8n) into this volume; subsequent
-      # starts are instant. On the Jetson, pre-stage this directory
-      # before `docker compose up` so the container is fully offline.
-      - ./models:/opt/itips/models
+      # starts are instant. Named volume (not a host bind mount) so
+      # Docker initialises the directory with the container user's
+      # uid:gid — a bind mount would clash with the host's owner and
+      # leave the dirs unwritable, forcing repeated re-downloads.
+      - itips-models:/opt/itips/models
     # tmpfs for transient frame copies — keeps SD/NVMe wear down.
     tmpfs:
       - /tmp:size=128m
@@ -67,3 +69,10 @@ services:
     #         - driver: nvidia
     #           count: all
     #           capabilities: [gpu]
+
+volumes:
+  # Named volume — Docker manages perms so the container user (uid 1000)
+  # can write to it. Inspect contents from the host via:
+  #   docker run --rm -v itips_itips-models:/m alpine ls /m
+  # or wipe with: docker volume rm itips_itips-models
+  itips-models:

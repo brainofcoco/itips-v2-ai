@@ -36,8 +36,9 @@
   }
 
   function renderWorker(w) {
-    const cameras = Object.entries(w.cameras || {})
-      .map(([camId, uid]) => `cam${camId}:${uid}`).join(", ") || "no cameras";
+    const cameraEntries = Object.entries(w.cameras || {});
+    const cameras = cameraEntries.map(([camId, uid]) => `cam${camId}:${uid}`).join(", ")
+                    || "no cameras";
     const delBtn = el("button", {}, "Delete");
     delBtn.addEventListener("click", async () => {
       if (!confirm(`Delete worker ${w.full_name} from every camera?`)) return;
@@ -46,10 +47,18 @@
       if (body.ok) await loadWorkers();
       else alert(body.error || "delete failed");
     });
+    const jetsonPill = el("span",
+      { class: w.jetson_enrolled ? "pill pill-ok" : "pill pill-idle" },
+      w.jetson_enrolled ? "jetson ✓" : "jetson ✗");
+    const dahuaPill = el("span",
+      { class: cameraEntries.length ? "pill pill-ok" : "pill pill-idle" },
+      cameraEntries.length ? `dahua ${cameraEntries.length}cam` : "dahua none");
     return el("li", {},
       el("div", { class: "row" },
         el("span", { class: "kind" }, w.full_name),
         el("span", { class: "muted" }, `· ${w.person_id}`),
+        el("span", {}, " "), jetsonPill,
+        el("span", {}, " "), dahuaPill,
         el("span", { class: "ts" }, delBtn),
       ),
       el("pre", {}, cameras),

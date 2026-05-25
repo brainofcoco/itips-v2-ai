@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import warnings
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
@@ -47,6 +48,18 @@ if TYPE_CHECKING:
     import numpy as np
 
 logger = logging.getLogger(__name__)
+
+# InsightFace 0.7.3 uses scikit-image's `SimilarityTransform.estimate`,
+# which scikit-image 0.26 deprecates with a FutureWarning emitted on
+# every face-alignment call. The replacement (`from_estimate`) doesn't
+# exist in the pinned `insightface==0.7.3`, so we can't fix the call
+# upstream without a fork. Silence the one warning class precisely so
+# container logs stay readable; real warnings still surface.
+warnings.filterwarnings(
+    "ignore",
+    message=r".*estimate.*is deprecated since version 0\.26.*",
+    category=FutureWarning,
+)
 
 
 class FaceEngineUnavailable(RuntimeError):
@@ -135,11 +148,21 @@ class FaceEngine:
                     "insightface is not installed. `pip install itips-ai[ml]` "
                     "or disable the face fallback in settings."
                 ) from exc
+            # Honour INSIGHTFACE_HOME if it's set — the library's own
+            # default is `~/.insightface/`, which on Docker lives outside
+            # any volume mount and so re-downloads every container
+            # restart. Setting `root=` here keeps the cache on the NVMe
+            # alongside the other engines' weights.
+            import os
+            root = os.environ.get("INSIGHTFACE_HOME") or None
             logger.info(
-                "FaceEngine: loading buffalo_l (providers=%s det_size=%s)",
-                self._providers, self._det_size,
+                "FaceEngine: loading buffalo_l (providers=%s det_size=%s root=%s)",
+                self._providers, self._det_size, root or "<default>",
             )
-            app = FaceAnalysis(name="buffalo_l", providers=self._providers)
+            kwargs = {"name": "buffalo_l", "providers": self._providers}
+            if root:
+                kwargs["root"] = root
+            app = FaceAnalysis(**kwargs)
             app.prepare(ctx_id=0, det_size=self._det_size)
             self._app = app
             self._ready.set()

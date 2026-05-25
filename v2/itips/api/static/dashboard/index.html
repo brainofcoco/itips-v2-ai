@@ -21,6 +21,7 @@
     <button data-tab="incidents">Incidents</button>
     <button data-tab="health">Health</button>
     <button data-tab="zones">Zones</button>
+    <button data-tab="mllab">ML Lab</button>
     <button data-tab="testing">Test Console</button>
     <a class="tab-link" href="/streams" target="_blank" rel="noopener">Streams ↗</a>
   </nav>
@@ -151,6 +152,86 @@
         <ul id="zone-existing">
           <li class="muted">No zones yet for this camera.</li>
         </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- ML LAB TAB — direct invocation of the Jetson fallback engines -->
+  <section data-tabpanel="mllab" class="panel">
+    <div class="toolbar">
+      <span class="muted">Engine status:</span>
+      <span id="ml-face-pill" class="pill pill-idle">face: —</span>
+      <span id="ml-plate-pill" class="pill pill-idle">plate: —</span>
+      <span id="ml-behavior-pill" class="pill pill-idle">behavior: —</span>
+      <button id="ml-warmup">Warm up all</button>
+      <span class="spacer"></span>
+      <label class="inline">
+        <input type="checkbox" id="ml-dispatch" />
+        Dispatch into AlertEngine (lights up the Alerts tab)
+      </label>
+      <button id="ml-refresh">Refresh</button>
+    </div>
+    <p class="muted">
+      Upload a still and run it against the Jetson-side fallback engines
+      directly — no camera event required. With <em>Dispatch</em> checked,
+      a successful read also fires through the same AlertEngine handlers
+      a real camera event would, so the Alerts tab updates in real time.
+    </p>
+
+    <div class="test-layout">
+      <!-- Face -->
+      <div class="test-col">
+        <h3>Face recognition</h3>
+        <p class="muted">SCRFD detect + ArcFace embed, matched against the Jetson EmbeddingStore.</p>
+        <div class="form-stack">
+          <input id="ml-face-image" type="file" accept="image/jpeg,image/png" />
+          <input id="ml-face-camera" type="number" min="0" value="0" placeholder="camera_id (for dispatch)" />
+          <button id="ml-face-run" class="primary">Recognize face</button>
+        </div>
+        <pre id="ml-face-result" class="muted">No result yet.</pre>
+
+        <h3>Force Jetson FR per camera</h3>
+        <p class="muted">
+          Camera still detects faces and ships the JPEG — but identity
+          gets decided by InsightFace on the Jetson instead of the
+          camera's onboard FaceRecognitionServer. Useful when a camera's
+          face DB is broken, empty, or simply less trustworthy than
+          the operator's enrolment.
+        </p>
+        <ul id="ml-face-overrides" class="alerts"></ul>
+
+        <h3>Enrolled on Jetson</h3>
+        <p class="muted">Mirror of the EmbeddingStore — populated by the Workers tab.</p>
+        <ul id="ml-face-enrolled" class="alerts"></ul>
+      </div>
+
+      <!-- Plate -->
+      <div class="test-col">
+        <h3>Plate reader</h3>
+        <p class="muted">EasyOCR detect+read, filtered by a Nigerian-friendly plate pattern.</p>
+        <div class="form-stack">
+          <input id="ml-plate-image" type="file" accept="image/jpeg,image/png" />
+          <input id="ml-plate-camera" type="number" min="0" value="0" placeholder="camera_id (for dispatch)" />
+          <button id="ml-plate-run" class="primary">Read plate</button>
+        </div>
+        <pre id="ml-plate-result" class="muted">No result yet.</pre>
+      </div>
+
+      <!-- Behavior -->
+      <div class="test-col">
+        <h3>Behavior analysis</h3>
+        <p class="muted">
+          YOLOv8 person detection + IoU tracker + your camera's polygon zones.
+          Define zones first in the Zones tab.
+        </p>
+        <div class="form-stack">
+          <label>Camera
+            <select id="ml-behavior-camera"></select>
+          </label>
+          <input id="ml-behavior-image" type="file" accept="image/jpeg,image/png" />
+          <button id="ml-behavior-run" class="primary">Analyse frame</button>
+        </div>
+        <pre id="ml-behavior-result" class="muted">No result yet.</pre>
       </div>
     </div>
   </section>

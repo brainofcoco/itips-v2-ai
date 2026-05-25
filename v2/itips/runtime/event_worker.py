@@ -264,12 +264,29 @@ class DahuaEventDispatcher(threading.Thread):
 
     # ─── per-event handlers ───────────────────────────────────────────
 
-    def _handle_face_recognition(self, event: DahuaEvent, _frame: Optional["np.ndarray"]) -> None:
-        """The discriminator: known worker vs intruder."""
-        candidates = event.data.get("Candidates") or []
+    def _handle_face_recognition(self, event: DahuaEvent, frame: Optional["np.ndarray"]) -> None:
+        """The discriminator: known worker vs intruder.
+
+        Two paths:
+        1. **Trust the camera** (default) — use its `Candidates` list to
+           decide identity. Fast: identity decision happens on-cam.
+        2. **Force Jetson FR** — the operator has flagged this camera's
+           face DB as not trusted (empty group, model variance,
+           per-camera enrolment failed, …). We ignore `Candidates` and
+           re-run InsightFace on the JPEG the camera shipped with the
+           event, so identity becomes the Jetson's decision.
+        """
         face = event.data.get("Face", {}) or {}
         bbox = _face_bbox(face)
 
+        if self._should_fallback_to_face_engine() and frame is not None:
+            # Camera is just acting as the face detector here — the
+            # JPEG it sent with FaceRecognition has the same crop the
+            # native matcher used, so it's a fine input for Jetson FR.
+            if self._dispatch_face_fallback(frame, bbox):
+                return
+
+        candidates = event.data.get("Candidates") or []
         if candidates:
             top = candidates[0]
             person = top.get("Person", {}) if isinstance(top, dict) else {}
