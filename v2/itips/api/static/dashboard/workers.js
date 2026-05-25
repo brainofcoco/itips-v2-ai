@@ -123,10 +123,18 @@
       if (body.ok) {
         const camCount = Object.keys(body.cameras || {}).length;
         const fail = (body.failures || []).join(", ");
+        // Jetson and Dahua are two independent enrollment paths. Either
+        // succeeding is enough — most setups with the FR override
+        // turned on will deliberately have 0 Dahua cameras enrolled.
+        const parts = [];
+        if (body.ml_enrolled) parts.push("Jetson ✓");
+        else if (body.ml_error) parts.push(`Jetson ✗ (${body.ml_error})`);
+        parts.push(`Dahua: ${camCount} camera(s)`);
+        if (fail) parts.push(`Dahua failures: ${fail}`);
+        const overallOk = body.ml_enrolled || camCount > 0;
         setStatus(
-          `Enrolled ${name} on ${camCount} camera(s)` +
-          (fail ? ` · failures: ${fail}` : ""),
-          camCount > 0
+          `Enrolled ${name} — ${parts.join(" · ")}`,
+          overallOk,
         );
         document.getElementById("worker-name").value = "";
         document.getElementById("worker-person-id").value = "";
