@@ -19,7 +19,10 @@
     <button data-tab="plates">Plates</button>
     <button data-tab="alerts">Alerts</button>
     <button data-tab="incidents">Incidents</button>
+    <button data-tab="health">Health</button>
+    <button data-tab="zones">Zones</button>
     <button data-tab="testing">Test Console</button>
+    <a class="tab-link" href="/streams" target="_blank" rel="noopener">Streams ↗</a>
   </nav>
 </header>
 
@@ -90,6 +93,66 @@
       <button id="alerts-clear">Clear</button>
     </div>
     <ul id="alerts-list" class="alerts"></ul>
+  </section>
+
+  <!-- HEALTH TAB — per-camera capability matrix -->
+  <section data-tabpanel="health" class="panel">
+    <div class="toolbar">
+      <button id="health-rerun" class="primary">Re-run health check</button>
+      <span class="muted" id="health-meta">Click to probe every camera now.</span>
+      <span class="spacer"></span>
+      <span class="muted">Legend:</span>
+      <span class="pill pill-ok">✓ ok</span>
+      <span class="pill pill-warn">⚠ unknown</span>
+      <span class="pill pill-err">✗ missing</span>
+    </div>
+    <div id="health-results"></div>
+  </section>
+
+  <!-- ZONES TAB — polygon zones for the BehaviorEngine fallback -->
+  <section data-tabpanel="zones" class="panel">
+    <div class="toolbar">
+      <label>Camera
+        <select id="zone-camera"></select>
+      </label>
+      <label>Type
+        <select id="zone-type">
+          <option value="region">Region (intrusion / loitering)</option>
+          <option value="line">Line (line crossing)</option>
+        </select>
+      </label>
+      <input id="zone-id" placeholder="zone id (e.g. perimeter)" />
+      <input id="zone-name" placeholder="display name (optional)" />
+      <label>Direction
+        <select id="zone-direction" disabled>
+          <option value="Any">Any</option>
+          <option value="LeftToRight">LeftToRight</option>
+          <option value="RightToLeft">RightToLeft</option>
+        </select>
+      </label>
+      <button id="zone-clear">Clear drawing</button>
+      <button id="zone-save" class="primary">Save zone</button>
+      <span class="spacer"></span>
+      <span id="zone-engine-pill" class="pill pill-idle">engine: —</span>
+      <button id="zone-refresh">Refresh</button>
+    </div>
+    <p class="muted" id="zone-status">
+      Click on the snapshot to add points. Region zones need at least 3 points;
+      lines need at least 2. Coords are stored normalised [0,1] so they survive
+      stream resolution changes.
+    </p>
+    <div class="zone-workspace">
+      <div class="canvas-wrap">
+        <canvas id="zone-canvas" width="640" height="360"></canvas>
+        <p class="hint" id="zone-hint">Select a camera to load a snapshot.</p>
+      </div>
+      <div class="zone-list">
+        <h3>Existing zones</h3>
+        <ul id="zone-existing">
+          <li class="muted">No zones yet for this camera.</li>
+        </ul>
+      </div>
+    </div>
   </section>
 
   <!-- TEST CONSOLE TAB -->

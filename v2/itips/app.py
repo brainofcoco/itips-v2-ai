@@ -82,11 +82,27 @@ def _build_deps():
     frame_bus = FrameBus()
     event_tap = EventTap()
 
+    # ─── ML fallback layer ────────────────────────────────────────────
+    # All ML services are optional. CapabilityRouter is always safe to
+    # build (pure-Python). Engines only initialise if the `ml` extras
+    # are installed; if not, calls return immediately and the event
+    # worker degrades to the bare native-only path. In a vanilla v2
+    # deploy with all-native cameras, no model is loaded and no GPU
+    # memory is reserved.
+    ml_state = _build_ml_layer(
+        embedding_db_path=personnel_store_path.parent / "face_embeddings.sqlite",
+        zones_path=personnel_store_path.parent / "zones.json",
+    )
+
     deps = WorkerDeps(
         alert_engine=alert_engine,
         frame_bus=frame_bus,
         recorders=recorders,
         event_tap=event_tap,
+        capability_router=ml_state.router,
+        face_engine=ml_state.face_engine,
+        plate_engine=ml_state.plate_engine,
+        behavior_engine=ml_state.behavior_engine,
     )
 
     public_api = PublicApiServer(
@@ -95,6 +111,11 @@ def _build_deps():
         dahua_manager=dahua_manager,
         personnel_store=personnel_store,
         event_tap=event_tap,
+        capability_router=ml_state.router,
+        face_engine=ml_state.face_engine,
+        plate_engine=ml_state.plate_engine,
+        behavior_engine=ml_state.behavior_engine,
+        zone_store=ml_state.zone_store,
     )
     inbound_api = InboundApiServer(
         dahua_manager=dahua_manager,
@@ -110,4 +131,70 @@ def _build_deps():
         public_api,
         inbound_api,
     ]
+    if ml_state.embedding_store is not None:
+        services.append(ml_state.embedding_store)
     return deps, services
+
+
+class _MlLayerState:
+    """All the optional services `_build_ml_layer` produces."""
+
+    def __init__(self) -> None:
+        self.router = None
+        self.face_engine = None
+        self.embedding_store = None
+        self.plate_engine = None
+        self.behavior_engine = None
+        self.object_detector = None
+        self.zone_store = None
+
+
+def _build_ml_layer(*, embedding_db_path, zones_path) -> "_MlLayerState":
+    """Best-effort ML wiring.
+
+    Every individual engine is allowed to fail independently — if
+    `ultralytics` is installed but `insightface` isn't, the behavior
+    fallback works and the face fallback degrades. Failure here must
+    never break the baseline runtime — log and continue.
+    """
+    logger = logging.getLogger("itips.app.ml")
+    state = _MlLayerState()
+    try:
+        from itips.ml import (
+            BehaviorEngine, CapabilityRouter, EmbeddingStore, FaceEngine,
+            ObjectDetector, PlateEngine, ZoneStore,
+        )
+    except Exception:
+        logger.warning("ml package import failed — running with no fallback layer")
+        return state
+
+    state.router = CapabilityRouter()
+
+    # Face fallback — InsightFace SCRFD+ArcFace.
+    try:
+        state.embedding_store = EmbeddingStore(db_path=embedding_db_path)
+        state.face_engine = FaceEngine(embedding_store=state.embedding_store)
+        state.face_engine.warmup_async()  # lazy; never blocks boot
+    except Exception:
+        logger.exception("face fallback disabled (will degrade to bare bbox)")
+
+    # ANPR fallback — EasyOCR.
+    try:
+        state.plate_engine = PlateEngine()
+        state.plate_engine.warmup_async()
+    except Exception:
+        logger.exception("plate fallback disabled (will degrade to log-only)")
+
+    # Behavior fallback — YOLOv8 + IoU tracker + zone polygons.
+    try:
+        state.zone_store = ZoneStore(path=zones_path)
+        state.object_detector = ObjectDetector()
+        state.behavior_engine = BehaviorEngine(
+            zone_store=state.zone_store,
+            object_detector=state.object_detector,
+        )
+        state.behavior_engine.warmup_async()
+    except Exception:
+        logger.exception("behavior fallback disabled (will degrade to motion-only)")
+
+    return state

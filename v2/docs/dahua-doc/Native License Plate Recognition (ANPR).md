@@ -1,5 +1,5 @@
 # Dahua Traffic ANPR Measurement API Documentation
-What it replaces: Deploying and licensing the Plate Recognizer or OpenALPR software on the Jetson. How Dahua does it: The camera can natively read plates, run OCR, and compare them against an internal database of authorized fleet vehicles.
+What it replaces: Deploying and licensing the Plate Recognizer or OpenALPR software on the Jetson. How Dahua does it: The camera can natively read plates, run OCR, and compare them against an internal database of authorized fleet vehicles
 
 [Event] Traffic ANPR Measurement: Page 739 (Section 10.1.8)
 Insert Traffic BlockList/AllowList Record: Page 751 (Section 10.3.1)

@@ -97,11 +97,20 @@ class DahuaPlateDB:
         r.raise_for_status()
 
     def list(self, *, list_type: str, limit: int = 200) -> list[PlateRecord]:
+        """Return rows in `list_type`. Raises `PlateListUnsupported` if the
+        camera doesn't carry ANPR tables (e.g. a face-only WizMind model).
+        """
         _ensure_list_type(list_type)
         params = {"action": "find", "name": list_type, "count": limit}
         r = self._endpoint.get(
             "/cgi-bin/recordFinder.cgi", params=params, timeout=self._timeout
         )
+        if r.status_code in (400, 404):
+            # Camera doesn't expose this table — common on face/IVS-only
+            # WizMind models. Caller distinguishes this from a network error.
+            raise PlateListUnsupported(
+                f"{list_type} not available on this camera (HTTP {r.status_code})"
+            )
         r.raise_for_status()
         return _parse_records(r.text, list_type)
 
@@ -122,6 +131,14 @@ class DahuaPlateDB:
 
 class DahuaPlateDBError(RuntimeError):
     """Protocol-level failure."""
+
+
+class PlateListUnsupported(RuntimeError):
+    """The camera doesn't carry the requested traffic table.
+
+    Distinct from a network or auth failure — operators see a clean
+    "ANPR not enabled" instead of a 502-style error.
+    """
 
 
 # ─── helpers ──────────────────────────────────────────────────────────

@@ -12,7 +12,14 @@
 # Storage:
 #   - ./var/            → /opt/itips/var/            (intake.sqlite, logs, personnel.sqlite)
 #   - ./evidence_store/ → /opt/itips/evidence_store/ (signed incident packages)
+#   - ./models/         → /opt/itips/models/         (InsightFace / EasyOCR / YOLO / torch caches)
 #   The dirs are created on first `up`. Inspect them on the host.
+#
+# Memory:
+#   mem_limit is sized for the ML fallback layer loaded into CPU RAM
+#   (Mac dev). On the Jetson, models live in GPU memory so the host
+#   side stays lower — but the limit applies to the container's RSS
+#   so leave it generous.
 
 services:
   itips:
@@ -30,13 +37,33 @@ services:
     volumes:
       - ./var:/opt/itips/var
       - ./evidence_store:/opt/itips/evidence_store
+      # Persist ML model caches across restarts. First container start
+      # downloads ~500 MB of weights (InsightFace buffalo_l, EasyOCR
+      # detector + recognizer, YOLOv8n) into this volume; subsequent
+      # starts are instant. On the Jetson, pre-stage this directory
+      # before `docker compose up` so the container is fully offline.
+      - ./models:/opt/itips/models
     # tmpfs for transient frame copies — keeps SD/NVMe wear down.
     tmpfs:
       - /tmp:size=128m
-    mem_limit: 1g
+    mem_limit: 4g
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:5050/health"]
       interval: 30s
       timeout: 5s
       start_period: 10s
       retries: 3
+    # ─── Jetson GPU access ───────────────────────────────────────────
+    # Uncomment on the Jetson so the ML engines actually use CUDA.
+    # Requires the NVIDIA Container Toolkit (preinstalled on JetPack)
+    # and that the base image and the torch / onnxruntime wheels were
+    # swapped to JetPack-matched builds in the Dockerfile.
+    #
+    # runtime: nvidia
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]

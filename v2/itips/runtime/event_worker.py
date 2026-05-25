@@ -71,11 +71,27 @@ class WorkerDeps:
         frame_bus: FrameBus,
         recorders: Optional[dict[int, Any]] = None,
         event_tap: Optional[Any] = None,
+        capability_router: Optional[Any] = None,
+        face_engine: Optional[Any] = None,
+        plate_engine: Optional[Any] = None,
+        behavior_engine: Optional[Any] = None,
     ) -> None:
         self.alert_engine = alert_engine
         self.frame_bus = frame_bus
         self.recorders = recorders or {}
         self.event_tap = event_tap
+        # ML fallback wiring — all `None` in the baseline build.
+        # Per capability:
+        #   face_engine     → augments _handle_face_detection
+        #   plate_engine    → augments _handle_vehicle_gate + _handle_motion
+        #   behavior_engine → augments _handle_motion (intrusion/loiter/line)
+        # `capability_router` is the shared gate: an engine is only
+        # consulted when the router says the camera lacks the native
+        # path for that capability.
+        self.capability_router = capability_router
+        self.face_engine = face_engine
+        self.plate_engine = plate_engine
+        self.behavior_engine = behavior_engine
 
 
 class DahuaEventDispatcher(threading.Thread):
@@ -98,6 +114,16 @@ class DahuaEventDispatcher(threading.Thread):
         self._stop = threading.Event()
         self._queue: queue.Queue[DahuaEvent] = queue.Queue(maxsize=32)
         self._last_processed: dict[str, float] = {}
+        # When the ANPR fallback fires from VideoMotion we debounce
+        # per-camera so a wind-blown tree can't keep the GPU busy.
+        # CarDrivingInOut ignores this cooldown — it's a strong signal.
+        self._plate_fallback_cooldown_s = 10.0
+        self._plate_fallback_last_run: float = 0.0
+        # The behavior fallback is heavier (YOLO + tracker + zones)
+        # but needs to run more often than ANPR — loitering only
+        # makes sense if we sample the scene every few seconds.
+        self._behavior_fallback_cooldown_s = 2.0
+        self._behavior_fallback_last_run: float = 0.0
 
         self._endpoint = DahuaCameraEndpoint.from_rtsp_url(rtsp_url)
         if self._endpoint is None:
@@ -269,15 +295,96 @@ class DahuaEventDispatcher(threading.Thread):
         )
         logger.info("cam %d FaceRecognition INTRUDER (no candidates)", self.camera_id)
 
-    def _handle_face_detection(self, event: DahuaEvent, _frame: Optional["np.ndarray"]) -> None:
-        """Bare face detect — only emit if we're NOT also doing FaceRecognition."""
+    def _handle_face_detection(self, event: DahuaEvent, frame: Optional["np.ndarray"]) -> None:
+        """Bare face detect.
+
+        Two paths:
+        1. **Camera does native FR.** We let the camera's own
+           FaceRecognition event handle identity — here we just log the
+           bare bbox so the dashboard sees activity.
+        2. **Camera does NOT do native FR.** The capability router
+           tells us, the Jetson FaceEngine runs ArcFace on the camera's
+           own snapshot, and we promote to the same alert handler the
+           native FaceRecognition path uses.
+        """
         face = event.data.get("Face", {}) or {}
         bbox = _face_bbox(face)
+
+        if self._should_fallback_to_face_engine() and frame is not None:
+            if self._dispatch_face_fallback(frame, bbox):
+                return  # promoted to personnel_seen / face_intruder
+
         self.deps.alert_engine.handle_behaviour_alert_simple(
             camera_id=self.camera_id,
             alert_type="face_detected",
             details={"bbox": list(bbox)},
         )
+
+    def _should_fallback_to_face_engine(self) -> bool:
+        if self.deps.face_engine is None or self.deps.capability_router is None:
+            return False
+        try:
+            # Imported here so the v2 baseline (no ml extras) doesn't
+            # pay for the import. The router itself doesn't depend on
+            # insightface, only the engine does.
+            from itips.ml.capability_router import Capability
+        except Exception:
+            return False
+        return self.deps.capability_router.needs_fallback(
+            self.camera_id, Capability.FACE_RECOGNITION,
+        )
+
+    def _dispatch_face_fallback(
+        self,
+        frame: "np.ndarray",
+        bbox: tuple[float, float, float, float],
+    ) -> bool:
+        """Run the Jetson FaceEngine; route the result to AlertEngine.
+
+        Returns `True` if a fallback alert was emitted, `False` if the
+        engine was unavailable / errored and the caller should fall
+        back to the bare bbox path.
+        """
+        try:
+            from itips.ml.face_engine import FaceEngineUnavailable
+        except Exception:
+            return False
+        engine = self.deps.face_engine
+        try:
+            result = engine.recognize(frame, bbox=bbox if bbox != (0, 0, 0, 0) else None)
+        except FaceEngineUnavailable:
+            logger.warning(
+                "cam %d: face engine unavailable — degrading to bare-bbox path",
+                self.camera_id,
+            )
+            return False
+        except Exception:
+            logger.exception("cam %d: face engine crashed", self.camera_id)
+            return False
+
+        if result.matched and result.person_id:
+            self.deps.alert_engine.handle_personnel_seen(
+                camera_id=self.camera_id,
+                person_uid=result.person_id,
+                group_id="jetson-fallback",
+                name=result.full_name or "",
+                similarity=int(round(result.similarity * 100)),
+            )
+            logger.info(
+                "cam %d face fallback MATCH person_id=%s sim=%.2f",
+                self.camera_id, result.person_id, result.similarity,
+            )
+        else:
+            self.deps.alert_engine.handle_face_intruder(
+                camera_id=self.camera_id,
+                face_bbox=bbox,
+                name="INTRUDER",
+            )
+            logger.info(
+                "cam %d face fallback NO-MATCH best_sim=%.2f",
+                self.camera_id, result.similarity,
+            )
+        return True
 
     def _handle_perimeter_breach(self, event: DahuaEvent, _frame: Optional["np.ndarray"]) -> None:
         direction = event.data.get("Direction", "")
@@ -322,13 +429,18 @@ class DahuaEventDispatcher(threading.Thread):
             speed=traffic.get("Speed") if isinstance(traffic, dict) else None,
         )
 
-    def _handle_vehicle_gate(self, event: DahuaEvent, _frame: Optional["np.ndarray"]) -> None:
+    def _handle_vehicle_gate(self, event: DahuaEvent, frame: Optional["np.ndarray"]) -> None:
         direction = event.data.get("DrivingDirection")
         self.deps.alert_engine.handle_behaviour_alert_simple(
             camera_id=self.camera_id,
             alert_type="vehicle_gate",
             details={"direction": "enter" if direction == 1 else "leave" if direction == 2 else "unknown"},
         )
+        # Strong signal — vehicle just crossed the gate sensor. If
+        # the camera lacks native ANPR, run our own OCR now. No
+        # cooldown: CarDrivingInOut is itself debounced by the camera.
+        if self._should_fallback_to_plate_engine() and frame is not None:
+            self._dispatch_plate_fallback(frame, force=True)
 
     def _handle_fire(self, event: DahuaEvent, _frame: Optional["np.ndarray"]) -> None:
         if event.data.get("MisReport"):
@@ -354,7 +466,7 @@ class DahuaEventDispatcher(threading.Thread):
             details={"alarm_type": event.data.get("AlarmType", 0)},
         )
 
-    def _handle_motion(self, event: DahuaEvent, _frame: Optional["np.ndarray"]) -> None:
+    def _handle_motion(self, event: DahuaEvent, frame: Optional["np.ndarray"]) -> None:
         # Lowest priority — log only. Useful when the camera fires this in
         # lieu of CrossLineDetection (older firmwares).
         self.deps.alert_engine.handle_behaviour_alert_simple(
@@ -362,9 +474,152 @@ class DahuaEventDispatcher(threading.Thread):
             alert_type="motion",
             details={},
         )
+        # Weak signal — VideoMotion fires for any movement (people,
+        # trees, light shifts). Run ANPR fallback only when the camera
+        # lacks native ANPR AND we haven't tried recently. The plate
+        # filter rejects non-plate text so the worst-case cost is one
+        # OCR pass every 10 s per camera.
+        if self._should_fallback_to_plate_engine() and frame is not None:
+            self._dispatch_plate_fallback(frame, force=False)
+        # Behavior fallback — sample the scene every ~2 s when the
+        # camera has no IVS rules and an operator has drawn zones.
+        # Inside the engine, zero zones = early return, so this is
+        # cheap on cameras nobody's configured zones for yet.
+        if self._should_fallback_to_behavior_engine() and frame is not None:
+            self._dispatch_behavior_fallback(frame)
 
     def _handle_unknown(self, event: DahuaEvent, _frame: Optional["np.ndarray"]) -> None:
         logger.debug("cam %d: ignoring %s/%s", self.camera_id, event.code, event.action)
+
+    # ─── ANPR fallback ────────────────────────────────────────────────
+
+    def _should_fallback_to_plate_engine(self) -> bool:
+        if self.deps.plate_engine is None or self.deps.capability_router is None:
+            return False
+        try:
+            from itips.ml.capability_router import Capability
+        except Exception:
+            return False
+        return self.deps.capability_router.needs_fallback(
+            self.camera_id, Capability.ANPR,
+        )
+
+    def _dispatch_plate_fallback(
+        self,
+        frame: "np.ndarray",
+        *,
+        force: bool,
+    ) -> bool:
+        """Run the Jetson PlateEngine; route a read into the alert engine.
+
+        `force=True` ignores the per-camera cooldown (used from the
+        strong CarDrivingInOut signal). `force=False` enforces the
+        cooldown (used from VideoMotion, which fires constantly).
+        Returns `True` if a plate was read and an alert was emitted.
+        """
+        now = time.monotonic()
+        if not force:
+            if (now - self._plate_fallback_last_run) < self._plate_fallback_cooldown_s:
+                return False
+        self._plate_fallback_last_run = now
+
+        try:
+            from itips.ml.plate_engine import PlateEngineUnavailable
+        except Exception:
+            return False
+        engine = self.deps.plate_engine
+        try:
+            result = engine.read_plate(frame)
+        except PlateEngineUnavailable:
+            logger.warning(
+                "cam %d: plate engine unavailable — degrading to log-only",
+                self.camera_id,
+            )
+            return False
+        except Exception:
+            logger.exception("cam %d: plate engine crashed", self.camera_id)
+            return False
+
+        if result is None:
+            logger.debug("cam %d: plate fallback found no plate-like text",
+                         self.camera_id)
+            return False
+
+        self.deps.alert_engine.handle_plate_capture(
+            camera_id=self.camera_id,
+            plate_number=result.plate_number,
+            plate_color=None,
+            vehicle_color=None,
+            speed=None,
+        )
+        logger.info(
+            "cam %d plate fallback READ plate=%s conf=%.2f",
+            self.camera_id, result.plate_number, result.confidence,
+        )
+        return True
+
+    # ─── behavior fallback ────────────────────────────────────────────
+
+    def _should_fallback_to_behavior_engine(self) -> bool:
+        if self.deps.behavior_engine is None or self.deps.capability_router is None:
+            return False
+        try:
+            from itips.ml.capability_router import Capability
+        except Exception:
+            return False
+        return self.deps.capability_router.needs_fallback(
+            self.camera_id, Capability.IVS_RULES,
+        )
+
+    def _dispatch_behavior_fallback(self, frame: "np.ndarray") -> bool:
+        """Run the BehaviorEngine; route synthesised IVS alerts.
+
+        Returns `True` if at least one synthetic alert was emitted.
+        Crash-isolated like the other fallbacks: any engine error
+        leaves the existing motion log path intact.
+        """
+        now = time.monotonic()
+        if (now - self._behavior_fallback_last_run) < self._behavior_fallback_cooldown_s:
+            return False
+        self._behavior_fallback_last_run = now
+
+        try:
+            from itips.ml.behavior_engine import BehaviorEngineUnavailable
+        except Exception:
+            return False
+        engine = self.deps.behavior_engine
+        try:
+            alerts = engine.analyse(self.camera_id, frame)
+        except BehaviorEngineUnavailable:
+            logger.warning(
+                "cam %d: behavior engine unavailable — degrading to motion-only",
+                self.camera_id,
+            )
+            return False
+        except Exception:
+            logger.exception("cam %d: behavior engine crashed", self.camera_id)
+            return False
+
+        if not alerts:
+            return False
+        for alert in alerts:
+            self.deps.alert_engine.handle_behaviour_alert_simple(
+                camera_id=self.camera_id,
+                alert_type=alert.alert_type,
+                details={
+                    **alert.details,
+                    "zone_id": alert.zone_id,
+                    "track_id": alert.track_id,
+                    "class_name": alert.class_name,
+                    "bbox": list(alert.bbox),
+                },
+            )
+            logger.info(
+                "cam %d behavior fallback %s zone=%s track=%d class=%s",
+                self.camera_id, alert.alert_type, alert.zone_id,
+                alert.track_id, alert.class_name,
+            )
+        return True
 
 
 # Backwards-compatible alias so the orchestrator import path holds.

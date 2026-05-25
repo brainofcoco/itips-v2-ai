@@ -1,4 +1,11 @@
-// Live tab — grid of MJPEG tiles with deterrence buttons per camera.
+// Live tab — MJPEG tiles with lazy connect.
+//
+// Browsers cap parallel connections per host at 6. Every <img src="/video_feed/N">
+// holds one of those slots open until the connection closes — which never
+// happens for MJPEG until we explicitly clear src. So we:
+//   * leave src="" until the Live tab is actually shown,
+//   * clear src when the Live tab is hidden (onHide),
+//   * also tear down when the page is hidden via the Visibility API.
 
 (function () {
   function el(tag, attrs = {}, ...children) {
@@ -11,6 +18,8 @@
     children.forEach((c) => node.appendChild(typeof c === "string" ? document.createTextNode(c) : c));
     return node;
   }
+
+  const tileImgs = [];   // refs so we can attach + clear src in batch
 
   async function fire(cameraId, btn) {
     btn.disabled = true;
@@ -44,9 +53,24 @@
 
   function buildTile(cam) {
     const img = el("img", {
-      src: `/video_feed/${cam.camera_id}`,
+      // Note: src is set in attachStreams(), not here. Empty src = no connection.
       alt: `Camera ${cam.camera_id}`,
+      "data-cam": String(cam.camera_id),
     });
+    // Auto-retry once on a dropped stream. The camera occasionally closes
+    // MJPEG (heavy main-stream load, brief Wi-Fi blip) — without a retry
+    // the tile stays dark forever.
+    let retried = false;
+    img.addEventListener("error", () => {
+      if (retried) return;
+      retried = true;
+      setTimeout(() => {
+        if (window.ITIPS && window.ITIPS.state && window.ITIPS.state.activeTab === "live") {
+          img.src = `/live/${cam.camera_id}?subtype=1&t=${Date.now()}`;
+        }
+      }, 1500);
+    });
+    tileImgs.push(img);
 
     const fireBtn = el("button", { class: "primary" }, "Test deterrence");
     fireBtn.addEventListener("click", () => fire(cam.camera_id, fireBtn));
@@ -73,9 +97,26 @@
     );
   }
 
+  function attachStreams() {
+    const ts = Date.now();
+    tileImgs.forEach((img) => {
+      const camId = img.getAttribute("data-cam");
+      if (!camId) return;
+      // Continuous MJPEG from the camera via /live/{id}. Auto-falls back
+      // from main → substream in the proxy if main isn't MJPEG. Substream
+      // by default keeps bandwidth modest on the dashboard view.
+      img.src = `/live/${camId}?subtype=1&t=${ts}`;
+    });
+  }
+
+  function detachStreams() {
+    tileImgs.forEach((img) => { img.removeAttribute("src"); });
+  }
+
   function render(state) {
     const grid = document.getElementById("camera-grid");
     grid.innerHTML = "";
+    tileImgs.length = 0;
     if (!state.cameras.length) {
       grid.appendChild(el("p", { class: "muted" }, "No cameras configured."));
       return;
@@ -85,6 +126,13 @@
 
   function init(state) {
     render(state);
+    // If the page is hidden mid-session, free the slots.
+    document.addEventListener("visibilitychange", () => {
+      if (document.hidden) detachStreams();
+      else if (window.ITIPS && window.ITIPS.state && window.ITIPS.state.activeTab === "live") {
+        attachStreams();
+      }
+    });
   }
 
   window.ITIPS = window.ITIPS || {};
@@ -94,6 +142,8 @@
       const state = window.ITIPS.state;
       state.cameras = await window.ITIPS.reloadCameras();
       render(state);
+      attachStreams();
     },
+    onHide: () => detachStreams(),
   };
 })();

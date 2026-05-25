@@ -31,6 +31,10 @@ class EventTap:
         self._buf: deque[tuple[int, dict[str, Any]]] = deque(maxlen=capacity)
         self._counter = 0
         self._lock = threading.Lock()
+        # Permanent set (camera_id, code) → last_seen_seq. Separate from
+        # the ring buffer so the health check can answer "has this camera
+        # ever fired FaceRecognition?" even after the event aged out.
+        self._codes_seen: dict[int, dict[str, int]] = {}
 
     def publish(self, *, camera_id: int, code: str, action: str,
                 index: int, data: dict[str, Any], has_jpeg: bool = False) -> None:
@@ -46,6 +50,7 @@ class EventTap:
                 "has_jpeg": has_jpeg,
                 "ts": time.time(),
             }))
+            self._codes_seen.setdefault(camera_id, {})[code] = self._counter
 
     def since(self, cursor: int) -> tuple[list[dict[str, Any]], int]:
         """Return (new_events, next_cursor). `cursor=0` returns everything."""
@@ -61,3 +66,12 @@ class EventTap:
         if limit is not None:
             items = items[-limit:]
         return items
+
+    def codes_seen_by_camera(self) -> dict[int, dict[str, int]]:
+        """For the health check: {camera_id: {event_code: last_seq}}.
+
+        Survives the ring-buffer evicting an old event. Useful for
+        answering "has this camera ever produced this event type?"
+        """
+        with self._lock:
+            return {cam: dict(codes) for cam, codes in self._codes_seen.items()}

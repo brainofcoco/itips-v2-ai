@@ -28,13 +28,21 @@
       wrap.appendChild(el("p", { class: "muted" }, "No cameras."));
       return;
     }
-    for (const [camId, rows] of Object.entries(body.cameras)) {
+    for (const [camId, payload] of Object.entries(body.cameras)) {
       const block = el("div", { class: "camera-block" });
       block.appendChild(el("h4", {}, `Camera ${camId} · ${listType}`));
-      if (!Array.isArray(rows) || !rows.length) {
+      if (payload && payload.supported === false) {
+        block.appendChild(el("p", { class: "muted" },
+          `(${payload.reason || "not available on this camera"})`));
+        wrap.appendChild(block);
+        continue;
+      }
+      const rows = (payload && payload.rows) || [];
+      if (payload && payload.error) {
+        block.appendChild(el("p", { class: "muted" },
+          `(transient error: ${payload.error})`));
+      } else if (!rows.length) {
         block.appendChild(el("p", { class: "muted" }, "(empty)"));
-      } else if (rows[0] && rows[0].error) {
-        block.appendChild(el("p", { class: "muted" }, `(error: ${rows[0].error})`));
       } else {
         const tbl = el("table", { class: "thin-table" });
         tbl.appendChild(el("tr", {},

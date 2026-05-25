@@ -30,6 +30,11 @@ class PublicApiServer(threading.Thread):
         dahua_manager: DahuaManager,
         personnel_store: PersonnelStore,
         event_tap=None,
+        capability_router=None,
+        face_engine=None,
+        plate_engine=None,
+        behavior_engine=None,
+        zone_store=None,
     ) -> None:
         super().__init__(name="api-public", daemon=True)
         self._frame_bus = frame_bus
@@ -37,6 +42,11 @@ class PublicApiServer(threading.Thread):
         self._dahua = dahua_manager
         self._personnel = personnel_store
         self._event_tap = event_tap
+        self._capability_router = capability_router
+        self._face_engine = face_engine
+        self._plate_engine = plate_engine
+        self._behavior_engine = behavior_engine
+        self._zone_store = zone_store
         self._app = self._build_app()
         self._server = None
 
@@ -53,6 +63,11 @@ class PublicApiServer(threading.Thread):
             personnel_store=self._personnel,
             alert_engine=self._alert_engine,
             event_tap=self._event_tap,
+            capability_router=self._capability_router,
+            face_engine=self._face_engine,
+            plate_engine=self._plate_engine,
+            behavior_engine=self._behavior_engine,
+            zone_store=self._zone_store,
         )
 
         @app.get("/health")

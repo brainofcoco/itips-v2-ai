@@ -64,11 +64,13 @@
     if (window.ITIPS.plates) window.ITIPS.plates.init(state);
     if (window.ITIPS.alerts) window.ITIPS.alerts.init(state);
     if (window.ITIPS.incidents) window.ITIPS.incidents.init(state);
+    if (window.ITIPS.health) window.ITIPS.health.init(state);
+    if (window.ITIPS.zones) window.ITIPS.zones.init(state);
     if (window.ITIPS.testing) window.ITIPS.testing.init(state);
     activateTab("live");
   }
 
-  const modules = ["live.js", "workers.js", "plates.js", "alerts.js", "incidents.js", "testing.js"];
+  const modules = ["live.js", "workers.js", "plates.js", "alerts.js", "incidents.js", "health.js", "zones.js", "testing.js"];
   let loaded = 0;
   modules.forEach((src) => {
     const s = document.createElement("script");

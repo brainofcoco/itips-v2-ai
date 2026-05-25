@@ -25,8 +25,9 @@ from flask import Flask, Response, abort, jsonify, request, send_file, send_from
 from config.settings import settings
 from itips.api.personnel_store import PersonnelStore
 from itips.camera.dahua_face_db import DahuaFaceDBError
+from itips.camera.dahua_health import run_for_all as run_health_for_all
 from itips.camera.dahua_manager import DahuaManager
-from itips.camera.dahua_plate_db import BLACK_LIST, RED_LIST
+from itips.camera.dahua_plate_db import BLACK_LIST, RED_LIST, PlateListUnsupported
 
 logger = logging.getLogger(__name__)
 
@@ -41,8 +42,22 @@ def register_dashboard(
     personnel_store: PersonnelStore,
     alert_engine=None,
     event_tap=None,
+    capability_router=None,
+    face_engine=None,
+    plate_engine=None,
+    behavior_engine=None,
+    zone_store=None,
 ) -> None:
-    """Wire all dashboard routes onto the given Flask app."""
+    """Wire all dashboard routes onto the given Flask app.
+
+    The trailing optional services are the ML fallback layer (see
+    `itips/ml/`). When supplied:
+      * worker enrolment also writes face embeddings to the Jetson DB
+      * `/api/health/capabilities` reports per-engine readiness
+      * the health route refreshes the router on every probe
+      * `/api/zones/<camera_id>` exposes CRUD for the behavioral
+        polygon zones the BehaviorEngine evaluates each motion event.
+    """
 
     @app.get("/dashboard")
     def dashboard_index():  # noqa: ANN202
@@ -69,24 +84,54 @@ def register_dashboard(
             abort(404)
         channel = request.args.get("channel", default=1, type=int)
         # subtype=1 → substream (lower-res, gentler on the LAN + CPU);
-        # subtype=0 → main stream (full quality). Both come over MJPEG
-        # via /cgi-bin/mjpg/video.cgi on every recent Dahua firmware.
-        subtype = request.args.get("subtype", default=1, type=int)
+        # subtype=0 → main stream (full quality). MJPEG availability
+        # varies per camera model — many dual-sensor / 4MP+ Dahuas only
+        # expose MJPEG on the substream (main stream is H.264 only).
+        # We try the requested subtype first and fall back to the
+        # substream if the camera 401/403/404s it. Saves operators from
+        # having to know which subtype their model supports.
+        requested = request.args.get("subtype", default=1, type=int)
+        candidates = [requested]
+        if requested != 1:
+            candidates.append(1)
 
         upstream = None
-        try:
-            upstream = client.endpoint.get(
-                "/cgi-bin/mjpg/video.cgi",
-                params={"channel": channel, "subtype": subtype},
-                timeout=(5, 30),
-                stream=True,
+        chosen_subtype = None
+        last_status = None
+        for try_subtype in candidates:
+            try:
+                resp = client.endpoint.get(
+                    "/cgi-bin/mjpg/video.cgi",
+                    params={"channel": channel, "subtype": try_subtype},
+                    timeout=(1.5, 30),
+                    stream=True,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "cam %d: live proxy open failed (subtype=%d): %s",
+                    camera_id, try_subtype, exc,
+                )
+                continue
+            if resp.status_code == 200:
+                upstream = resp
+                chosen_subtype = try_subtype
+                break
+            last_status = resp.status_code
+            resp.close()
+            logger.info(
+                "cam %d: subtype=%d returned HTTP %d, trying fallback",
+                camera_id, try_subtype, resp.status_code,
             )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("cam %d: live proxy open failed: %s", camera_id, exc)
+
+        if upstream is None:
+            logger.warning(
+                "cam %d: no MJPEG subtype available (last status %s)",
+                camera_id, last_status,
+            )
             abort(502)
-        if upstream.status_code != 200:
-            upstream.close()
-            abort(502)
+        if chosen_subtype != requested:
+            logger.info("cam %d: served subtype=%d as fallback for requested=%d",
+                        camera_id, chosen_subtype, requested)
 
         # Mirror the camera's content-type so the browser parses the
         # multipart boundary correctly. If the camera omits it, fall back
@@ -97,8 +142,11 @@ def register_dashboard(
         )
 
         def gen():
+            # Smaller chunks + no decode_unicode so we forward bytes ASAP —
+            # browsers want the first JPEG frame within ~2s or they show
+            # nothing. macOS Docker Desktop NAT can hold larger buffers.
             try:
-                for chunk in upstream.iter_content(chunk_size=8192):
+                for chunk in upstream.iter_content(chunk_size=1024):
                     if chunk:
                         yield chunk
             except Exception:
@@ -226,10 +274,31 @@ def register_dashboard(
         personnel_store.upsert(
             person_id=person_id, full_name=full_name, per_camera=per_camera,
         )
+
+        # Mirror into the Jetson face DB so cameras without native
+        # faceRecognitionServer can still recognise this worker. Soft
+        # failure: a missing FaceEngine, missing ML extras, or a no-face
+        # enrolment image must not block the native-camera path.
+        ml_enrolled = False
+        ml_error: str | None = None
+        if face_engine is not None:
+            try:
+                face_engine.enroll(
+                    person_id=person_id,
+                    full_name=full_name,
+                    image_bytes=jpeg,
+                )
+                ml_enrolled = True
+            except Exception as exc:  # noqa: BLE001
+                ml_error = exc.__class__.__name__
+                logger.warning("ml face enrol failed for %s: %s", person_id, exc)
+
         return jsonify({
-            "ok": bool(per_camera),
+            "ok": bool(per_camera) or ml_enrolled,
             "person_id": person_id,
             "cameras": per_camera,
+            "ml_enrolled": ml_enrolled,
+            "ml_error": ml_error,
             "failures": failures,
         })
 
@@ -251,6 +320,11 @@ def register_dashboard(
             except Exception as exc:  # noqa: BLE001
                 failures.append(f"cam{cam_id}:{exc.__class__.__name__}")
         personnel_store.delete(person_id)
+        if face_engine is not None:
+            try:
+                face_engine.remove(person_id)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("ml face remove failed for %s: %s", person_id, exc)
         return jsonify({"ok": True, "cameras_cleared": cleared, "failures": failures})
 
     # ─── plate lists ───────────────────────────────────────────────
@@ -260,13 +334,27 @@ def register_dashboard(
         list_type = request.args.get("list_type", RED_LIST)
         if list_type not in (RED_LIST, BLACK_LIST):
             return jsonify({"ok": False, "error": "invalid list_type"}), 400
-        out: dict[int, list[dict[str, Any]]] = {}
+        # Per-camera response shape:
+        #   {"supported": True,  "rows": [...]}             — happy path
+        #   {"supported": False, "reason": "..."}           — camera has no ANPR
+        #   {"supported": True,  "error": "...", "rows": []} — transient failure
+        out: dict[int, dict[str, Any]] = {}
         for client in dahua_manager.all():
             try:
                 rows = client.plate_db.list(list_type=list_type, limit=200)
-                out[client.camera_id] = [asdict(r) for r in rows]
+                out[client.camera_id] = {"supported": True, "rows": [asdict(r) for r in rows]}
+            except PlateListUnsupported as exc:
+                out[client.camera_id] = {
+                    "supported": False,
+                    "reason": "ANPR not enabled on this camera",
+                    "detail": str(exc),
+                }
             except Exception as exc:  # noqa: BLE001
-                out[client.camera_id] = [{"error": str(exc)}]
+                out[client.camera_id] = {
+                    "supported": True,
+                    "rows": [],
+                    "error": exc.__class__.__name__,
+                }
         return jsonify({"list_type": list_type, "cameras": out})
 
     @app.post("/api/plates")
@@ -378,6 +466,86 @@ def register_dashboard(
         if not candidate.is_file() or package not in candidate.parents:
             abort(404)
         return send_file(candidate, as_attachment=True)
+
+    # ─── health checks ─────────────────────────────────────────────
+    # Per-camera capability matrix. Caches a result briefly so a click-happy
+    # operator doesn't re-probe every camera multiple times per second.
+    health_cache = {"timestamp": 0.0, "body": None}
+    _HEALTH_CACHE_TTL = 20.0  # seconds
+
+    @app.get("/api/health/cameras")
+    def get_camera_health():  # noqa: ANN202
+        force = request.args.get("force", "").lower() in {"1", "true", "yes"}
+        now = time.monotonic()
+        if (not force
+                and health_cache["body"] is not None
+                and (now - health_cache["timestamp"]) < _HEALTH_CACHE_TTL):
+            cached = dict(health_cache["body"])
+            cached["cached"] = True
+            return jsonify(cached)
+        body = run_health_for_all(dahua_manager, event_tap)
+        body["cached"] = False
+        # Keep the capability router in lockstep with the probe matrix
+        # so the event worker's needs_fallback() answers reflect what
+        # the operator just looked at on the dashboard.
+        if capability_router is not None:
+            try:
+                capability_router.update_from_health(body)
+            except Exception:
+                logger.exception("capability router refresh failed")
+        health_cache["timestamp"] = now
+        health_cache["body"] = body
+        return jsonify(body)
+
+    @app.get("/api/health/capabilities")
+    def get_capability_summary():  # noqa: ANN202
+        """Per-camera capability vector the event worker is currently
+        routing on. Useful to verify which fallback paths are armed."""
+        if capability_router is None:
+            return jsonify({"available": False, "cameras": {}})
+        face_ready = bool(face_engine and face_engine.is_ready()) if face_engine else False
+        plate_ready = bool(plate_engine and plate_engine.is_ready()) if plate_engine else False
+        behavior_ready = bool(behavior_engine and behavior_engine.is_ready()) if behavior_engine else False
+        return jsonify({
+            "available": True,
+            "face_engine_ready": face_ready,
+            "plate_engine_ready": plate_ready,
+            "behavior_engine_ready": behavior_ready,
+            "cameras": capability_router.summary(),
+        })
+
+    # ─── zone CRUD for the behavioral fallback ─────────────────────
+    # Polygon coords are stored normalised to `[0, 1]` in image space
+    # so the same zone keeps working across stream resolutions and
+    # snapshot resizes.
+
+    @app.get("/api/zones/<int:camera_id>")
+    def list_zones(camera_id: int):  # noqa: ANN202
+        if zone_store is None:
+            return jsonify({"available": False, "zones": []})
+        zones = [_zone_to_dict(z) for z in zone_store.for_camera(camera_id)]
+        return jsonify({"available": True, "camera_id": camera_id, "zones": zones})
+
+    @app.post("/api/zones/<int:camera_id>")
+    def upsert_zone(camera_id: int):  # noqa: ANN202
+        if zone_store is None:
+            return jsonify({"ok": False, "error": "zone store not wired"}), 503
+        body = request.get_json(silent=True) or {}
+        try:
+            zone = _zone_from_dict(body)
+        except (ValueError, KeyError) as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 400
+        zone_store.upsert_zone(camera_id, zone)
+        return jsonify({"ok": True, "zone": _zone_to_dict(zone)})
+
+    @app.delete("/api/zones/<int:camera_id>/<zone_id>")
+    def delete_zone(camera_id: int, zone_id: str):  # noqa: ANN202
+        if zone_store is None:
+            return jsonify({"ok": False, "error": "zone store not wired"}), 503
+        removed = zone_store.remove_zone(camera_id, zone_id)
+        if not removed:
+            return jsonify({"ok": False, "error": "zone not found"}), 404
+        return jsonify({"ok": True})
 
     # ─── test console ──────────────────────────────────────────────
     # Routes prefixed `/api/test/*` are for the in-dashboard Test Console.
@@ -574,3 +742,32 @@ def _read_json(path: Path) -> dict | None:
         return json.loads(path.read_text(encoding="utf-8"))
     except (FileNotFoundError, json.JSONDecodeError):
         return None
+
+
+def _zone_to_dict(zone) -> dict:
+    return {
+        "zone_id": zone.zone_id,
+        "zone_type": zone.zone_type,
+        "points": [list(p) for p in zone.points],
+        "name": zone.name,
+        "direction": zone.direction,
+        "metadata": dict(zone.metadata or {}),
+    }
+
+
+def _zone_from_dict(body: dict):
+    """Build a `Zone` from a JSON request body.
+
+    Imported lazily so the dashboard can be wired without the ML
+    extras installed — only the zone routes need it, and they'll
+    have short-circuited on `zone_store is None` before reaching here.
+    """
+    from itips.ml.zone_store import Zone
+    return Zone(
+        zone_id=str(body["zone_id"]),
+        zone_type=str(body["zone_type"]),
+        points=[tuple(p) for p in body.get("points", [])],
+        name=str(body.get("name", "")),
+        direction=str(body.get("direction", "Any")),
+        metadata=dict(body.get("metadata") or {}),
+    )

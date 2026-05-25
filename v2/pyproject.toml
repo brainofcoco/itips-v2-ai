@@ -26,6 +26,21 @@ dev = [
     "mypy==1.11.2",
     "freezegun==1.5.1",
 ]
+# Jetson-side ML fallback layer. Optional — the v2 runtime works
+# without these; the engines raise *EngineUnavailable on first use
+# and the event worker degrades to the native-only path.
+#
+# Jetson deploy notes:
+#   * replace `onnxruntime` with the JetPack-matched `onnxruntime-gpu`
+#     wheel (built against L4T) at install time;
+#   * `easyocr` pulls `torch` — use the NVIDIA-published torch wheel
+#     for the Jetson's JetPack version, not the generic PyPI build.
+ml = [
+    "insightface==0.7.3",
+    "onnxruntime>=1.16,<2",
+    "easyocr>=1.7,<2",
+    "ultralytics>=8.2,<9",
+]
 
 [project.scripts]
 itips = "itips.__main__:main"

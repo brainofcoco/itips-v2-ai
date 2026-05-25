@@ -1,0 +1,213 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>ITIPS — Live Streams</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; height: 100%; background: #000; color: #c9d1d9;
+    font: 13px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    overflow: hidden;
+  }
+  .topbar {
+    display: flex; align-items: center; gap: 12px;
+    padding: 8px 14px; background: #0d1117; border-bottom: 1px solid #21262d;
+    position: sticky; top: 0; z-index: 10;
+  }
+  .topbar h1 { font-size: 13px; font-weight: 600; margin: 0; }
+  .topbar .meta { color: #8b949e; font-size: 12px; margin-left: auto; }
+  .topbar a, .topbar button {
+    color: #c9d1d9; background: transparent; border: 1px solid #30363d;
+    padding: 4px 10px; border-radius: 6px; font-size: 12px;
+    cursor: pointer; text-decoration: none;
+  }
+  .topbar a:hover, .topbar button:hover { border-color: #7c3aed; }
+  .topbar .substream { display: inline-flex; align-items: center; gap: 6px; color: #8b949e; }
+  .topbar select {
+    background: #161b22; color: #c9d1d9; border: 1px solid #30363d;
+    border-radius: 6px; padding: 3px 6px; font: inherit;
+  }
+
+  .wall {
+    display: grid; gap: 4px; padding: 4px;
+    height: calc(100vh - 41px); width: 100vw; background: #000;
+  }
+  .wall.one  { grid-template-columns: 1fr; grid-template-rows: 1fr; }
+  .wall.two  { grid-template-columns: 1fr 1fr; }
+  .wall.four { grid-template-columns: 1fr 1fr; grid-template-rows: 1fr 1fr; }
+
+  .tile {
+    position: relative; background: #000; border-radius: 4px; overflow: hidden;
+    display: flex; align-items: center; justify-content: center;
+    border: 1px solid #21262d;
+  }
+  .tile img {
+    width: 100%; height: 100%; object-fit: contain; display: block;
+  }
+  .tile .label {
+    position: absolute; left: 8px; top: 8px;
+    padding: 3px 8px; border-radius: 4px;
+    background: rgba(0, 0, 0, 0.6); color: #c9d1d9;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px;
+    pointer-events: none;
+  }
+  .tile .err {
+    position: absolute; inset: 0;
+    display: none; align-items: center; justify-content: center;
+    background: rgba(0, 0, 0, 0.55); color: #f85149;
+    font-size: 12px;
+  }
+  .tile.broken .err { display: flex; }
+
+  .empty {
+    display: flex; align-items: center; justify-content: center;
+    height: 100%; color: #8b949e; font-size: 13px;
+  }
+
+  /* Click any tile to expand it. */
+  .tile.focus {
+    position: fixed; inset: 41px 0 0 0; z-index: 5; border: none; border-radius: 0;
+  }
+  .tile.focus img { width: 100vw; height: calc(100vh - 41px); object-fit: contain; }
+</style>
+</head>
+<body>
+<header class="topbar">
+  <h1>ITIPS · Live Streams</h1>
+  <label class="substream">
+    Quality
+    <select id="substream">
+      <option value="1" selected>Substream (smaller)</option>
+      <option value="0">Main stream (full)</option>
+    </select>
+  </label>
+  <button id="refresh">Reload tiles</button>
+  <button id="stop">Stop streams</button>
+  <button id="fullscreen">Fullscreen</button>
+  <span class="meta" id="meta">—</span>
+  <a href="/dashboard">← Dashboard</a>
+</header>
+
+<main id="wall" class="wall">
+  <div class="empty">Loading cameras…</div>
+</main>
+
+<script>
+(async function () {
+  const wall = document.getElementById("wall");
+  const meta = document.getElementById("meta");
+  const subSelect = document.getElementById("substream");
+  const refreshBtn = document.getElementById("refresh");
+  const stopBtn = document.getElementById("stop");
+  const fsBtn = document.getElementById("fullscreen");
+
+  let cameras = [];
+  let imgs = [];   // tracked so we can clear src in batch
+
+  async function loadCameras() {
+    try {
+      const res = await fetch("/api/cameras");
+      const body = await res.json();
+      cameras = body.cameras || [];
+    } catch (e) {
+      cameras = [];
+    }
+  }
+
+  function buildTile(cam, subtype, cacheBust) {
+    const tile = document.createElement("div");
+    tile.className = "tile";
+
+    const img = document.createElement("img");
+    // cacheBust forces a fresh stream open on reload.
+    img.src = `/live/${cam.camera_id}?subtype=${subtype}&t=${cacheBust}`;
+    img.alt = `Camera ${cam.camera_id}`;
+    img.dataset.live = `/live/${cam.camera_id}?subtype=${subtype}`;
+    img.addEventListener("error", () => tile.classList.add("broken"));
+    imgs.push(img);
+
+    const label = document.createElement("div");
+    label.className = "label";
+    label.textContent = `cam${cam.camera_id} · ${cam.endpoint}`;
+
+    const err = document.createElement("div");
+    err.className = "err";
+    err.textContent = "stream unavailable";
+
+    tile.appendChild(img);
+    tile.appendChild(label);
+    tile.appendChild(err);
+
+    // Click to expand / collapse.
+    tile.addEventListener("click", () => tile.classList.toggle("focus"));
+    return tile;
+  }
+
+  function detachAll() {
+    imgs.forEach((img) => { img.removeAttribute("src"); });
+  }
+  function reattachAll() {
+    const subtype = subSelect.value;
+    const ts = Date.now();
+    imgs.forEach((img) => {
+      const base = img.dataset.live;
+      if (base) img.src = `${base.replace(/subtype=\d+/, `subtype=${subtype}`)}&t=${ts}`;
+    });
+  }
+
+  function render() {
+    detachAll();
+    wall.innerHTML = "";
+    imgs = [];
+    if (!cameras.length) {
+      const e = document.createElement("div");
+      e.className = "empty";
+      e.textContent = "No cameras configured in .env.";
+      wall.appendChild(e);
+      meta.textContent = "0 cameras";
+      return;
+    }
+    const subtype = subSelect.value;
+    const cacheBust = Date.now();
+    cameras.forEach((cam) => wall.appendChild(buildTile(cam, subtype, cacheBust)));
+    wall.classList.remove("one", "two", "four");
+    wall.classList.add(
+      cameras.length === 1 ? "one" :
+      cameras.length === 2 ? "two" : "four"
+    );
+    meta.textContent = `${cameras.length} camera${cameras.length === 1 ? "" : "s"}`;
+  }
+
+  refreshBtn.addEventListener("click", render);
+  subSelect.addEventListener("change", render);
+  stopBtn.addEventListener("click", () => {
+    detachAll();
+    meta.textContent = `${cameras.length} cameras · streams stopped`;
+  });
+
+  // Free connection slots when the tab is in the background; resume on focus.
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) detachAll();
+    else reattachAll();
+  });
+  // Belt-and-braces: clean up on navigate-away.
+  window.addEventListener("pagehide", detachAll);
+
+  fsBtn.addEventListener("click", async () => {
+    if (!document.fullscreenElement) {
+      try { await document.documentElement.requestFullscreen(); }
+      catch (e) { /* user denied or unsupported */ }
+    } else {
+      try { await document.exitFullscreen(); } catch (e) {}
+    }
+  });
+
+  await loadCameras();
+  render();
+})();
+</script>
+</body>
+</html>
