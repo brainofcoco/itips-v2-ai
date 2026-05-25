@@ -1,0 +1,591 @@
+openapi: 3.1.0
+info:
+  title: ITIPS V2 — Jetson Edge API
+  version: 2.0.0
+  description: |
+    The ITIPS V2 Jetson edge node exposes two distinct HTTP surfaces:
+
+    - **Public API (port 5050)** — live MJPEG feeds, the SSE alert stream,
+      health and status. Consumed by the dashboard and by operators.
+      No authentication in POC; bearer-token in Phase 1.
+    - **Inbound API (port 8443)** — backend → Jetson commands per PRD
+      §4.7 Part B (B1–B5). Personnel sync, config push, maintenance
+      windows, operator commands, firmware. Bearer-token auth in POC;
+      mutual TLS in Phase 1.
+
+    The AI pipeline never makes outbound cloud calls. Everything that
+    leaves this node is written to a local SQLite intake queue at
+    `var/intake.sqlite` and drained by the backend-owned Jetson Sync
+    Agent.
+
+    See `docs/intake-schema.md` and `docs/port-8443-contract.md` for
+    the wire-level contract.
+  contact:
+    name: Seismic Digital & Innovations Limited
+  license:
+    name: Proprietary
+
+servers:
+  - url: http://localhost:5050
+    description: Public surface (live view, alerts) on the Jetson
+  - url: http://localhost:8443
+    description: Inbound surface (backend push commands) on the Jetson
+
+tags:
+  - name: Health
+    description: Liveness + status probes
+  - name: Live Feed
+    description: Per-camera MJPEG streams (port 5050)
+  - name: Alerts
+    description: SSE stream + history of behaviour and sensor alerts (port 5050)
+  - name: Personnel (B1)
+    description: Cloud-pushed personnel embeddings (port 8443)
+  - name: Config (B2)
+    description: Hot configuration push (port 8443)
+  - name: Maintenance (B3)
+    description: Arm/disarm maintenance windows for technicians (port 8443)
+  - name: Commands (B4)
+    description: PTZ override, deterrence standdown, stream requests (port 8443)
+  - name: Firmware (B5)
+    description: Scheduled firmware updates (port 8443)
+
+security: []  # Public routes have no auth; inbound routes opt-in below.
+
+paths:
+
+  # ─── Public 5050 ─────────────────────────────────────────────────
+
+  /health:
+    get:
+      tags: [Health]
+      summary: Liveness probe
+      description: |
+        Returns immediately with `{"status":"ok"}` if the Flask server
+        is up. Used by Docker HEALTHCHECK and by external monitors.
+        Present on both servers (5050 and 8443).
+      responses:
+        "200":
+          description: Server is alive
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Health"
+              examples:
+                ok:
+                  value: { status: ok }
+
+  /status:
+    get:
+      tags: [Health]
+      summary: Detailed runtime status
+      description: |
+        Reports version, mode, tenant identifiers, and the set of
+        cameras that currently have a frame on the bus. Useful as a
+        first sanity check after `make sim` or `make up`.
+      servers:
+        - url: http://localhost:5050
+      responses:
+        "200":
+          description: Status payload
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Status"
+
+  /video_feed/{camera_id}:
+    get:
+      tags: [Live Feed]
+      summary: MJPEG live view for one camera
+      description: |
+        Returns a `multipart/x-mixed-replace` MJPEG stream. Open this
+        URL in a browser — the latest annotated frame from the camera
+        worker is re-encoded to JPEG and pushed at the 30 fps display
+        cap. Inference still happens at full speed in the worker; this
+        endpoint never blocks the inference loop.
+
+        WebRTC replacement is scheduled for Phase 1.
+      servers:
+        - url: http://localhost:5050
+      parameters:
+        - $ref: "#/components/parameters/CameraId"
+      responses:
+        "200":
+          description: MJPEG stream
+          content:
+            multipart/x-mixed-replace:
+              schema:
+                type: string
+                format: binary
+
+  /api/alerts/stream:
+    get:
+      tags: [Alerts]
+      summary: Server-Sent Events feed of live alerts
+      description: |
+        Long-lived SSE connection. Every new behaviour alert or sensor
+        event the alert engine receives is pushed as a `data:` frame
+        carrying an `Alert` JSON object. Used by the dashboard.
+
+        Test from the terminal with: `curl -N http://localhost:5050/api/alerts/stream`
+      servers:
+        - url: http://localhost:5050
+      responses:
+        "200":
+          description: SSE stream of Alert records
+          content:
+            text/event-stream:
+              schema:
+                type: string
+                example: |
+                  data: {"kind":"behaviour","alert_type":"intrusion","camera_id":1,"track_id":3,"site_id":"site-test","timestamp_utc":"2026-05-20T09:00:01.000000Z"}
+
+  /api/alerts/latest:
+    get:
+      tags: [Alerts]
+      summary: Recent alert history (bounded ring buffer)
+      description: |
+        Returns up to the last 200 alerts the engine has emitted since
+        process start. Useful for dashboards reconnecting after a
+        network blip.
+      servers:
+        - url: http://localhost:5050
+      responses:
+        "200":
+          description: Alert history (newest last)
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Alert"
+
+  # ─── Inbound 8443 (B1–B5) ────────────────────────────────────────
+
+  /local/api/v1/personnel/sync:
+    post:
+      tags: [Personnel (B1)]
+      summary: B1 — push a personnel record into the local cache
+      description: |
+        Backend Personnel Service pushes a registered person's face
+        embeddings (generated in the cloud, never on this device).
+        `add` and `update` are idempotent; `deactivate` removes the
+        person from the local cache within one tick.
+
+        This endpoint **must not** be called during an active incident
+        if the embedding pertains to a track in that incident.
+      servers:
+        - url: http://localhost:8443
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PersonnelSyncRequest"
+            examples:
+              add:
+                summary: Add a new technician
+                value:
+                  action: add
+                  person_id: 1f9b7e60-4f7e-4cd0-9c3f-1e8c8d6a5b2a
+                  full_name: Ada Okafor
+                  embeddings:
+                    - [0.012, -0.034, 0.087]  # 512-d in practice
+                  assigned_sites:
+                    - site-ng-0042
+                  access_status: active
+              deactivate:
+                summary: Remove a terminated employee
+                value:
+                  action: deactivate
+                  person_id: 1f9b7e60-4f7e-4cd0-9c3f-1e8c8d6a5b2a
+      responses:
+        "200":
+          description: Sync result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PersonnelSyncResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /local/api/v1/config:
+    post:
+      tags: [Config (B2)]
+      summary: B2 — hot configuration push
+      description: |
+        Backend Device Management Service updates per-site tunables
+        without a Jetson restart. Tunables include behaviour
+        thresholds, buffer durations, and heartbeat cadence.
+      servers:
+        - url: http://localhost:8443
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ConfigPushRequest"
+            examples:
+              tune_loitering:
+                summary: Lengthen loitering threshold for a quiet site
+                value:
+                  config_version: "1.4.2"
+                  parameters:
+                    loitering_seconds: 180
+                    loitering_gate_seconds: 45
+                    pre_event_buffer_seconds: 900
+      responses:
+        "200":
+          description: Config applied
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ConfigPushResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /local/api/v1/maintenance/window:
+    post:
+      tags: [Maintenance (B3)]
+      summary: B3 — arm or disarm a maintenance window
+      description: |
+        While a window is **armed**, the named person triggers no
+        deterrence or RAPID dispatch at the named site between
+        `start_utc` and `end_utc`. The face is still recorded to the
+        evidence package as a maintenance event (not an incident).
+      servers:
+        - url: http://localhost:8443
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/MaintenanceWindowRequest"
+            examples:
+              arm:
+                value:
+                  action: arm
+                  window_id: 5a3c2c5e-9f1c-4e94-a3a1-3a2a7b9e9b2c
+                  person_id: 1f9b7e60-4f7e-4cd0-9c3f-1e8c8d6a5b2a
+                  start_utc: "2026-05-25T10:00:00Z"
+                  end_utc: "2026-05-25T14:00:00Z"
+              disarm:
+                value:
+                  action: disarm
+                  window_id: 5a3c2c5e-9f1c-4e94-a3a1-3a2a7b9e9b2c
+                  person_id: 1f9b7e60-4f7e-4cd0-9c3f-1e8c8d6a5b2a
+                  start_utc: "2026-05-25T10:00:00Z"
+                  end_utc: "2026-05-25T14:00:00Z"
+      responses:
+        "200":
+          description: Maintenance window state updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MaintenanceWindowResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /local/api/v1/commands:
+    post:
+      tags: [Commands (B4)]
+      summary: B4 — operator command (PTZ, standdown, request_stream)
+      description: |
+        Three sub-types are accepted:
+
+        - `ptz_override` — move the named PTZ camera to the requested
+          pan/tilt/zoom. Honoured only if the camera is configured and
+          connected.
+        - `deterrence_standdown` — suppress sirens/strobes. Only valid
+          during an active maintenance window; otherwise refused.
+        - `request_stream` — return a stream URL the dashboard can
+          subscribe to. POC returns an MJPEG hint; Phase 1 will return
+          a WebRTC session ID from the media server.
+      servers:
+        - url: http://localhost:8443
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CommandRequest"
+            examples:
+              ptz:
+                summary: Pan camera 1 to (45°, -20°) and zoom 15×
+                value:
+                  command_type: ptz_override
+                  parameters: { camera_id: 1, pan_degrees: 45, tilt_degrees: -20, zoom_x: 15 }
+                  issued_by: 6e2f3a8e-21d4-4c8a-bb2b-d5e3c1f9a7d4
+                  expires_utc: "2026-05-25T10:15:00Z"
+              stream:
+                summary: Request a live-view URL for camera 2
+                value:
+                  command_type: request_stream
+                  parameters: { camera_id: 2 }
+                  issued_by: 6e2f3a8e-21d4-4c8a-bb2b-d5e3c1f9a7d4
+                  expires_utc: "2026-05-25T10:15:00Z"
+      responses:
+        "200":
+          description: Command accepted (or refused, with reason)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CommandResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /local/api/v1/firmware/update:
+    post:
+      tags: [Firmware (B5)]
+      summary: B5 — schedule a firmware install
+      description: |
+        Backend Device Management Service schedules a signed firmware
+        package install. The Jetson downloads at `schedule_utc`,
+        verifies the signature, and applies. Never applied during an
+        active incident — if one is open at the scheduled time, the
+        install defers to the next idle window.
+      servers:
+        - url: http://localhost:8443
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/FirmwareUpdateRequest"
+            examples:
+              scheduled:
+                value:
+                  version: "2.1.4"
+                  download_url: https://updates.itips.seismic.io/jetson/v2.1.4.tar.gz
+                  signature: 9c4e9d6e4f2a1c5b7d8e0f1a2b3c4d5e6f7890abcdef1234567890fedcba9876
+                  schedule_utc: "2026-05-26T02:00:00Z"
+                  requires_restart: true
+      responses:
+        "200":
+          description: Firmware update scheduled
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FirmwareUpdateResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+components:
+
+  parameters:
+    CameraId:
+      name: camera_id
+      in: path
+      required: true
+      description: Camera index (1–4) matching ITIPS_CAMERA_{N}_RTSP.
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 4
+      example: 1
+
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: |
+        Static bearer token from `ITIPS_INBOUND_TOKEN` (POC). Phase 1
+        replaces this with mutual TLS using a per-device certificate.
+
+  responses:
+    Unauthorized:
+      description: Missing or invalid bearer token
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          examples:
+            no_token:
+              value: { error: unauthorized }
+
+  schemas:
+
+    Health:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [ok]
+
+    Status:
+      type: object
+      required: [version, mode, active_cameras]
+      properties:
+        version:
+          type: string
+          example: 2.0.0
+        mode:
+          type: string
+          enum: [prod, sim, dev, test]
+        site_id:
+          type: string
+          nullable: true
+        operator_id:
+          type: string
+          nullable: true
+        device_id:
+          type: string
+          nullable: true
+        active_cameras:
+          type: array
+          items:
+            type: integer
+
+    Alert:
+      type: object
+      required: [kind, timestamp_utc, monotonic_ns]
+      description: |
+        A normalised alert record. Emitted to the SSE stream and
+        written to the intake DB as the payload of an A4 (behaviour)
+        or A2 (sensor) packet.
+      properties:
+        kind:
+          type: string
+          enum: [behaviour, face_intruder, sensor, heartbeat]
+        site_id: { type: string, nullable: true }
+        operator_id: { type: string, nullable: true }
+        device_id: { type: string, nullable: true }
+        incident_id: { type: string, nullable: true }
+        timestamp_utc: { type: string, format: date-time }
+        monotonic_ns: { type: integer }
+        alert_type:
+          type: string
+          example: intrusion
+          description: Present for behaviour alerts only.
+        camera_id: { type: integer, nullable: true }
+        track_id: { type: integer, nullable: true }
+        details: { type: object, additionalProperties: true }
+
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+
+    PersonnelSyncRequest:
+      type: object
+      required: [action, person_id]
+      properties:
+        action:
+          type: string
+          enum: [add, update, deactivate]
+        person_id:
+          type: string
+          format: uuid
+        full_name:
+          type: string
+        embeddings:
+          type: array
+          description: Array of 512-dim ArcFace embeddings (cloud-generated).
+          items:
+            type: array
+            items: { type: number }
+        assigned_sites:
+          type: array
+          items: { type: string }
+        access_status:
+          type: string
+          enum: [active, suspended, terminated]
+
+    PersonnelSyncResponse:
+      type: object
+      required: [synced]
+      properties:
+        synced: { type: boolean }
+        reason: { type: string }
+
+    ConfigPushRequest:
+      type: object
+      required: [config_version, parameters]
+      properties:
+        config_version: { type: string, example: "1.4.2" }
+        parameters:
+          type: object
+          additionalProperties: true
+          example:
+            loitering_seconds: 180
+            loitering_gate_seconds: 45
+            pre_event_buffer_seconds: 900
+
+    ConfigPushResponse:
+      type: object
+      required: [applied, version]
+      properties:
+        applied: { type: boolean }
+        version: { type: string }
+
+    MaintenanceWindowRequest:
+      type: object
+      required: [action, window_id, person_id, start_utc, end_utc]
+      properties:
+        action: { type: string, enum: [arm, disarm] }
+        window_id: { type: string, format: uuid }
+        person_id: { type: string, format: uuid }
+        start_utc: { type: string, format: date-time }
+        end_utc: { type: string, format: date-time }
+
+    MaintenanceWindowResponse:
+      type: object
+      required: [applied]
+      properties:
+        applied: { type: boolean }
+        reason: { type: string }
+
+    CommandRequest:
+      type: object
+      required: [command_type, parameters]
+      properties:
+        command_type:
+          type: string
+          enum: [ptz_override, deterrence_standdown, request_stream]
+        parameters:
+          type: object
+          additionalProperties: true
+        issued_by: { type: string, format: uuid }
+        expires_utc: { type: string, format: date-time }
+
+    CommandResponse:
+      type: object
+      required: [command_accepted]
+      properties:
+        command_accepted: { type: boolean }
+        reason: { type: string }
+        stream:
+          type: object
+          nullable: true
+          properties:
+            protocol: { type: string, example: mjpeg }
+            url_hint: { type: string, example: /video_feed/2 }
+
+    FirmwareUpdateRequest:
+      type: object
+      required: [version, download_url, signature, schedule_utc]
+      properties:
+        version: { type: string }
+        download_url: { type: string, format: uri }
+        signature: { type: string, description: SHA-256 hex digest of the signed package }
+        schedule_utc: { type: string, format: date-time }
+        requires_restart: { type: boolean, default: true }
+
+    FirmwareUpdateResponse:
+      type: object
+      required: [scheduled]
+      properties:
+        scheduled: { type: boolean }
+        version: { type: string }

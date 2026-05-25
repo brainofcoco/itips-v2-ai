@@ -1,0 +1,138 @@
+"""Port 5050 public API — live MJPEG feeds, SSE alerts, evidence reads.
+
+This is the dashboard-facing surface during POC. WebRTC replacement is a
+Phase 1 deliverable (see ARCHITECTURE.md §8).
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import threading
+import time
+from typing import Any
+
+import cv2
+from flask import Flask, Response, jsonify, stream_with_context
+
+from config.settings import settings
+from itips.runtime.frame_bus import FrameBus
+
+logger = logging.getLogger(__name__)
+
+
+class PublicApiServer(threading.Thread):
+    def __init__(
+        self,
+        *,
+        frame_bus: FrameBus,
+        alert_engine,
+        preset_registry=None,
+        ptz_controllers=None,
+    ) -> None:
+        super().__init__(name="api-public", daemon=True)
+        self._frame_bus = frame_bus
+        self._alert_engine = alert_engine
+        self._preset_registry = preset_registry
+        self._ptz_controllers = ptz_controllers or {}
+        self._app = self._build_app()
+        self._server = None
+
+    def _build_app(self) -> Flask:
+        from itips.api.dashboard import register_dashboard
+        from itips.api.docs import register_docs
+
+        app = Flask("itips-public")
+        register_docs(app)
+        if self._preset_registry is not None:
+            register_dashboard(
+                app,
+                frame_bus=self._frame_bus,
+                preset_registry=self._preset_registry,
+                ptz_controllers=self._ptz_controllers,
+            )
+
+        @app.get("/health")
+        def health():
+            return jsonify({"status": "ok"})
+
+        @app.get("/status")
+        def status():
+            return jsonify({
+                "version": "2.0.0",
+                "mode": settings.mode,
+                "site_id": settings.tenant.site_id or None,
+                "operator_id": settings.tenant.operator_id or None,
+                "device_id": settings.tenant.device_id or None,
+                "active_cameras": self._frame_bus.active_cameras(),
+            })
+
+        @app.get("/video_feed/<int:camera_id>")
+        def video_feed(camera_id: int):
+            return Response(
+                stream_with_context(self._mjpeg_generator(camera_id)),
+                mimetype="multipart/x-mixed-replace; boundary=frame",
+            )
+
+        @app.get("/api/alerts/stream")
+        def alerts_stream():
+            return Response(
+                stream_with_context(self._sse_generator()),
+                mimetype="text/event-stream",
+                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+            )
+
+        @app.get("/api/alerts/latest")
+        def alerts_latest():
+            return jsonify(self._alert_engine.history())
+
+        return app
+
+    def run(self) -> None:
+        from werkzeug.serving import make_server
+
+        self._server = make_server(
+            host=settings.api.public_host,
+            port=settings.api.public_port,
+            app=self._app,
+            threaded=True,
+        )
+        logger.info("Public API listening on http://%s:%d",
+                    settings.api.public_host, settings.api.public_port)
+        try:
+            self._server.serve_forever()
+        except Exception:
+            logger.exception("Public API crashed.")
+
+    def stop(self) -> None:
+        if self._server is not None:
+            self._server.shutdown()
+
+    # ─── streamers ─────────────────────────────────────────────────
+
+    def _mjpeg_generator(self, camera_id: int):
+        last_ns = -1
+        while True:
+            snap = self._frame_bus.latest(camera_id)
+            if snap is None or snap.annotated is None or snap.monotonic_ns == last_ns:
+                time.sleep(0.033)
+                continue
+            last_ns = snap.monotonic_ns
+            ok, encoded = cv2.imencode(".jpg", snap.annotated, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+            if not ok:
+                continue
+            yield (
+                b"--frame\r\n"
+                b"Content-Type: image/jpeg\r\n\r\n" + encoded.tobytes() + b"\r\n"
+            )
+            time.sleep(0.033)  # 30 fps display cap
+
+    def _sse_generator(self):
+        cursor = 0
+        while True:
+            history = self._alert_engine.history()
+            new_items = history[cursor:]
+            cursor = len(history)
+            for item in new_items:
+                yield f"data: {json.dumps(item)}\n\n"
+            time.sleep(0.5)

@@ -1,0 +1,87 @@
+# Simulation overlay for laptop demos with no real cameras and no GPU.
+#
+# Run with:
+#   make sim                # or:
+#   docker compose -f docker-compose.yml -f docker-compose.sim.yml up
+#
+# Adds:
+#   - MediaMTX, an open-source RTSP server.
+#   - ffmpeg-feeder, which loops MP4s from assets/sim/*.mp4 into MediaMTX.
+#   - Overrides on the ITIPS container so it runs without /opt/itips and
+#     without an NVIDIA runtime — CPU inference, smaller models.
+
+services:
+  mediamtx:
+    image: bluenviron/mediamtx:1.9.0
+    container_name: itips-mediamtx
+    restart: unless-stopped
+    ports:
+      - "8554:8554"   # RTSP
+      - "8888:8888"   # HLS (debug)
+    environment:
+      MTX_PROTOCOLS: tcp
+
+  ffmpeg-feeder:
+    image: linuxserver/ffmpeg:7.0.2
+    container_name: itips-ffmpeg-feeder
+    restart: unless-stopped
+    depends_on:
+      - mediamtx
+    volumes:
+      - ./assets/sim:/sim:ro
+      - ./scripts:/scripts:ro
+    environment:
+      # Explicit per-camera mapping. Filenames are relative to assets/sim/.
+      # Leave a slot blank to publish nothing on that cam.
+      SIM_CAM1_FILE: cam1_sim_exp1.mp4
+      SIM_CAM2_FILE: cam2_sim_steal1.mp4
+      SIM_CAM3_FILE: ""
+      SIM_CAM4_FILE: ""
+    entrypoint: ["/bin/sh", "/scripts/simulate_cameras.sh"]
+
+  itips:
+    # Override the Jetson Dockerfile so this works on a laptop without a GPU.
+    build:
+      context: .
+      dockerfile: Dockerfile.sim
+    image: itips/edge-sim:2.0.0
+    runtime: ""
+    # AV_LOG_LEVEL=24 = error and above. Silences the harmless
+    # "co located POCs unavailable" chatter at every Sintel loop boundary.
+    # Remove this in prod — we want decoder warnings to surface real packet
+    # loss on a real RTSP connection.
+    environment:
+      AV_LOG_FORCE_NOCOLOR: "1"
+      AV_LOG_LEVEL: "24"
+      ITIPS_MODE: sim
+      ITIPS_SIMULATE: "true"
+      ITIPS_YOLO_MODEL: yolo11n.pt
+      ITIPS_INSIGHTFACE_DET_SIZE: "320"
+      # Dev-only signing key so the packager can finalize incidents in sim.
+      # Production uses a per-device key from the provisioning secret store.
+      ITIPS_DEVICE_HMAC_KEY: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+      # Shorter timers so the demo lifecycle completes quickly in sim.
+      ITIPS_INCIDENT_CONFIRMATION_DWELL_SECONDS: "3"
+      ITIPS_INCIDENT_IDLE_TIMEOUT_SECONDS: "8"
+      # Sim defaults to 2 cameras matching the assets/sim/cam{1,2}.mp4 fixtures.
+      # Drop cam{3,4}.mp4 in there and uncomment the lines below to scale up.
+      ITIPS_CAMERA_1_RTSP: rtsp://mediamtx:8554/cam1
+      ITIPS_CAMERA_2_RTSP: rtsp://mediamtx:8554/cam2
+      ITIPS_CAMERA_3_RTSP: ""
+      ITIPS_CAMERA_4_RTSP: ""
+    network_mode: ""
+    ports:
+      - "5050:5050"
+      - "8443:8443"
+    volumes:
+      - ./var:/opt/itips/var
+      - ./evidence_store:/opt/itips/evidence_store
+      - ./dataset:/opt/itips/dataset
+      - ./models:/opt/itips/models
+    depends_on:
+      - mediamtx
+      - ffmpeg-feeder
+    deploy:
+      resources:
+        limits:
+          memory: 4g

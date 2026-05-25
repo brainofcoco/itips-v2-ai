@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>ITIPS V2 — Operator Dashboard</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<link rel="stylesheet" href="/dashboard/style.css" />
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="dot"></span>
+    <h1>ITIPS V2</h1>
+    <span class="subtitle" id="site-label">…</span>
+  </div>
+  <nav class="tabs">
+    <button data-tab="live" class="active">Live</button>
+    <button data-tab="zones">Zones</button>
+    <button data-tab="alerts">Alerts</button>
+    <button data-tab="incidents">Incidents</button>
+  </nav>
+</header>
+
+<main>
+  <!-- LIVE TAB -->
+  <section data-tabpanel="live" class="panel active">
+    <div class="grid" id="camera-grid">
+      <p class="muted">Loading cameras…</p>
+    </div>
+  </section>
+
+  <!-- ZONES TAB -->
+  <section data-tabpanel="zones" class="panel">
+    <div class="toolbar">
+      <label>Camera
+        <select id="zone-camera"></select>
+      </label>
+      <label>Preset
+        <select id="zone-preset"></select>
+      </label>
+      <button id="zone-snapshot">Capture frame</button>
+      <span class="spacer"></span>
+      <label>New zone name
+        <input id="zone-name" placeholder="intrusion" />
+      </label>
+      <button id="zone-finish" disabled>Finish polygon</button>
+      <button id="zone-cancel" disabled>Cancel</button>
+      <button id="zone-save" class="primary">Save zones</button>
+    </div>
+    <div class="zone-workspace">
+      <div class="canvas-wrap">
+        <canvas id="zone-canvas" width="960" height="540"></canvas>
+        <p id="zone-hint" class="hint">Choose a camera + preset, capture a frame, then click points to draw a polygon.</p>
+      </div>
+      <aside class="zone-list">
+        <h3>Polygons on this preset</h3>
+        <ul id="zone-items"></ul>
+        <p class="muted" id="zone-status"></p>
+      </aside>
+    </div>
+  </section>
+
+  <!-- ALERTS TAB -->
+  <section data-tabpanel="alerts" class="panel">
+    <div class="toolbar">
+      <span id="sse-status" class="pill pill-idle">Connecting…</span>
+      <button id="alerts-clear">Clear</button>
+    </div>
+    <ul id="alerts-list" class="alerts"></ul>
+  </section>
+
+  <!-- INCIDENTS TAB -->
+  <section data-tabpanel="incidents" class="panel">
+    <div class="toolbar">
+      <button id="incidents-refresh">Refresh</button>
+      <span class="spacer"></span>
+      <span class="muted" id="incidents-meta"></span>
+    </div>
+    <div class="incident-layout">
+      <ul id="incidents-list" class="incidents"></ul>
+      <div id="incident-detail" class="incident-detail muted">
+        Select an incident to inspect.
+      </div>
+    </div>
+  </section>
+</main>
+
+<script src="/dashboard/app.js"></script>
+</body>
+</html>

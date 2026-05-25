@@ -1,0 +1,76 @@
+# Simulation-mode image — runs the full ITIPS pipeline on a laptop with no GPU.
+#
+# Used by docker-compose.sim.yml. Production Jetson deployments use the main
+# Dockerfile instead. This image is intentionally small, CPU-only, and
+# multi-arch (works on Apple Silicon, Intel Macs, Linux x86_64, and Linux arm64).
+#
+# Critical: install CPU-only torch BEFORE ultralytics. Otherwise pip resolves
+# torch to the default CUDA wheel and downloads ~1.5 GB of NVIDIA libraries
+# we will never use.
+
+FROM python:3.10-slim-bookworm
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPATH=/app \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    ITIPS_SIMULATE=true \
+    ITIPS_MODE=sim
+
+# Runtime libs (libgl, ffmpeg) + build toolchain (g++, python3-dev).
+# The toolchain is required because `insightface` ships a Cython extension
+# that compiles at install time — there is no prebuilt wheel for arm64.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libgl1 libglib2.0-0 libsm6 libxext6 libxrender1 libgomp1 \
+        ffmpeg \
+        g++ python3-dev \
+        curl ca-certificates tini \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Layer 1: CPU-only torch from PyTorch's CPU index. Done first so the later
+# ultralytics install finds torch already satisfied and skips the CUDA wheel.
+RUN pip install --no-cache-dir \
+        --index-url https://download.pytorch.org/whl/cpu \
+        torch==2.4.1 \
+        torchvision==0.19.1
+
+# Layer 2: small runtime essentials. Fast, cached separately from the heavy
+# ML stack below so a future change to one doesn't invalidate the other.
+RUN pip install --no-cache-dir \
+        "numpy<2" \
+        flask==3.0.3 werkzeug==3.0.3 \
+        python-dotenv==1.0.1 requests==2.32.3 pydantic==2.8.2 pyyaml==6.0.2 \
+        opencv-python-headless==4.10.0.84 pillow==10.4.0 \
+        onvif-zeep==0.2.12 \
+        pycryptodomex==3.20.0
+
+# Layer 3: ML stack. Slowest layer — insightface compiles a Cython extension
+# from source. Isolated so a failure here is recoverable without redoing torch.
+# `lapx` is a ByteTrack dep that ultralytics otherwise auto-installs at first
+# tracker call; we bake it in so the container is self-contained at boot.
+RUN pip install --no-cache-dir \
+        onnxruntime==1.18.1 \
+        ultralytics==8.3.40 \
+        lapx==0.5.11 \
+        insightface==0.7.3
+
+COPY config/ ./config/
+COPY itips/ ./itips/
+COPY openapi/ ./openapi/
+
+RUN useradd --uid 1000 --create-home --shell /bin/bash itips \
+    && mkdir -p /opt/itips/var /opt/itips/evidence_store /opt/itips/models /opt/itips/dataset \
+    && chown -R itips:itips /opt/itips /app
+USER itips
+
+EXPOSE 5050 8443
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
+    CMD curl -fsS http://localhost:5050/health || exit 1
+
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["python3", "-m", "itips"]

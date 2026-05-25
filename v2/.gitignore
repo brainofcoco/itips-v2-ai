@@ -1,0 +1,56 @@
+# Environment secrets — never commit
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+.venv/
+venv/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Models (downloaded at deploy time)
+*.pt
+*.onnx
+*.engine
+models/
+
+# Runtime state
+var/
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+
+# Evidence and logs (per-site, sensitive)
+evidence_store/
+logs/
+
+# Face gallery — site-specific
+dataset/
+
+# Simulation fixtures (large MP4s)
+assets/sim/*.mp4
+assets/sim/*.mkv
+
+# Test artefacts
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Ad-hoc curl payloads
+body.json
+*.tmp
+*.bak
