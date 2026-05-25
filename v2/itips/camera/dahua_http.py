@@ -1,24 +1,26 @@
-"""HTTP client utilities for Dahua IP cameras.
+"""Shared HTTP primitives for talking to a Dahua IP camera.
 
-V2 currently decodes RTSP 24/7 to do AI on every frame, which doesn't fit on
-the 8 GB Orin Nano. This module backs a cheaper, event-driven path:
+Everything in `itips/camera/dahua_*.py` and `itips/sensors/dahua_events.py`
+runs through one `DahuaCameraEndpoint` instance per camera so we have a
+single place that owns credentials, base URL, digest auth, and timeouts.
 
-  * `DahuaCameraEndpoint` — host/user/pass parsed from an existing RTSP URL,
-    so the user keeps the single `ITIPS_CAMERA_<N>_RTSP` knob in `.env`.
-  * `snapshot()` — single HTTP GET against `/cgi-bin/snapshot.cgi`, returns a
-    decoded BGR frame (or raises). ~200-400 KB JPEG, ~50 ms on a Jetson LAN.
+There is exactly one credential set per camera. We parse it out of the
+existing `ITIPS_CAMERA_<N>_RTSP` env var so operators keep a single
+configuration knob and we never duplicate secrets across env keys.
 """
 
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Optional
+from typing import TYPE_CHECKING, Any, Optional
 from urllib.parse import unquote, urlsplit
 
-import numpy as np
 import requests
 from requests.auth import HTTPDigestAuth
+
+if TYPE_CHECKING:
+    import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +33,8 @@ class DahuaCameraEndpoint:
     port: int
     user: str
     password: str
+
+    # ─── construction ─────────────────────────────────────────────────
 
     @classmethod
     def from_rtsp_url(cls, rtsp_url: str, http_port: int = 80) -> Optional["DahuaCameraEndpoint"]:
@@ -52,36 +56,97 @@ class DahuaCameraEndpoint:
         password = unquote(parts.password or "")
         return cls(host=host, port=http_port, user=user, password=password)
 
-    def _auth(self) -> HTTPDigestAuth:
+    # ─── primitives ───────────────────────────────────────────────────
+
+    def auth(self) -> HTTPDigestAuth:
         return HTTPDigestAuth(self.user, self.password)
 
-    def _base(self) -> str:
+    def base(self) -> str:
         return f"http://{self.host}:{self.port}"
 
-    def snapshot(self, channel: int = 1, timeout: float = 5.0) -> Optional[np.ndarray]:
+    def cgi(self, path: str) -> str:
+        """Return absolute URL for a `/cgi-bin/...` path."""
+        if not path.startswith("/"):
+            path = "/" + path
+        return self.base() + path
+
+    def safe_label(self) -> str:
+        """User-visible identifier with credentials redacted."""
+        return f"{self.host}:{self.port}"
+
+    # ─── high-level helpers ───────────────────────────────────────────
+
+    def get(
+        self,
+        path: str,
+        *,
+        params: Optional[dict[str, Any]] = None,
+        timeout: float = 5.0,
+        stream: bool = False,
+    ) -> requests.Response:
+        """GET against `/cgi-bin/...`. Caller handles status + parsing."""
+        return requests.get(
+            self.cgi(path),
+            auth=self.auth(),
+            params=params,
+            timeout=timeout,
+            stream=stream,
+        )
+
+    def post(
+        self,
+        path: str,
+        *,
+        params: Optional[dict[str, Any]] = None,
+        data: Optional[bytes] = None,
+        headers: Optional[dict[str, str]] = None,
+        json_body: Optional[dict] = None,
+        timeout: float = 10.0,
+    ) -> requests.Response:
+        return requests.post(
+            self.cgi(path),
+            auth=self.auth(),
+            params=params,
+            data=data,
+            json=json_body,
+            headers=headers,
+            timeout=timeout,
+        )
+
+    def snapshot(self, channel: int = 1, timeout: float = 5.0) -> Optional["np.ndarray"]:
         """Fetch a single JPEG via `/cgi-bin/snapshot.cgi`, return BGR ndarray.
 
         Returns None on any failure — callers handle by logging and skipping
         the event, never by crashing the worker thread.
         """
-        import cv2  # local import — keeps this module importable in tests w/o cv2
+        import cv2  # local import — keeps this module importable without cv2
+        import numpy as np
 
-        url = f"{self._base()}/cgi-bin/snapshot.cgi?channel={channel}"
         try:
-            r = requests.get(url, auth=self._auth(), timeout=timeout)
+            r = self.get("/cgi-bin/snapshot.cgi", params={"channel": channel}, timeout=timeout)
         except requests.RequestException as exc:
             logger.warning("snapshot %s failed: %s", self.host, exc)
             return None
         if r.status_code != 200 or not r.content:
-            logger.warning("snapshot %s returned HTTP %s, %d bytes",
-                           self.host, r.status_code, len(r.content))
+            logger.warning(
+                "snapshot %s returned HTTP %s, %d bytes",
+                self.host, r.status_code, len(r.content),
+            )
             return None
         buf = np.frombuffer(r.content, dtype=np.uint8)
         frame = cv2.imdecode(buf, cv2.IMREAD_COLOR)
         if frame is None:
-            logger.warning("snapshot %s: cv2.imdecode returned None (corrupt JPEG)", self.host)
+            logger.warning("snapshot %s: cv2.imdecode returned None", self.host)
         return frame
 
-    def safe_label(self) -> str:
-        """User-visible identifier with credentials redacted."""
-        return f"{self.host}:{self.port}"
+
+def endpoints_from_settings() -> dict[int, DahuaCameraEndpoint]:
+    """Build an endpoint per active camera using the RTSP URLs in settings."""
+    from config.settings import settings
+
+    out: dict[int, DahuaCameraEndpoint] = {}
+    for cam_id, rtsp_url in settings.cameras.active().items():
+        endpoint = DahuaCameraEndpoint.from_rtsp_url(rtsp_url)
+        if endpoint is not None:
+            out[cam_id] = endpoint
+    return out

@@ -1,4 +1,4 @@
-// Live tab — grid of MJPEG tiles with a preset switcher per camera.
+// Live tab — grid of MJPEG tiles with deterrence buttons per camera.
 
 (function () {
   function el(tag, attrs = {}, ...children) {
@@ -12,57 +12,68 @@
     return node;
   }
 
-  function buildTile(cam) {
-    const select = el("select");
-    cam.presets.forEach((p) => {
-      const opt = el("option", { value: p }, p);
-      if (p === cam.active_preset) opt.setAttribute("selected", "selected");
-      select.appendChild(opt);
-    });
-    select.addEventListener("change", async () => {
-      const target = select.value;
-      select.disabled = true;
-      try {
-        const res = await fetch(`/api/cameras/${cam.camera_id}/preset`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ preset_id: target }),
-        });
-        const body = await res.json();
-        if (!body.ok) {
-          alert(body.error || "preset switch failed");
-          select.value = cam.active_preset;
-        } else {
-          cam.active_preset = body.active_preset;
-        }
-      } catch (e) {
-        alert("preset switch failed: " + e);
-        select.value = cam.active_preset;
-      } finally {
-        select.disabled = false;
-      }
-    });
+  async function fire(cameraId, btn) {
+    btn.disabled = true;
+    try {
+      const res = await fetch(`/api/deterrence/${cameraId}/fire`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ light: true, speaker: true }),
+      });
+      const body = await res.json();
+      if (!body.ok) alert(body.error || "deterrence fire failed");
+    } catch (e) {
+      alert("deterrence fire failed: " + e);
+    } finally {
+      btn.disabled = false;
+    }
+  }
 
+  async function standdown(cameraId, btn) {
+    btn.disabled = true;
+    try {
+      const res = await fetch(`/api/deterrence/${cameraId}/standdown`, { method: "POST" });
+      const body = await res.json();
+      if (!body.ok) alert(body.error || "stand-down failed");
+    } catch (e) {
+      alert("stand-down failed: " + e);
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  function buildTile(cam) {
     const img = el("img", {
       src: `/video_feed/${cam.camera_id}`,
       alt: `Camera ${cam.camera_id}`,
     });
 
+    const fireBtn = el("button", { class: "primary" }, "Test deterrence");
+    fireBtn.addEventListener("click", () => fire(cam.camera_id, fireBtn));
+
+    const standBtn = el("button", {}, "Stand down");
+    standBtn.addEventListener("click", () => standdown(cam.camera_id, standBtn));
+
+    const groupLabel = cam.workers_group_id
+      ? `face-group ${cam.workers_group_id}`
+      : "no face-group";
+
     return el("article", { class: "cam" },
       el("header", {},
-        el("h2", {}, `Camera ${cam.camera_id}`),
-        el("span", { class: cam.ptz_configured ? "pill pill-ok" : "pill pill-idle" },
-          cam.ptz_connected ? "PTZ" : (cam.ptz_configured ? "VPTZ" : "fixed"))
+        el("h2", {}, `Camera ${cam.camera_id} · ${cam.endpoint}`),
+        el("span", { class: "pill pill-ok" }, groupLabel),
       ),
       el("div", { class: "feed" }, img),
       el("div", { class: "controls" },
-        el("label", { class: "muted" }, "Preset"),
-        select,
+        fireBtn,
+        standBtn,
+        el("span", { class: cam.ptz_connected ? "pill pill-ok" : "pill pill-idle" },
+          cam.ptz_connected ? "PTZ ready" : "PTZ idle"),
       ),
     );
   }
 
-  async function render(state) {
+  function render(state) {
     const grid = document.getElementById("camera-grid");
     grid.innerHTML = "";
     if (!state.cameras.length) {

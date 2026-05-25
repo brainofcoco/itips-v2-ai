@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8" />
-<title>ITIPS V2 — Operator Dashboard</title>
+<title>ITIPS V2 — Dahua Operator Dashboard</title>
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <link rel="stylesheet" href="/dashboard/style.css" />
 </head>
@@ -15,9 +15,11 @@
   </div>
   <nav class="tabs">
     <button data-tab="live" class="active">Live</button>
-    <button data-tab="zones">Zones</button>
+    <button data-tab="workers">Workers</button>
+    <button data-tab="plates">Plates</button>
     <button data-tab="alerts">Alerts</button>
     <button data-tab="incidents">Incidents</button>
+    <button data-tab="testing">Test Console</button>
   </nav>
 </header>
 
@@ -29,35 +31,56 @@
     </div>
   </section>
 
-  <!-- ZONES TAB -->
-  <section data-tabpanel="zones" class="panel">
+  <!-- WORKERS TAB — face allowlist mapped directly into each Dahua FaceRecognitionServer -->
+  <section data-tabpanel="workers" class="panel">
     <div class="toolbar">
-      <label>Camera
-        <select id="zone-camera"></select>
-      </label>
-      <label>Preset
-        <select id="zone-preset"></select>
-      </label>
-      <button id="zone-snapshot">Capture frame</button>
+      <span class="muted">Add a worker</span>
+      <input id="worker-name" placeholder="Full name" />
+      <input id="worker-person-id" placeholder="Optional person_id" />
+      <select id="worker-sex">
+        <option value="">Sex (optional)</option>
+        <option value="Male">Male</option>
+        <option value="Female">Female</option>
+      </select>
+      <input type="file" id="worker-image" accept="image/jpeg,image/png" />
+      <button id="worker-add" class="primary">Enroll on all cameras</button>
       <span class="spacer"></span>
-      <label>New zone name
-        <input id="zone-name" placeholder="intrusion" />
-      </label>
-      <button id="zone-finish" disabled>Finish polygon</button>
-      <button id="zone-cancel" disabled>Cancel</button>
-      <button id="zone-save" class="primary">Save zones</button>
+      <button id="worker-refresh">Refresh</button>
     </div>
-    <div class="zone-workspace">
-      <div class="canvas-wrap">
-        <canvas id="zone-canvas" width="960" height="540"></canvas>
-        <p id="zone-hint" class="hint">Choose a camera + preset, capture a frame, then click points to draw a polygon.</p>
+    <p class="muted" id="worker-status"></p>
+    <div class="workers-layout">
+      <div>
+        <h3>Enrolled (local map)</h3>
+        <ul id="worker-list" class="alerts"></ul>
       </div>
-      <aside class="zone-list">
-        <h3>Polygons on this preset</h3>
-        <ul id="zone-items"></ul>
-        <p class="muted" id="zone-status"></p>
-      </aside>
+      <div>
+        <h3>Camera reality check</h3>
+        <p class="muted">Per-camera group contents straight from FaceRecognitionServer.</p>
+        <div id="worker-cameras"></div>
+      </div>
     </div>
+  </section>
+
+  <!-- PLATES TAB — TrafficRedList / TrafficBlackList mapped per camera -->
+  <section data-tabpanel="plates" class="panel">
+    <div class="toolbar">
+      <label>List
+        <select id="plate-list-type">
+          <option value="TrafficRedList">Red (allow / open gate)</option>
+          <option value="TrafficBlackList">Black (escalate)</option>
+        </select>
+      </label>
+      <input id="plate-number" placeholder="Plate number" />
+      <input id="plate-master" placeholder="Driver / owner (optional)" />
+      <label class="inline">
+        <input type="checkbox" id="plate-open-gate" /> Open gate
+      </label>
+      <button id="plate-add" class="primary">Add to all cameras</button>
+      <span class="spacer"></span>
+      <button id="plate-refresh">Refresh</button>
+    </div>
+    <p class="muted" id="plate-status"></p>
+    <div id="plate-cameras"></div>
   </section>
 
   <!-- ALERTS TAB -->
@@ -67,6 +90,115 @@
       <button id="alerts-clear">Clear</button>
     </div>
     <ul id="alerts-list" class="alerts"></ul>
+  </section>
+
+  <!-- TEST CONSOLE TAB -->
+  <section data-tabpanel="testing" class="panel">
+    <div class="test-layout">
+      <!-- column 1: live event tap -->
+      <div class="test-col">
+        <h3>Live Dahua events</h3>
+        <p class="muted">Every event each camera fires lands here, regardless of cooldown.</p>
+        <div class="toolbar">
+          <span id="tap-status" class="pill pill-idle">Connecting…</span>
+          <button id="tap-clear">Clear</button>
+          <span class="spacer"></span>
+          <label class="inline"><input type="checkbox" id="tap-autoscroll" checked /> Auto-scroll</label>
+        </div>
+        <ul id="tap-list" class="event-tap"></ul>
+      </div>
+
+      <!-- column 2: camera quick-actions + simulator -->
+      <div class="test-col">
+        <h3>Camera quick-actions</h3>
+        <p class="muted">Direct HTTP calls to each Dahua camera's API.</p>
+        <div id="cam-actions"></div>
+
+        <h3>PTZ jog pad</h3>
+        <div class="toolbar">
+          <label>Camera <select id="jog-camera"></select></label>
+          <label>Speed <input id="jog-speed" type="number" min="1" max="8" value="4" /></label>
+        </div>
+        <div class="jog-pad">
+          <button data-dir="left_up">↖</button><button data-dir="up">↑</button><button data-dir="right_up">↗</button>
+          <button data-dir="left">←</button><button data-dir="zoom_wide" class="wide">−</button><button data-dir="right">→</button>
+          <button data-dir="left_down">↙</button><button data-dir="down">↓</button><button data-dir="right_down">↘</button>
+        </div>
+        <div class="toolbar">
+          <button data-dir="zoom_tele" id="jog-zoom-in" class="primary">Zoom in</button>
+          <button data-dir="zoom_wide" id="jog-zoom-out">Zoom out</button>
+        </div>
+
+        <h3>Event simulator</h3>
+        <p class="muted">Inject synthetic events into the AlertEngine to verify the lifecycle without waiting on a real trigger.</p>
+        <div class="toolbar">
+          <label>Camera <select id="sim-camera"></select></label>
+        </div>
+        <div class="sim-grid">
+          <button data-sim="face_intruder">Face → INTRUDER</button>
+          <button data-sim="face_known">Face → known worker</button>
+          <button data-sim="line_crossing">Line crossing</button>
+          <button data-sim="intrusion">Region intrusion</button>
+          <button data-sim="loitering">Loitering</button>
+          <button data-sim="plate">Plate capture</button>
+          <button data-sim="fire">Fire</button>
+          <button data-sim="smoke">Smoke</button>
+        </div>
+        <p class="muted" id="sim-status"></p>
+      </div>
+
+      <!-- column 3: inbound (8443) tester -->
+      <div class="test-col">
+        <h3>Inbound API (port 8443)</h3>
+        <p class="muted">Proxied through the dashboard so the bearer stays server-side.</p>
+
+        <details open>
+          <summary>B1 · Personnel sync</summary>
+          <div class="form-stack">
+            <select id="b1-action">
+              <option value="add">add</option>
+              <option value="update">update</option>
+              <option value="deactivate">deactivate</option>
+            </select>
+            <input id="b1-person-id" placeholder="person_id" />
+            <input id="b1-full-name" placeholder="full_name" />
+            <input id="b1-image" type="file" accept="image/jpeg,image/png" />
+            <button data-inbound="personnel/sync" id="b1-fire" class="primary">POST B1</button>
+          </div>
+        </details>
+
+        <details>
+          <summary>B3 · Maintenance window</summary>
+          <div class="form-stack">
+            <select id="b3-action">
+              <option value="arm">arm</option>
+              <option value="disarm">disarm</option>
+            </select>
+            <input id="b3-window-id" placeholder="window_id" />
+            <input id="b3-person-id" placeholder="person_id" />
+            <button data-inbound="maintenance/window" id="b3-fire" class="primary">POST B3</button>
+          </div>
+        </details>
+
+        <details>
+          <summary>B4 · Commands</summary>
+          <div class="form-stack">
+            <select id="b4-command">
+              <option value="ptz_override">ptz_override</option>
+              <option value="deterrence_fire">deterrence_fire</option>
+              <option value="deterrence_standdown">deterrence_standdown</option>
+              <option value="request_stream">request_stream</option>
+            </select>
+            <input id="b4-camera-id" type="number" value="1" />
+            <textarea id="b4-params" rows="3" placeholder='{"preset_id": 1}'></textarea>
+            <button data-inbound="commands" id="b4-fire" class="primary">POST B4</button>
+          </div>
+        </details>
+
+        <h3>Last response</h3>
+        <pre id="inbound-response" class="muted">—</pre>
+      </div>
+    </div>
   </section>
 
   <!-- INCIDENTS TAB -->

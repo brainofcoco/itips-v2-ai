@@ -1,20 +1,20 @@
 """Two-stage alert engine: PRELIMINARY → CONFIRMED.
 
-Detection events open an incident in the PRELIMINARY state and trigger
-the recorder so the pre-event buffer is captured and the post-event tail
-starts streaming. RAPID dispatch and an A3 "confirmed" packet only emit
-once a corroborating signal lands:
+In the Dahua-driven architecture the camera onboard AI does *every*
+primary classification (face match, perimeter line cross, region entry,
+loitering, plate read, fire, smoke). The Jetson's job here is just to
+turn those classified events into incidents:
 
-  - dwell:    the same track stays in zone past `confirmation_dwell_seconds`
-  - sensor:   a PIR/door-contact event arrives for the same site within
-              `confirmation_window_seconds`
-  - face:     face recognition labels the track as INTRUDER
+  * one PRELIMINARY incident per (camera, recent window),
+  * promote to CONFIRMED on a corroborating signal,
+  * finalize idle incidents and ship the signed package via the intake.
 
-A janitor thread finalises any incident whose last event is older than
-`idle_timeout_seconds` — the recorder closes pre+post MP4s, attaches them
-to the packager, and the packager signs and seals the package.
+Confirmation signals:
+  - dwell:     same camera keeps emitting events past `confirmation_dwell_seconds`
+  - face:      a FaceRecognition with empty Candidates labelled the track INTRUDER
+  - fire/smoke: forced fast promotion (life safety)
 
-Everything goes through the intake queue. We never call the cloud.
+Everything goes through the intake queue. We never call the cloud here.
 """
 
 from __future__ import annotations
@@ -26,7 +26,6 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
-from config.settings import settings
 from itips.sync.intake import IntakeWriter
 from itips.sync.schema import Priority
 from itips.utils.clock import monotonic_ns, now_iso
@@ -92,8 +91,6 @@ class AlertEngine:
         self._recorders[camera_id] = recorder
 
     def feed_frame(self, camera_id: int, frame) -> None:
-        """Camera worker calls this every tick so the recorder has a
-        continuously-populated pre-event buffer."""
         rec = self._recorders.get(camera_id)
         if rec is not None:
             try:
@@ -104,26 +101,33 @@ class AlertEngine:
     def stop(self) -> None:
         self._janitor_stop.set()
 
-    # ─── public surface ────────────────────────────────────────────
+    # ─── public surface — Dahua-native handlers ───────────────────
 
-    def handle_behaviour_alert(self, alert) -> None:
-        state = self._touch_incident(alert.camera_id)
+    def handle_behaviour_alert_simple(
+        self,
+        *,
+        camera_id: int,
+        alert_type: str,
+        details: dict[str, Any],
+    ) -> None:
+        """Single-frame behaviour event from a camera-side rule.
+
+        Used for line crossing, region intrusion, loitering, motion, work
+        clothes — anything where the camera classified the event and we
+        just need to log + open an incident.
+        """
+        state = self._touch_incident(camera_id)
         record = self._record("behaviour", {
-            "alert_type": alert.alert_type,
-            "camera_id": alert.camera_id,
-            "track_id": alert.track_id,
-            "details": alert.details,
+            "alert_type": alert_type,
+            "camera_id": camera_id,
+            "details": details,
         }, incident_id=state.incident_id)
         self._publish(record, priority=Priority.INCIDENT_EVENT, endpoint="A4",
                       incident_id=state.incident_id)
-        # Dwell-based confirmation: the analyser keeps zone_entry_at on
-        # the track, and forwards it via `alert.details["dwell_seconds"]`
-        # when set. As a safety net, the janitor will also promote on
-        # consecutive events stretching past dwell.
         if state.stage == STAGE_PRELIMINARY:
             elapsed = state.last_event_at - state.first_event_at
-            if elapsed >= state.dwell_required_s:
-                self._promote(state, signal="dwell")
+            if elapsed >= state.dwell_required_s or alert_type == "loitering":
+                self._promote(state, signal=f"dwell:{alert_type}")
 
     def handle_face_intruder(self, *, camera_id: int, face_bbox, name: str) -> None:
         state = self._touch_incident(camera_id)
@@ -137,29 +141,74 @@ class AlertEngine:
         if state.stage == STAGE_PRELIMINARY:
             self._promote(state, signal="face_intruder")
 
-    def handle_sensor_event(self, event) -> None:
-        record = self._record("sensor", {
-            "event_type": getattr(event, "event_type", "unknown"),
-            "zone_id": getattr(event, "zone_id", None),
-            "zone_name": getattr(event, "zone_name", None),
-            "event_state": getattr(event, "event_state", None),
+    def handle_personnel_seen(
+        self,
+        *,
+        camera_id: int,
+        person_uid: str,
+        group_id: str,
+        name: str,
+        similarity: int,
+    ) -> None:
+        """Camera matched a face to the workers group. Log only — no incident."""
+        record = self._record("personnel_seen", {
+            "camera_id": camera_id,
+            "person_uid": person_uid,
+            "group_id": group_id,
+            "name": name,
+            "similarity": similarity,
         })
-        self._publish(record, priority=Priority.INCIDENT_EVENT, endpoint="A2",
+        # Personnel sightings go to the intake at low priority so HQ can
+        # build a presence log; they don't trigger A3/A8.
+        self._publish(record, priority=Priority.HEARTBEAT, endpoint="A1",
                       incident_id=None)
-        # Sensor events corroborate every preliminary incident within the
-        # window — sensors aren't per-camera so we apply globally.
-        now = time.monotonic()
-        with self._lock:
-            promotable = [
-                s for s in self._incidents.values()
-                if s.stage == STAGE_PRELIMINARY and (now - s.first_event_at) <= self._window_s
-            ]
-        for state in promotable:
-            self._promote(state, signal="sensor")
+
+    def handle_plate_capture(
+        self,
+        *,
+        camera_id: int,
+        plate_number: str,
+        plate_color: Optional[str] = None,
+        vehicle_color: Optional[str] = None,
+        speed: Optional[float] = None,
+    ) -> None:
+        record = self._record("plate_capture", {
+            "camera_id": camera_id,
+            "plate_number": plate_number,
+            "plate_color": plate_color,
+            "vehicle_color": vehicle_color,
+            "speed": speed,
+        })
+        # The camera's onboard TrafficBlackList / TrafficRedList already
+        # gates which plates trigger its own alarm rails. Here we always
+        # forward the read so the backend can audit it.
+        self._publish(record, priority=Priority.MEDIA_CAPTURE, endpoint="A6",
+                      incident_id=None)
+
+    def handle_fire(self, *, camera_id: int, details: dict[str, Any]) -> None:
+        state = self._touch_incident(camera_id)
+        record = self._record("fire", {"camera_id": camera_id, "details": details},
+                              incident_id=state.incident_id)
+        self._publish(record, priority=Priority.INCIDENT_EVENT, endpoint="A4",
+                      incident_id=state.incident_id)
+        # Life safety — promote immediately.
+        if state.stage == STAGE_PRELIMINARY:
+            self._promote(state, signal="fire")
+
+    def handle_smoke(self, *, camera_id: int, details: dict[str, Any]) -> None:
+        state = self._touch_incident(camera_id)
+        record = self._record("smoke", {"camera_id": camera_id, "details": details},
+                              incident_id=state.incident_id)
+        self._publish(record, priority=Priority.INCIDENT_EVENT, endpoint="A4",
+                      incident_id=state.incident_id)
+        if state.stage == STAGE_PRELIMINARY:
+            self._promote(state, signal="smoke")
 
     def handle_heartbeat(self, payload: dict[str, Any]) -> None:
         record = self._record("heartbeat", payload)
         self._publish(record, priority=Priority.HEARTBEAT, endpoint="A1", incident_id=None)
+
+    # ─── inspection ───────────────────────────────────────────────
 
     def history(self) -> list[dict[str, Any]]:
         with self._history_lock:
@@ -179,7 +228,7 @@ class AlertEngine:
                 for s in self._incidents.values()
             ]
 
-    # ─── internals ─────────────────────────────────────────────────
+    # ─── internals ────────────────────────────────────────────────
 
     def _touch_incident(self, camera_id: int) -> _IncidentState:
         now = time.monotonic()
@@ -216,8 +265,6 @@ class AlertEngine:
             },
             incident_id=incident_id,
         )
-        # Start recording immediately — we don't want to miss the
-        # pre-event buffer if a confirmation arrives 10 s later.
         recorder = self._recorders.get(camera_id)
         if recorder is not None and package_dir is not None:
             try:
@@ -254,8 +301,6 @@ class AlertEngine:
                     state.camera_id, state.incident_id, signal)
 
     def _packager_dir(self, incident_id: str):
-        # The packager creates the directory inside its own thread; wait
-        # briefly so it's ready when the recorder opens its MP4s.
         store_root = getattr(self._packager, "store_root", None)
         if store_root is None:
             return None
@@ -265,7 +310,7 @@ class AlertEngine:
             if target.exists():
                 return target
             time.sleep(0.02)
-        return target  # let recorder/packager handle the race
+        return target
 
     def _record(self, kind: str, body: dict[str, Any], *, incident_id: str | None = None) -> dict[str, Any]:
         return {
@@ -291,12 +336,9 @@ class AlertEngine:
     # ─── janitor ──────────────────────────────────────────────────
 
     def _janitor_loop(self) -> None:
-        # Sweep at least 3× per idle window so a confirmation-soon-after
-        # finalize doesn't race; bounded to avoid tight loops in prod.
         interval = max(0.1, min(2.0, self._idle_s / 3.0))
         while not self._janitor_stop.wait(timeout=interval):
             self._sweep_once()
-        # Final flush so shutdown doesn't drop in-flight incidents.
         self._sweep_once(force=True)
 
     def _sweep_once(self, *, force: bool = False) -> None:

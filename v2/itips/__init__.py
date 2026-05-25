@@ -1,3 +1,3 @@
-"""ITIPS edge node — V2."""
+"""ITIPS edge node — V2 (Dahua-native)."""
 
-__version__ = "2.0.0"
+__version__ = "2.1.0"

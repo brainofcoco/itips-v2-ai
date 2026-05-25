@@ -1,4 +1,4 @@
-# ITIPS V2 — developer ergonomics
+# ITIPS V2.1 — developer ergonomics.
 # Run `make help` for the menu.
 
 .DEFAULT_GOAL := help
@@ -8,54 +8,37 @@ DOCKER ?= docker
 COMPOSE ?= docker compose
 PYTHON ?= python3
 
-.PHONY: help install build up down logs restart sim sim-down sim-logs test lint fmt typecheck check clean fresh
-.PHONY: shell bench export-trt
+.PHONY: help install build up down logs restart shell ps test lint fmt typecheck check clean fresh
 
 help:  ## Show available targets
 	@awk 'BEGIN {FS = ":.*##"; printf "Usage: make \033[36m<target>\033[0m\n\nTargets:\n"} \
 	      /^[a-zA-Z_-]+:.*##/ { printf "  \033[36m%-15s\033[0m %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
 
-install:  ## Install Python deps locally (dev)
+install:  ## Install Python deps locally (dev only, not needed for docker)
 	$(PYTHON) -m pip install -e ".[dev]"
 
-# A working `nvidia-smi` is the cheapest "am I on a Jetson?" check. If
-# we're on a laptop the production targets refuse to run and point the
-# user at `make sim` instead — much friendlier than a 60-second
-# DeadlineExceeded on the L4T base image.
-define require_jetson
-	@command -v nvidia-smi >/dev/null 2>&1 || { \
-		echo ""; \
-		echo "  ✗ This target is for the Jetson only (nvidia-smi not found)."; \
-		echo "  → On a laptop, run 'make sim' instead."; \
-		echo ""; \
-		exit 1; \
-	}
-endef
-
-build:  ## Build the Jetson docker image (Jetson only — use 'make sim' on a laptop)
-	$(call require_jetson)
+build:  ## Build the docker image
 	$(COMPOSE) build
 
-up:  ## Start the Jetson container (Jetson only — use 'make sim' on a laptop)
-	$(call require_jetson)
+up:  ## Start the container (works on Mac and Jetson identically)
+	@mkdir -p ./var ./evidence_store
 	$(COMPOSE) up -d
+	@echo ""
+	@echo "  Dashboard:  http://localhost:5050/dashboard"
+	@echo "  API docs:   http://localhost:5050/docs"
+	@echo "  Inbound:    http://localhost:8443/docs (bearer required)"
+	@echo ""
 
-down:  ## Stop the Jetson container
+down:  ## Stop the container
 	$(COMPOSE) down
 
 logs:  ## Follow container logs
 	$(COMPOSE) logs -f --tail=200 itips
 
-restart: down up  ## Restart the Jetson container
+restart: down up  ## Restart
 
-sim:  ## Start simulation mode (MediaMTX + ffmpeg + ITIPS, no GPU required)
-	$(COMPOSE) -f docker-compose.yml -f docker-compose.sim.yml up -d --build
-
-sim-down:  ## Stop simulation
-	$(COMPOSE) -f docker-compose.yml -f docker-compose.sim.yml down
-
-sim-logs:  ## Follow simulation logs
-	$(COMPOSE) -f docker-compose.yml -f docker-compose.sim.yml logs -f --tail=200
+ps:  ## Show container status
+	$(COMPOSE) ps
 
 shell:  ## Open a shell inside the running container
 	$(COMPOSE) exec itips bash
@@ -74,15 +57,9 @@ typecheck:  ## mypy
 
 check: lint typecheck test  ## Run all quality gates
 
-export-trt:  ## Convert yolo11n.pt → yolo11n.engine on the Jetson
-	./scripts/export_yolo_tensorrt.sh
-
-bench:  ## Benchmark inference FPS on the Jetson
-	$(PYTHON) -m itips.tools.bench
-
 clean:  ## Remove pycache + test artefacts
 	find . -type d -name __pycache__ -prune -exec rm -rf {} +
-	rm -rf .pytest_cache .coverage htmlcov dist build *.egg-info
+	rm -rf .pytest_cache .coverage htmlcov dist build *.egg-info .venv-refactor
 
-fresh: clean down  ## Hard reset — clean + down (does NOT touch evidence_store)
-	@echo "Cleaned. Evidence and intake DB preserved on the NVMe."
+fresh: clean down  ## Hard reset — clean + down (does NOT touch evidence_store/ or var/)
+	@echo "Cleaned. Evidence and intake DB preserved on host."

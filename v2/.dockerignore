@@ -3,6 +3,7 @@
 .git/
 .github/
 .venv/
+.venv-refactor/
 venv/
 __pycache__/
 *.pyc
@@ -16,7 +17,8 @@ evidence_store/
 logs/
 dataset/
 models/
-assets/sim/*.mp4
+assets/
 *.engine
 *.onnx
 *.pt
+*.tmp

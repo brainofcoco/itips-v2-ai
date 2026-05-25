@@ -1,98 +1,150 @@
-# ITIPS-ai — V2
+# ITIPS-ai — V2.1 (Dahua-native)
 
-The on-Jetson edge node of the ITIPS national telecom infrastructure protection
-platform. This is a clean re-implementation of the V1 codebase against the
-v2.5 PRD (`../docs/about-project.md`), with the structural fixes called out in
-`../docs/feedback.md`.
+The on-Jetson edge node of the ITIPS national telecom infrastructure
+protection platform. V2.1 trims the heavy ML stack from V2 and leans on
+the Dahua cameras' onboard AI as the primary classifier.
 
-V2 exists to do four things V1 did not:
+The Jetson runs zero inference. The cameras' WizMind / TiOC silicon does
+face recognition, line/region/wander detection, ANPR, fire/smoke
+detection, and active deterrence. The Jetson subscribes to camera
+events, packages signed evidence, and proxies operator clicks onto the
+Dahua HTTP API.
 
-1. **Fix the lag.** Per-camera worker threads, YOLO11n + TensorRT, 640 px input.
-   The single-threaded `for cam in cameras: ...` loop in V1 is gone.
-2. **Honour the team boundary.** The AI pipeline ends at a local intake queue.
-   It never makes outbound cloud calls. The Sync Agent (backend deliverable)
-   drains the queue.
-3. **Produce signed evidence.** Per-incident packages with HMAC-SHA-256
-   signatures, a 15-minute pre-event ring buffer, and the PRD §4.3 manifest.
-4. **Accept backend commands.** A separate port 8443 server implements the
-   B1–B5 inbound API: personnel sync, config push, maintenance windows,
-   PTZ overrides, firmware.
+## Run it locally on your Mac, against real cameras
 
-V2 keeps every working detection idea from V1 (GStreamer + NVDEC, InsightFace
-SCRFD+ArcFace, sensor-triggered PTZ pan, zone-aware behaviour analysis,
-object-removal heuristics) and reorganises them around those four pillars.
+The Docker image is small (~280 MB), multi-arch, and has no GPU
+dependency. The same image builds on a Mac for live validation and on
+the Jetson for production.
 
-## Quick start
+### 1. One-time setup
 
 ```bash
-# 1. Copy the env template and fill in real values
+cd v2
+
+# Copy and edit env. The RTSP URLs already carry the HTTP credentials
+# (Dahua uses the same user/pass on both protocols), so this is the
+# only knob per camera.
 cp .env.example .env
-nano .env                  # or vim / code / open -e
-
-# 2. Sanity-check on a laptop with no cameras and no GPU (simulation mode)
-make sim
-
-# 3. On the Jetson, with real cameras
-make up
+nano .env
 ```
 
-`make help` lists every target.
+Required `.env` keys:
 
-Once it's up, open **http://localhost:5050/docs** in a browser — that's the
-Scalar API reference, with a built-in HTTP client so you can fire every
-endpoint without leaving the page. The same UI is also mounted on the
-inbound surface at **http://localhost:8443/docs** (use the bearer token
-you set in `.env` as `ITIPS_INBOUND_TOKEN`).
+| Key | What |
+|---|---|
+| `ITIPS_SITE_ID`, `ITIPS_OPERATOR_ID`, `ITIPS_DEVICE_ID` | Anything for local test — they get stamped onto intake records. |
+| `ITIPS_CAMERA_1_RTSP` (and 2/3/4) | `rtsp://admin:PASS@192.168.0.184:554/...`. Leave unused slots blank. |
+| `ITIPS_DEVICE_HMAC_KEY` | 64-hex-char (any 32 bytes will do for local test). |
+| `ITIPS_INBOUND_TOKEN` | Any string — used by the dashboard's Inbound proxy. |
+
+### 2. Confirm your Mac can reach the cameras
+
+```bash
+# Should return HTTP 200 (digest-auth challenge) on each one:
+curl -I -u admin:PASS --digest http://192.168.0.184/cgi-bin/snapshot.cgi
+curl -I -u admin:PASS --digest http://192.168.0.123/cgi-bin/snapshot.cgi
+curl -I -u admin:PASS --digest http://192.168.0.124/cgi-bin/snapshot.cgi
+```
+
+If those work, your Mac (and therefore the container) is on the same LAN
+as the cameras and can talk to them.
+
+### 3. Build + run
+
+```bash
+make build       # ~90s first time, ~5s on subsequent rebuilds (cached layers)
+make up
+make logs
+```
+
+Open the dashboard at <http://localhost:5050/dashboard>.
+
+Tabs you'll use most:
+
+- **Live** — MJPEG tiles of the latest event snapshot from each camera,
+  plus a quick deterrence fire/standdown button per camera.
+- **Workers** — upload a JPEG of a worker; the container fans it out via
+  `POST /cgi-bin/faceRecognitionServer.cgi?action=addPerson` to every
+  camera. Each camera assigns its own UID; we persist the mapping.
+- **Plates** — add/remove plates per camera against `TrafficRedList` (allow,
+  optional gate-open) or `TrafficBlackList` (escalate).
+- **Test Console** — three panes:
+  1. *Live Dahua events* — SSE feed of every event the cameras fire,
+     including the ones filtered by the dispatcher's cooldown.
+  2. *Camera quick-actions + PTZ jog pad + Event simulator* — press-and-hold
+     directional jog, plus one-click buttons that inject synthetic events
+     into the AlertEngine so you can verify the incident lifecycle without
+     a real motion trigger.
+  3. *Inbound API tester* — collapsible forms for B1–B5 (proxied through
+     the dashboard so the bearer stays server-side).
+- **Alerts** — SSE of every record the AlertEngine emits.
+- **Incidents** — local signed evidence packages.
+
+API reference (Scalar UI):
+
+- Public surface: <http://localhost:5050/docs>
+- Inbound surface: <http://localhost:8443/docs> (bearer required)
+
+### 4. Tear down
+
+```bash
+make down        # stops the container
+make fresh       # also cleans pycache (evidence + intake DB are preserved on host)
+```
+
+Inspect anything the container wrote on your Mac:
+
+```bash
+ls var/                    # intake.sqlite, personnel.sqlite, logs/
+ls evidence_store/incidents/  # signed packages
+```
+
+### Will it work on Docker Desktop for Mac?
+
+Yes — with one important note. On macOS, Docker Desktop **does not honour
+`network_mode: host`**, which is why the compose file uses normal port
+mapping (`-p 5050:5050 -p 8443:8443`). All traffic *from* the container
+*to* your cameras (192.168.x.x) routes through Docker's NAT and reaches
+them just like any other LAN device — no special config needed. We use
+that path for every Dahua call (`eventManager.cgi`, `snapshot.cgi`,
+`faceRecognitionServer.cgi`, `recordUpdater.cgi`, `coaxialControlIO.cgi`,
+`ptz.cgi`). No camera ever needs to reach back into the container.
+
+When you move to the Jetson the same compose file works as-is on Linux.
 
 ## Repository layout
 
 ```
 v2/
-├── README.md                 — this file
-├── ARCHITECTURE.md           — design decisions, the lag fix, the boundary
-├── DEPLOY.md                 — Jetson deployment runbook
-├── RULE.md                   — coding standards
-├── pyproject.toml            — Python 3.10 deps, pinned for L4T r36
-├── Dockerfile                — multi-stage, l4t-ml base
-├── docker-compose.yml        — production-shaped compose on a Jetson
-├── docker-compose.sim.yml    — laptop simulation overlay (MediaMTX + ffmpeg)
-├── Makefile                  — common dev targets
-├── .env.example              — secrets and per-site config template
-├── .gitignore                — protects .env, model weights, evidence
-├── .dockerignore
-├── .github/workflows/        — CI: lint, tests, arm64 image build
+├── README.md
+├── pyproject.toml            — Python 3.10–3.11 deps (no ML)
+├── Dockerfile                — slim multi-arch image
+├── docker-compose.yml        — Mac + Jetson, same file
+├── Makefile
+├── .env.example
 ├── config/
-│   ├── settings.py           — single source of truth for tunables
-│   └── zones.example.json    — default detection zones
-├── itips/                    — the Python package
-│   ├── __main__.py           — `python -m itips`
-│   ├── app.py                — bootstrap
-│   ├── runtime/              — orchestrator + per-camera workers (LAG FIX)
-│   ├── camera/               — GStreamer RTSP reader
-│   ├── detection/            — YOLO11n, InsightFace, ByteTrack, Plate Recognizer
-│   ├── behaviour/            — zones, rules, tracks, object removal
-│   ├── sensors/              — AX PRO listener
-│   ├── alerts/               — alert engine, PTZ controller
-│   ├── evidence/             — packager, signing, manifest, pre-event buffer
+│   └── settings.py
+├── itips/
+│   ├── __main__.py
+│   ├── app.py
+│   ├── runtime/              — orchestrator, dispatchers, EventTap
+│   ├── camera/               — Dahua HTTP clients
+│   │   ├── dahua_http.py     —   endpoint + snapshot
+│   │   ├── dahua_face_db.py  —   faceRecognitionServer.cgi
+│   │   ├── dahua_plate_db.py —   recordUpdater.cgi (Red/BlackList)
+│   │   ├── dahua_deterrence  —   coaxialControlIO.cgi
+│   │   ├── dahua_ptz.py      —   ptz.cgi (incl. jog start/stop)
+│   │   └── dahua_manager.py
+│   ├── sensors/              — Dahua event listener (multipart parser)
+│   ├── alerts/               — two-stage AlertEngine
+│   ├── evidence/             — packager, signing, manifest, recorder
 │   ├── sync/                 — local intake queue → backend Sync Agent
-│   ├── api/                  — port 5050 public, port 8443 inbound
-│   └── utils/                — geometry, drawing, clock, logging
-├── scripts/
-│   ├── export_yolo_tensorrt.sh
-│   ├── simulate_cameras.sh
-│   └── healthcheck.sh
-├── tests/                    — pytest suite
-└── docs/                     — V2-specific design notes
+│   ├── api/                  — Flask 5050 (dashboard) + 8443 (inbound)
+│   │   ├── personnel_store   —   local person_id ↔ camera UID map
+│   │   └── static/dashboard  —   HTML + vanilla JS (Test Console here)
+│   └── utils/
+└── tests/                    — 44 tests, all pass without GPU/ML deps
 ```
-
-## Status
-
-V2 is being built in parallel with the V1 POC site visit (2026-05-21). The
-goal is for V2 to be the platform that ships from Phase 1 onwards. V1 carries
-the POC.
-
-See `ARCHITECTURE.md` for *why* the structure looks the way it does. See
-`../docs/feedback.md` for the gap analysis that motivated the rebuild.
 
 ## License
 

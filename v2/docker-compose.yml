@@ -1,34 +1,42 @@
-# Production-shaped compose for a Jetson at a tower site.
-# `make up` runs this. `make sim` overlays docker-compose.sim.yml on top.
+# ITIPS V2.1 — Dahua-native edge node.
+#
+# Same compose works on a Mac (for validating against real cameras over
+# the LAN before Jetson rollout) and on the Jetson at a site.
+#
+# Networking:
+#   - The container reaches your cameras outbound (192.168.x.x) through the
+#     normal Docker bridge — works on Mac Docker Desktop without host-mode.
+#   - Ports 5050 (dashboard) and 8443 (inbound API) are mapped to the host
+#     so you can open http://localhost:5050/dashboard in your Mac browser.
+#
+# Storage:
+#   - ./var/            → /opt/itips/var/            (intake.sqlite, logs, personnel.sqlite)
+#   - ./evidence_store/ → /opt/itips/evidence_store/ (signed incident packages)
+#   The dirs are created on first `up`. Inspect them on the host.
 
 services:
   itips:
     build:
       context: .
       dockerfile: Dockerfile
-    image: itips/edge:2.0.0
+    image: itips/edge:2.1.0
     container_name: itips
     restart: unless-stopped
-    mem_limit: 6g
-    memswap_limit: 6g  # disable swap for container so kernel never thrashes
-    runtime: nvidia
-    environment:
-      NVIDIA_VISIBLE_DEVICES: all
-      NVIDIA_DRIVER_CAPABILITIES: all
     env_file:
       - .env
-    network_mode: host
+    ports:
+      - "5050:5050"   # dashboard + Test Console
+      - "8443:8443"   # backend → Jetson inbound API
     volumes:
-      - /opt/itips/evidence_store:/opt/itips/evidence_store
-      - /opt/itips/dataset:/opt/itips/dataset
-      - /opt/itips/var:/opt/itips/var
-      - /opt/itips/models:/opt/itips/models
-    # /tmp on tmpfs keeps frame copies off the NVMe write counter.
+      - ./var:/opt/itips/var
+      - ./evidence_store:/opt/itips/evidence_store
+    # tmpfs for transient frame copies — keeps SD/NVMe wear down.
     tmpfs:
-      - /tmp:size=512m
+      - /tmp:size=128m
+    mem_limit: 1g
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:5050/health"]
       interval: 30s
       timeout: 5s
-      start_period: 30s
+      start_period: 10s
       retries: 3

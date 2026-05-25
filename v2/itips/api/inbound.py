@@ -2,23 +2,34 @@
 
 Routes implemented:
   B1  POST /local/api/v1/personnel/sync       — personnel cache update
-  B2  POST /local/api/v1/config               — hot config push
+  B2  POST /local/api/v1/config               — hot config push (no-op stub)
   B3  POST /local/api/v1/maintenance/window   — arm/disarm window
-  B4  POST /local/api/v1/commands             — PTZ override, standdown, request_stream
+  B4  POST /local/api/v1/commands             — PTZ / deterrence / stream
   B5  POST /local/api/v1/firmware/update      — schedule firmware install
 
-Auth model:
-  POC: static bearer token in `Authorization: Bearer <ITIPS_INBOUND_TOKEN>`.
-  Phase 1: mutual TLS using a per-device certificate. The route handlers
-  themselves don't change — only the middleware.
+Personnel sync (B1)
+-------------------
+The backend now ships the worker JPEG (the camera does the embedding
+work). Payload supports two shapes:
 
-The server runs in its own thread so it doesn't block startup. TLS is
-optional; when cert+key paths are present we serve HTTPS, otherwise HTTP
-(useful for POC site networks where TLS terminates upstream).
+  * `{"action":"add","person_id":"p1","full_name":"...","image_b64":"..."}`
+  * `{"action":"deactivate","person_id":"p1"}`
+
+For `add`/`update` we fan out to every active camera's FaceRecognitionServer
+and record the camera-assigned UID alongside our `person_id`. On `deactivate`
+we look up those UIDs and delete on every camera.
+
+Commands (B4)
+-------------
+* `ptz_override`           → DahuaPTZ.apply_override (preset/bbox/abs angles)
+* `deterrence_standdown`   → DahuaDeterrence.standdown on the requested camera
+* `deterrence_fire`        → DahuaDeterrence.fire on the requested camera
+* `request_stream`         → returns the existing MJPEG hint
 """
 
 from __future__ import annotations
 
+import base64
 import logging
 import threading
 from typing import Any
@@ -26,16 +37,23 @@ from typing import Any
 from flask import Flask, jsonify, request
 
 from config.settings import settings
+from itips.api.personnel_store import PersonnelStore
+from itips.camera.dahua_face_db import DahuaFaceDBError
+from itips.camera.dahua_manager import DahuaManager
 
 logger = logging.getLogger(__name__)
 
 
 class InboundApiServer(threading.Thread):
-    def __init__(self, *, face_engine, face_authorizer, ptz_controllers) -> None:
+    def __init__(
+        self,
+        *,
+        dahua_manager: DahuaManager,
+        personnel_store: PersonnelStore,
+    ) -> None:
         super().__init__(name="api-inbound", daemon=True)
-        self._face_engine = face_engine
-        self._face_authorizer = face_authorizer
-        self._ptz_controllers = ptz_controllers or {}
+        self._dahua = dahua_manager
+        self._personnel = personnel_store
         self._app = self._build_app()
         self._server = None
         self._stop = threading.Event()
@@ -46,9 +64,6 @@ class InboundApiServer(threading.Thread):
         app = Flask("itips-inbound")
         register_docs(app)
 
-        # /health, /docs, and /openapi.yaml are intentionally open so the
-        # Scalar reference loads without a token. Every B1–B5 route below
-        # still requires the bearer.
         _open_paths = {"/health", "/docs", "/docs/", "/openapi.yaml"}
 
         @app.before_request
@@ -68,7 +83,7 @@ class InboundApiServer(threading.Thread):
         @app.post("/local/api/v1/personnel/sync")
         def b1_personnel_sync():
             payload = request.get_json(silent=True) or {}
-            result = _apply_personnel_sync(payload, self._face_engine)
+            result = _apply_personnel_sync(payload, self._dahua, self._personnel)
             return jsonify(result)
 
         @app.post("/local/api/v1/config")
@@ -79,12 +94,12 @@ class InboundApiServer(threading.Thread):
         @app.post("/local/api/v1/maintenance/window")
         def b3_maintenance():
             payload = request.get_json(silent=True) or {}
-            return jsonify(_apply_maintenance(payload, self._face_authorizer))
+            return jsonify(_apply_maintenance(payload))
 
         @app.post("/local/api/v1/commands")
         def b4_commands():
             payload = request.get_json(silent=True) or {}
-            return jsonify(_apply_command(payload, self._ptz_controllers))
+            return jsonify(_apply_command(payload, self._dahua))
 
         @app.post("/local/api/v1/firmware/update")
         def b5_firmware():
@@ -124,56 +139,172 @@ class InboundApiServer(threading.Thread):
 # ─── route handlers (pure functions, easy to test) ───────────────────
 
 
-def _apply_personnel_sync(payload: dict[str, Any], face_engine) -> dict[str, Any]:
+def _apply_personnel_sync(
+    payload: dict[str, Any],
+    dahua: DahuaManager,
+    personnel: PersonnelStore,
+) -> dict[str, Any]:
     action = payload.get("action")
     person_id = payload.get("person_id")
     if not person_id or action not in {"add", "update", "deactivate"}:
         return {"synced": False, "reason": "invalid payload"}
-    method = getattr(face_engine, "apply_personnel_sync", None)
-    if not callable(method):
-        return {"synced": False, "reason": "personnel sync not implemented"}
+
+    if action == "deactivate":
+        return _deactivate_person(str(person_id), dahua, personnel)
+
+    image_b64 = payload.get("image_b64") or payload.get("image")
+    if not image_b64:
+        return {"synced": False, "reason": "image_b64 required for add/update"}
     try:
-        method(payload)
-        return {"synced": True}
-    except Exception as exc:
-        return {"synced": False, "reason": str(exc)}
+        jpeg = base64.b64decode(image_b64, validate=False)
+    except Exception:
+        return {"synced": False, "reason": "image_b64 not valid base64"}
+
+    return _add_or_update_person(
+        person_id=str(person_id),
+        full_name=str(payload.get("full_name") or person_id),
+        jpeg=jpeg,
+        sex=payload.get("sex"),
+        birthday=payload.get("birthday"),
+        dahua=dahua,
+        personnel=personnel,
+    )
 
 
-def _apply_maintenance(payload: dict[str, Any], face_authorizer) -> dict[str, Any]:
+def _add_or_update_person(
+    *,
+    person_id: str,
+    full_name: str,
+    jpeg: bytes,
+    sex: Any,
+    birthday: Any,
+    dahua: DahuaManager,
+    personnel: PersonnelStore,
+) -> dict[str, Any]:
+    """Fan out `addPerson` to every camera with a workers group bound."""
+    # Replace existing record (update == delete-then-add for simplicity).
+    if personnel.get(person_id):
+        _deactivate_person(person_id, dahua, personnel)
+
+    per_camera: dict[int, str] = {}
+    failures: list[str] = []
+    for client in dahua.all():
+        if not client.workers_group_id:
+            failures.append(f"cam{client.camera_id}:no-group")
+            continue
+        try:
+            uid = client.face_db.add_person(
+                group_id=client.workers_group_id,
+                name=full_name,
+                jpeg=jpeg,
+                sex=sex if isinstance(sex, str) else None,
+                birthday=birthday if isinstance(birthday, str) else None,
+            )
+            per_camera[client.camera_id] = uid
+        except (DahuaFaceDBError, Exception) as exc:  # noqa: BLE001
+            failures.append(f"cam{client.camera_id}:{exc.__class__.__name__}")
+            logger.warning("cam %d: addPerson failed for %s: %s",
+                           client.camera_id, person_id, exc)
+
+    personnel.upsert(person_id=person_id, full_name=full_name, per_camera=per_camera)
+
+    return {
+        "synced": bool(per_camera),
+        "person_id": person_id,
+        "cameras": per_camera,
+        "failures": failures,
+    }
+
+
+def _deactivate_person(
+    person_id: str,
+    dahua: DahuaManager,
+    personnel: PersonnelStore,
+) -> dict[str, Any]:
+    record = personnel.get(person_id)
+    if not record:
+        return {"synced": True, "person_id": person_id, "note": "not found"}
+    removed: list[int] = []
+    failures: list[str] = []
+    for cam_id, uid in record.per_camera.items():
+        client = dahua.get(cam_id)
+        if client is None or not client.workers_group_id:
+            failures.append(f"cam{cam_id}:not-available")
+            continue
+        try:
+            client.face_db.delete_person(group_id=client.workers_group_id, uid=uid)
+            removed.append(cam_id)
+        except Exception as exc:  # noqa: BLE001
+            failures.append(f"cam{cam_id}:{exc.__class__.__name__}")
+    personnel.delete(person_id)
+    return {
+        "synced": True,
+        "person_id": person_id,
+        "cameras_cleared": removed,
+        "failures": failures,
+    }
+
+
+def _apply_maintenance(payload: dict[str, Any]) -> dict[str, Any]:
+    """Maintenance windows are now a backend-side concept.
+
+    With FaceRecognition fan-out the Jetson does not need a per-person
+    auth gate — a registered worker is recognised by the camera and
+    `handle_personnel_seen` already suppresses incident creation. The
+    window's role shrinks to "pause RAPID escalation for this person ID
+    during this time range," which is a backend policy decision.
+    """
     action = payload.get("action")
     window_id = payload.get("window_id")
     person_id = payload.get("person_id")
     if not window_id or not person_id or action not in {"arm", "disarm"}:
         return {"applied": False, "reason": "invalid payload"}
-    method = getattr(face_authorizer, "apply_maintenance_window", None)
-    if not callable(method):
-        return {"applied": False, "reason": "maintenance window not implemented"}
-    try:
-        method(payload)
-        return {"applied": True}
-    except Exception as exc:
-        return {"applied": False, "reason": str(exc)}
+    logger.info(
+        "Maintenance window %s for person %s acknowledged (no-op on Jetson)",
+        action, person_id,
+    )
+    return {"applied": True}
 
 
-def _apply_command(payload: dict[str, Any], ptz_controllers: dict[int, Any]) -> dict[str, Any]:
+def _apply_command(payload: dict[str, Any], dahua: DahuaManager) -> dict[str, Any]:
     command = payload.get("command_type")
     params = payload.get("parameters") or {}
-    camera_id = int(params.get("camera_id", 1))
-    ptz = ptz_controllers.get(camera_id)
+    try:
+        camera_id = int(params.get("camera_id", 1))
+    except (TypeError, ValueError):
+        return {"command_accepted": False, "reason": "camera_id must be int"}
+
+    client = dahua.get(camera_id)
 
     if command == "ptz_override":
-        if not ptz:
-            return {"command_accepted": False, "reason": f"no PTZ on cam {camera_id}"}
-        method = getattr(ptz, "apply_override", None)
-        if not callable(method):
-            return {"command_accepted": False, "reason": "ptz override not implemented"}
-        method(params)
-        return {"command_accepted": True}
+        if client is None:
+            return {"command_accepted": False, "reason": f"no client for cam {camera_id}"}
+        try:
+            client.ptz.apply_override(params)
+            return {"command_accepted": True}
+        except Exception as exc:  # noqa: BLE001
+            return {"command_accepted": False, "reason": str(exc)}
 
     if command == "deterrence_standdown":
-        # Standdown is only valid during an active maintenance window. The
-        # actual gate is enforced by the alert engine; here we just accept.
-        return {"command_accepted": True}
+        if client is None:
+            return {"command_accepted": False, "reason": f"no client for cam {camera_id}"}
+        try:
+            client.deterrence.standdown()
+            return {"command_accepted": True}
+        except Exception as exc:  # noqa: BLE001
+            return {"command_accepted": False, "reason": str(exc)}
+
+    if command == "deterrence_fire":
+        if client is None:
+            return {"command_accepted": False, "reason": f"no client for cam {camera_id}"}
+        try:
+            client.deterrence.fire(
+                light=bool(params.get("light", True)),
+                speaker=bool(params.get("speaker", True)),
+            )
+            return {"command_accepted": True}
+        except Exception as exc:  # noqa: BLE001
+            return {"command_accepted": False, "reason": str(exc)}
 
     if command == "request_stream":
         return {

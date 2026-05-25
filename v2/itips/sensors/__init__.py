@@ -1,5 +1,5 @@
-"""Wireless sensor integration — AX PRO hub listener."""
+"""Camera-side event subscriptions."""
 
-from .ax_pro import AXProListener, SensorEvent
+from .dahua_events import DahuaEvent, DahuaEventListener, DEFAULT_CODES
 
-__all__ = ["AXProListener", "SensorEvent"]
+__all__ = ["DahuaEvent", "DahuaEventListener", "DEFAULT_CODES"]

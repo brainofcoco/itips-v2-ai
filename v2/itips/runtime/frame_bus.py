@@ -9,16 +9,17 @@ from __future__ import annotations
 
 import threading
 from dataclasses import dataclass
-from typing import Optional
+from typing import TYPE_CHECKING, Any, Optional
 
-import numpy as np
+if TYPE_CHECKING:
+    import numpy as np
 
 
 @dataclass
 class FrameSnapshot:
     camera_id: int
-    raw: Optional[np.ndarray] = None
-    annotated: Optional[np.ndarray] = None
+    raw: Optional[Any] = None  # numpy.ndarray at runtime
+    annotated: Optional[Any] = None
     monotonic_ns: int = 0
     preset_id: str = "default"
 

@@ -1,10 +1,9 @@
-"""Alert engine + PTZ controller — the side-effect surface of the AI pipeline.
+"""Alert engine — the side-effect surface of the Dahua event pipeline.
 
 All outbound effects route through the intake queue. Local side effects
-(PTZ commands) stay on-Jetson.
+(deterrence, PTZ) live in `itips.camera`.
 """
 
 from .engine import AlertEngine
-from .ptz import PTZController
 
-__all__ = ["AlertEngine", "PTZController"]
+__all__ = ["AlertEngine"]
