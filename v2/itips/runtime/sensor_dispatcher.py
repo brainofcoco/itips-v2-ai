@@ -1,34 +1,7 @@
-"""Sensor → PTZ-pan → snapshot → face-validate pipeline.
+"""Sensor → PTZ pan → snapshot → face-validate pipeline.
 
-When a sensor alarm reaches the dispatcher (from the AX PRO hub
-listener in Phase 2, or from the dashboard's `simulate` button in
-Phase 1), it does the following:
-
-  1. Log the raw sensor alarm via `AlertEngine.handle_behaviour_alert_simple`
-     so it shows up in the Alerts tab as `sensor_alarm` with the zone
-     and sensor type — operators see the trigger even if the rest of
-     the pipeline goes nowhere.
-  2. Look up the zone in `SensorMap`. If unmapped, the dispatch ends
-     here (logged as `outcome=unmapped`). Operators map zones from the
-     Sensors tab.
-  3. Resolve the target camera + preset. Pan via
-     `DahuaPTZ.goto_preset_by_name`, wait `pan_settle_s` for the dome
-     to physically arrive.
-  4. Pull a snapshot from `snapshot.cgi` on the target camera.
-  5. Run `FaceEngine.recognize` against the snapshot. Three branches:
-        * matched     → `handle_personnel_seen`  (authorised entry)
-        * not matched → `handle_face_intruder`   (unauthorised, escalate)
-        * no face     → `handle_behaviour_alert_simple` with
-                        `alert_type=sensor_unverified` (sensor fired
-                        but the camera couldn't see a person — could
-                        be small animal, false alarm, or attacker
-                        already moved out of frame)
-
-All work happens on a single worker thread so a noisy sensor can't
-saturate the GPU with concurrent face inferences — events queue up
-and drain in order with a per-zone cooldown. Crash-isolated like the
-other dispatchers: any exception is logged and skipped, the next
-event proceeds.
+Single worker thread so a chatty sensor can't saturate the GPU.
+Per-zone cooldown debounces; any exception is logged and skipped.
 """
 
 from __future__ import annotations
@@ -46,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 
 class SensorDispatcher(threading.Thread):
-    """Single worker that turns SensorEvents into PTZ actions + alerts."""
+    """Turns SensorEvents into PTZ + snapshot + face-validate alerts."""
 
     def __init__(
         self,
@@ -72,17 +45,10 @@ class SensorDispatcher(threading.Thread):
         self._per_zone_cooldown_s = float(per_zone_cooldown_s)
         self._queue: queue.Queue[SensorEvent] = queue.Queue(maxsize=queue_size)
         self._stop_event = threading.Event()
-        # zone_id → monotonic ts of last accepted dispatch — keyed
-        # separately from the alert engine's idle window so a hammered
-        # door sensor can't drown out a real concurrent perimeter alarm.
         self._last_dispatch: dict[int, float] = {}
 
-    # ─── lifecycle ────────────────────────────────────────────────────
-
     def start(self) -> None:
-        # threading.Thread.start may not be re-entrant; mirror the
-        # service-shim pattern in the rest of the codebase (idempotent
-        # start is expected from the orchestrator's start-all loop).
+        # Idempotent — orchestrator's start-all loop may call twice.
         if self.is_alive():
             return
         super().start()
@@ -90,10 +56,8 @@ class SensorDispatcher(threading.Thread):
     def stop(self) -> None:
         self._stop_event.set()
 
-    # ─── ingest ───────────────────────────────────────────────────────
-
     def dispatch(self, event: SensorEvent) -> bool:
-        """Enqueue. Returns False if the queue is full (drop, don't block)."""
+        """Returns False if the queue is full — drop rather than block."""
         try:
             self._queue.put_nowait(event)
             return True
@@ -103,8 +67,6 @@ class SensorDispatcher(threading.Thread):
                 event.zone_id, event.event_type,
             )
             return False
-
-    # ─── worker loop ──────────────────────────────────────────────────
 
     def run(self) -> None:
         logger.info("SensorDispatcher running (pan_settle=%.1fs cooldown=%.1fs)",
@@ -121,8 +83,7 @@ class SensorDispatcher(threading.Thread):
         logger.info("SensorDispatcher stopped")
 
     def _process(self, event: SensorEvent) -> None:
-        # Always record the raw alarm — gives operators an audit trail
-        # even if the rest of the pipeline is unmapped or fails.
+        # Always log the raw alarm — audit trail even when the rest fails.
         self._alert_engine.handle_behaviour_alert_simple(
             camera_id=0,
             alert_type="sensor_alarm",
@@ -135,8 +96,7 @@ class SensorDispatcher(threading.Thread):
             },
         )
 
-        # Per-zone cooldown — protects PTZ from being slewed back and
-        # forth by a chatty contact sensor.
+        # Per-zone cooldown — chatty sensor must not slew the PTZ continuously.
         now = time.monotonic()
         last = self._last_dispatch.get(event.zone_id, 0.0)
         if (now - last) < self._per_zone_cooldown_s:
@@ -162,45 +122,37 @@ class SensorDispatcher(threading.Thread):
                            event.zone_id, mapping.camera_id)
             return
 
-        # Step 1 — pan.
         pan_ok = False
         try:
             pan_ok = client.ptz.goto_preset_by_name(mapping.preset_name)
         except Exception:
             logger.exception("sensor zone=%d: PTZ pan crashed", event.zone_id)
         if not pan_ok:
-            outcome = {"verdict": "pan_failed",
-                       "camera_id": mapping.camera_id,
-                       "preset_name": mapping.preset_name}
-            self._event_tap.publish(event, outcome=outcome)
+            self._event_tap.publish(event, outcome={
+                "verdict": "pan_failed",
+                "camera_id": mapping.camera_id,
+                "preset_name": mapping.preset_name,
+            })
             return
 
-        # Step 2 — wait for the dome to physically arrive. The Dahua
-        # ptz.cgi GotoPreset call is fire-and-forget; the camera
-        # itself takes 1–2s. Sleeping here is fine — this thread is
-        # dedicated to sensor flow.
+        # GotoPreset is fire-and-forget on Dahua; sleep for the dome to arrive.
         time.sleep(self._pan_settle_s)
 
-        # Step 3 — pull a snapshot at the new position.
         frame = None
         try:
             frame = client.endpoint.snapshot(timeout=self._snapshot_timeout_s)
         except Exception:
             logger.exception("sensor zone=%d: snapshot failed", event.zone_id)
         if frame is None:
-            outcome = {"verdict": "snapshot_failed",
-                       "camera_id": mapping.camera_id,
-                       "preset_name": mapping.preset_name}
-            self._event_tap.publish(event, outcome=outcome)
+            self._event_tap.publish(event, outcome={
+                "verdict": "snapshot_failed",
+                "camera_id": mapping.camera_id,
+                "preset_name": mapping.preset_name,
+            })
             return
 
-        # Step 4 — validate.
-        outcome = self._validate_face(
-            event=event, mapping=mapping, frame=frame,
-        )
+        outcome = self._validate_face(event=event, mapping=mapping, frame=frame)
         self._event_tap.publish(event, outcome=outcome)
-
-    # ─── face validation ──────────────────────────────────────────────
 
     def _validate_face(
         self,
@@ -209,12 +161,7 @@ class SensorDispatcher(threading.Thread):
         mapping,
         frame,
     ) -> dict[str, Any]:
-        """Run the Jetson FaceEngine on the just-captured snapshot.
-
-        Three outcomes routed through the existing alert handlers so
-        the Alerts tab and incident lifecycle behave identically to
-        camera-triggered face matches.
-        """
+        """Routes through the same handlers a camera-triggered face match uses."""
         details_common = {
             "trigger": "sensor",
             "zone_id": event.zone_id,
@@ -225,8 +172,7 @@ class SensorDispatcher(threading.Thread):
         }
 
         if self._face_engine is None:
-            # No face engine wired — register a generic "person on
-            # camera" advisory and let the operator review the snapshot.
+            # No engine — log presence + leave the snapshot for operator review.
             self._alert_engine.handle_behaviour_alert_simple(
                 camera_id=mapping.camera_id,
                 alert_type="sensor_unverified",
@@ -248,12 +194,7 @@ class SensorDispatcher(threading.Thread):
                     "camera_id": mapping.camera_id}
 
         if result.embedding is None:
-            # No face in the frame at all. Either the person moved
-            # out of view between sensor trip and pan-settle, or the
-            # sensor fired on a non-human signal (vibration on a fence
-            # rattled by wind, a cat tripping a PIR, …). Either way,
-            # we log "sensor fired but no person visible" so the
-            # operator can review the snapshot.
+            # No face in frame — person moved out of view, animal, false alarm.
             self._alert_engine.handle_behaviour_alert_simple(
                 camera_id=mapping.camera_id,
                 alert_type="sensor_unverified",
@@ -283,7 +224,7 @@ class SensorDispatcher(threading.Thread):
                 "camera_id": mapping.camera_id,
             }
 
-        # Found a face but no match — INTRUDER.
+        # Face present but no enrolled match → intruder.
         self._alert_engine.handle_face_intruder(
             camera_id=mapping.camera_id,
             face_bbox=(0, 0, 0, 0),

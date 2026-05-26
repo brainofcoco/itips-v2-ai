@@ -1,21 +1,8 @@
 """YOLOv8 person/vehicle detector for the behavioral fallback.
 
-Same lazy-init posture as `face_engine` and `plate_engine`: nothing
-imports `ultralytics` (or torch) at module load. The first call to
-`detect()` triggers the model load. A `warmup_async()` kicks it off
-in the background at boot.
-
-Only two object classes are interesting for ITIPS today:
-  * `person`  (COCO class 0) — drives intrusion / loitering / line
-                                crossing in the absence of native IVS.
-  * `car`     (COCO class 2) — informs the plate fallback's vehicle
-                                bbox argument (Phase 2 currently uses
-                                whole-frame OCR; this lets us tighten
-                                it later without re-architecting).
-
-Other COCO classes are filtered out before the result reaches the
-behavior engine — keeps the alert surface focused on what cameras
-without native IVS actually need to detect.
+Lazy-loaded — ultralytics + torch only import on first `detect()`.
+Only COCO person + vehicle classes pass through; everything else
+is filtered out before the result reaches the behavior engine.
 """
 
 from __future__ import annotations
@@ -36,10 +23,8 @@ class ObjectDetectorUnavailable(RuntimeError):
     """Raised when `ultralytics` / `torch` aren't installed."""
 
 
-# COCO class IDs we care about. The string names come out of
-# Ultralytics' `model.names` and become the `class_name` carried in
-# `Detection` records.
-_TARGET_CLASS_IDS = {0, 1, 2, 3, 5, 7}  # person, bicycle, car, motorcycle, bus, truck
+# COCO ids: person, bicycle, car, motorcycle, bus, truck.
+_TARGET_CLASS_IDS = {0, 1, 2, 3, 5, 7}
 _VEHICLE_CLASSES = {"car", "bicycle", "motorcycle", "bus", "truck"}
 
 
@@ -55,9 +40,7 @@ class ObjectDetector:
     ) -> None:
         self._model_name = model_name
         self._confidence = float(confidence)
-        # Ultralytics auto-selects CUDA when available; pass an explicit
-        # device only if the caller (e.g. JetPack init script) wants to
-        # pin to a specific GPU.
+        # Ultralytics auto-selects CUDA when available; pin manually for JetPack.
         self._device = device
         self._model = None
         self._init_lock = threading.Lock()
@@ -114,15 +97,8 @@ class ObjectDetector:
     # ─── inference ────────────────────────────────────────────────────
 
     def detect(self, frame: "np.ndarray") -> list[Detection]:
-        """Run a single forward pass; return filtered Detections.
-
-        Frame is BGR uint8 (OpenCV format — same as `event.jpeg` →
-        `cv2.imdecode` produces). YOLO accepts that natively.
-        """
+        """`frame` is BGR uint8 (OpenCV) — YOLO accepts that natively."""
         model = self._ensure_model()
-        # `verbose=False` keeps the Jetson log quiet; `conf` filters
-        # at the predict step so we don't allocate tensors we'll just
-        # drop. Stream API would be wasteful for a single image.
         kwargs = {"conf": self._confidence, "verbose": False}
         if self._device is not None:
             kwargs["device"] = self._device
@@ -131,8 +107,6 @@ class ObjectDetector:
 
     def _extract_detections(self, results) -> list[Detection]:
         out: list[Detection] = []
-        # Ultralytics returns a list of Results, one per input image —
-        # we always send a single image, so results[0] is the one.
         if not results:
             return out
         res = results[0]
@@ -140,7 +114,6 @@ class ObjectDetector:
         boxes = getattr(res, "boxes", None)
         if boxes is None:
             return out
-        # `.boxes` exposes `.xyxy` (tensor), `.cls`, `.conf`.
         for box in boxes:
             cls_id = int(box.cls.item()) if hasattr(box.cls, "item") else int(box.cls[0])
             if cls_id not in _TARGET_CLASS_IDS:

@@ -1,20 +1,8 @@
 """Per-camera zone polygons for the behavioral fallback.
 
-Zones come in two shapes:
-
-  region  — closed polygon used for intrusion ("person inside") and
-            loitering ("person inside for ≥N seconds") checks.
-  line    — open polyline (1+ segments) used for line-crossing
-            ("person centroid moved from one side to the other").
-
-Coords are normalised to `[0, 1]` in the camera's image frame so the
-zone survives resolution changes between the operator's editor view
-and the snapshot the engine receives. Persisted as JSON next to
-`personnel.sqlite` on the NVMe; the dashboard reads/writes the file
-through a small CRUD API that the frontend already calls for face DBs.
-
-This module has zero ML deps — it's the pure-Python geometry layer
-that sits underneath the engines.
+Two shapes: `region` (closed polygon, drives intrusion/loitering) and
+`line` (polyline, drives line-crossing). Coords are normalised [0,1]
+so zones survive snapshot resolution changes.
 """
 
 from __future__ import annotations
@@ -36,13 +24,11 @@ _VALID_TYPES = {ZONE_TYPE_REGION, ZONE_TYPE_LINE}
 
 @dataclass
 class Zone:
-    """A single named zone on one camera's view."""
-
     zone_id: str
-    zone_type: str                              # "region" | "line"
+    zone_type: str                              # region | line
     points: list[tuple[float, float]]           # normalised [0,1]
     name: str = ""
-    direction: str = "Any"                      # "Any" | "LeftToRight" | "RightToLeft"
+    direction: str = "Any"                      # Any | LeftToRight | RightToLeft
     metadata: dict = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -52,18 +38,11 @@ class Zone:
             raise ValueError(f"region zone needs ≥3 points, got {len(self.points)}")
         if self.zone_type == ZONE_TYPE_LINE and len(self.points) < 2:
             raise ValueError(f"line zone needs ≥2 points, got {len(self.points)}")
-        # Normalise tuples so equality/json behave consistently.
         self.points = [(float(p[0]), float(p[1])) for p in self.points]
 
 
 class ZoneStore:
-    """Thread-safe JSON-backed per-camera zone registry.
-
-    The file format is intentionally human-editable so an operator can
-    bootstrap a fleet from a known-good config without spinning up the
-    dashboard. Concurrency is coarse — one writer at a time, full file
-    rewrite on save (small payload).
-    """
+    """Thread-safe JSON-backed per-camera zone registry."""
 
     def __init__(self, path: Path) -> None:
         self._path = Path(path)
@@ -159,7 +138,7 @@ class ZoneStore:
 
 
 def point_in_polygon(x: float, y: float, polygon: list[tuple[float, float]]) -> bool:
-    """Ray-casting test. `polygon` is a closed sequence of (x, y) pairs."""
+    """Ray-casting PIP test."""
     if len(polygon) < 3:
         return False
     inside = False
@@ -168,7 +147,6 @@ def point_in_polygon(x: float, y: float, polygon: list[tuple[float, float]]) -> 
     for i in range(n):
         xi, yi = polygon[i]
         xj, yj = polygon[j]
-        # Standard PIP: count crossings.
         if ((yi > y) != (yj > y)) and (
             x < (xj - xi) * (y - yi) / (yj - yi + 1e-12) + xi
         ):
@@ -181,12 +159,8 @@ def segments_intersect(
     a1: tuple[float, float], a2: tuple[float, float],
     b1: tuple[float, float], b2: tuple[float, float],
 ) -> bool:
-    """Standard CCW segment-intersection test.
-
-    Returns `True` if segment (a1, a2) crosses segment (b1, b2),
-    excluding the colinear-overlap degenerate (that's never useful
-    for line-crossing rules anyway).
-    """
+    """CCW segment-intersection test; excludes colinear-overlap (unwanted
+    for line-crossing semantics)."""
     def ccw(p, q, r):
         return (r[1] - p[1]) * (q[0] - p[0]) > (q[1] - p[1]) * (r[0] - p[0])
 

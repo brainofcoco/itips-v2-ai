@@ -82,26 +82,15 @@ def _build_deps():
     frame_bus = FrameBus()
     event_tap = EventTap()
 
-    # ─── ML fallback layer ────────────────────────────────────────────
-    # All ML services are optional. CapabilityRouter is always safe to
-    # build (pure-Python). Engines only initialise if the `ml` extras
-    # are installed; if not, calls return immediately and the event
-    # worker degrades to the bare native-only path. In a vanilla v2
-    # deploy with all-native cameras, no model is loaded and no GPU
-    # memory is reserved.
+    # ML fallback — all optional; engines only init if ml extras installed.
     ml_state = _build_ml_layer(
         embedding_db_path=personnel_store_path.parent / "face_embeddings.sqlite",
         zones_path=personnel_store_path.parent / "zones.json",
         overrides_path=personnel_store_path.parent / "ml_overrides.json",
     )
 
-    # ─── Sensor pipeline ──────────────────────────────────────────────
-    # Same posture as the ML layer: best-effort wiring. SensorMap is
-    # always safe to build (it's just JSON-on-disk). The dispatcher
-    # needs the alert engine + dahua manager, which we have here, and
-    # *optionally* the FaceEngine for the validation branch. Without
-    # the FaceEngine, dispatches still pan + snapshot + log — just
-    # without the auto-recognise step.
+    # Sensor pipeline. Dispatcher works without face_engine — just
+    # pans + snapshots without the auto-validate step.
     from itips.runtime.sensor_dispatcher import SensorDispatcher
     from itips.sensors.sensor_event import SensorEventTap
     from itips.sensors.sensor_map import SensorMap
@@ -115,9 +104,7 @@ def _build_deps():
         face_engine=ml_state.face_engine,
     )
 
-    # AX PRO hub listener — only constructed when the operator has
-    # supplied credentials AND hikaxpro is installed. Otherwise the
-    # dispatcher still runs and the Simulate button still works.
+    # AX PRO hub listener — None unless ITIPS_AXPRO_* env are set.
     axpro_listener = _build_axpro_listener(sensor_dispatcher)
 
     deps = WorkerDeps(
@@ -170,19 +157,7 @@ def _build_deps():
 
 
 def _build_axpro_listener(dispatcher):
-    """Best-effort AX PRO hub listener construction.
-
-    Returns `None` when:
-      * `ITIPS_AXPRO_HOST` is unset / empty (operator hasn't wired a
-        hub — that's fine, the Simulate button still works), OR
-      * `hikaxpro` isn't installed in this build of the image, OR
-      * any other unexpected failure during construction.
-
-    The orchestrator's start-all loop will call `start()` on the
-    listener if one is returned; the listener itself raises
-    `AxProUnavailable` if the lib isn't importable, which we catch
-    here too so a missing dep can't kill the boot sequence.
-    """
+    """Returns None when host/creds aren't set or hikaxpro missing."""
     import os
     logger = logging.getLogger("itips.app.axpro")
     host = (os.environ.get("ITIPS_AXPRO_HOST") or "").strip()
@@ -226,13 +201,7 @@ class _MlLayerState:
 
 def _build_ml_layer(*, embedding_db_path, zones_path,
                     overrides_path) -> "_MlLayerState":
-    """Best-effort ML wiring.
-
-    Every individual engine is allowed to fail independently — if
-    `ultralytics` is installed but `insightface` isn't, the behavior
-    fallback works and the face fallback degrades. Failure here must
-    never break the baseline runtime — log and continue.
-    """
+    """Each engine fails independently — failure must never break boot."""
     logger = logging.getLogger("itips.app.ml")
     state = _MlLayerState()
     try:

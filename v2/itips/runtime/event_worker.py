@@ -1,25 +1,9 @@
 """Per-camera Dahua event dispatcher.
 
-The Jetson runs zero inference. Each `DahuaEventDispatcher` instance owns
-one long-poll subscription to a camera's `eventManager.cgi` stream and
-routes incoming events to the AlertEngine.
-
-Lifecycle:
-
-  1. Subscribe to the curated event-code list (see `dahua_events.DEFAULT_CODES`).
-  2. On each event:
-        * pull the JPEG that came with the multipart payload (if any),
-          else fetch one via `/cgi-bin/snapshot.cgi`,
-        * dispatch through the per-code handler table,
-        * publish the snapshot to FrameBus so the dashboard's MJPEG
-          endpoint can serve it.
-  3. Per-event-code cooldown so a noisy rule cannot pin the CPU.
-  4. Per-camera face-DB binding is guaranteed at start: if the workers
-     group is bound, the camera will only emit FaceRecognition for that
-     group; if not, we still react to FaceDetection.
-
-Memory profile on Orin Nano: ~80 MB resident (Python + requests), no
-GPU footprint at all. All heavy work is on the camera.
+Long-polls `eventManager.cgi` per camera, routes events into the
+AlertEngine. When the ML fallback layer is wired and the capability
+router flags a missing native feature, the relevant handler also
+invokes the Jetson engine on the event's JPEG.
 """
 
 from __future__ import annotations
@@ -57,12 +41,7 @@ _START_ONLY_CODES = {
 
 
 class WorkerDeps:
-    """Bundle of long-lived services every dispatcher needs.
-
-    Plain `class` (not dataclass) because the streaming-era WorkerDeps
-    dataclass shipped with too many ML attributes and tying us to it
-    keeps the dead surface alive.
-    """
+    """Bundle of long-lived services every dispatcher needs."""
 
     def __init__(
         self,
@@ -80,14 +59,8 @@ class WorkerDeps:
         self.frame_bus = frame_bus
         self.recorders = recorders or {}
         self.event_tap = event_tap
-        # ML fallback wiring — all `None` in the baseline build.
-        # Per capability:
-        #   face_engine     → augments _handle_face_detection
-        #   plate_engine    → augments _handle_vehicle_gate + _handle_motion
-        #   behavior_engine → augments _handle_motion (intrusion/loiter/line)
-        # `capability_router` is the shared gate: an engine is only
-        # consulted when the router says the camera lacks the native
-        # path for that capability.
+        # ML fallbacks — None in baseline. Engine fires only when the
+        # capability_router says the camera lacks the native path.
         self.capability_router = capability_router
         self.face_engine = face_engine
         self.plate_engine = plate_engine
@@ -114,14 +87,11 @@ class DahuaEventDispatcher(threading.Thread):
         self._stop = threading.Event()
         self._queue: queue.Queue[DahuaEvent] = queue.Queue(maxsize=32)
         self._last_processed: dict[str, float] = {}
-        # When the ANPR fallback fires from VideoMotion we debounce
-        # per-camera so a wind-blown tree can't keep the GPU busy.
-        # CarDrivingInOut ignores this cooldown — it's a strong signal.
+        # ANPR fallback debounce — wind-blown tree must not pin the GPU.
+        # CarDrivingInOut ignores this (strong signal, already debounced).
         self._plate_fallback_cooldown_s = 10.0
         self._plate_fallback_last_run: float = 0.0
-        # The behavior fallback is heavier (YOLO + tracker + zones)
-        # but needs to run more often than ANPR — loitering only
-        # makes sense if we sample the scene every few seconds.
+        # Behavior fallback runs more often — loitering needs frequent samples.
         self._behavior_fallback_cooldown_s = 2.0
         self._behavior_fallback_last_run: float = 0.0
 
@@ -265,24 +235,12 @@ class DahuaEventDispatcher(threading.Thread):
     # ─── per-event handlers ───────────────────────────────────────────
 
     def _handle_face_recognition(self, event: DahuaEvent, frame: Optional["np.ndarray"]) -> None:
-        """The discriminator: known worker vs intruder.
-
-        Two paths:
-        1. **Trust the camera** (default) — use its `Candidates` list to
-           decide identity. Fast: identity decision happens on-cam.
-        2. **Force Jetson FR** — the operator has flagged this camera's
-           face DB as not trusted (empty group, model variance,
-           per-camera enrolment failed, …). We ignore `Candidates` and
-           re-run InsightFace on the JPEG the camera shipped with the
-           event, so identity becomes the Jetson's decision.
-        """
+        """Default: trust the camera's `Candidates`. With the operator
+        override on: ignore them and re-run Jetson FR on the event JPEG."""
         face = event.data.get("Face", {}) or {}
         bbox = _face_bbox(face)
 
         if self._should_fallback_to_face_engine() and frame is not None:
-            # Camera is just acting as the face detector here — the
-            # JPEG it sent with FaceRecognition has the same crop the
-            # native matcher used, so it's a fine input for Jetson FR.
             if self._dispatch_face_fallback(frame, bbox):
                 return
 
@@ -313,23 +271,15 @@ class DahuaEventDispatcher(threading.Thread):
         logger.info("cam %d FaceRecognition INTRUDER (no candidates)", self.camera_id)
 
     def _handle_face_detection(self, event: DahuaEvent, frame: Optional["np.ndarray"]) -> None:
-        """Bare face detect.
-
-        Two paths:
-        1. **Camera does native FR.** We let the camera's own
-           FaceRecognition event handle identity — here we just log the
-           bare bbox so the dashboard sees activity.
-        2. **Camera does NOT do native FR.** The capability router
-           tells us, the Jetson FaceEngine runs ArcFace on the camera's
-           own snapshot, and we promote to the same alert handler the
-           native FaceRecognition path uses.
-        """
+        """If the camera lacks native FR (or override is on), Jetson FR
+        runs and promotes to personnel_seen / face_intruder. Otherwise
+        log the bare bbox and let the camera's FaceRecognition decide."""
         face = event.data.get("Face", {}) or {}
         bbox = _face_bbox(face)
 
         if self._should_fallback_to_face_engine() and frame is not None:
             if self._dispatch_face_fallback(frame, bbox):
-                return  # promoted to personnel_seen / face_intruder
+                return
 
         self.deps.alert_engine.handle_behaviour_alert_simple(
             camera_id=self.camera_id,
@@ -341,9 +291,6 @@ class DahuaEventDispatcher(threading.Thread):
         if self.deps.face_engine is None or self.deps.capability_router is None:
             return False
         try:
-            # Imported here so the v2 baseline (no ml extras) doesn't
-            # pay for the import. The router itself doesn't depend on
-            # insightface, only the engine does.
             from itips.ml.capability_router import Capability
         except Exception:
             return False
@@ -356,12 +303,8 @@ class DahuaEventDispatcher(threading.Thread):
         frame: "np.ndarray",
         bbox: tuple[float, float, float, float],
     ) -> bool:
-        """Run the Jetson FaceEngine; route the result to AlertEngine.
-
-        Returns `True` if a fallback alert was emitted, `False` if the
-        engine was unavailable / errored and the caller should fall
-        back to the bare bbox path.
-        """
+        """Returns True if a fallback alert was emitted, False on
+        engine error so the caller drops back to bare-bbox path."""
         try:
             from itips.ml.face_engine import FaceEngineUnavailable
         except Exception:
@@ -453,9 +396,7 @@ class DahuaEventDispatcher(threading.Thread):
             alert_type="vehicle_gate",
             details={"direction": "enter" if direction == 1 else "leave" if direction == 2 else "unknown"},
         )
-        # Strong signal — vehicle just crossed the gate sensor. If
-        # the camera lacks native ANPR, run our own OCR now. No
-        # cooldown: CarDrivingInOut is itself debounced by the camera.
+        # Strong signal — bypass cooldown; CarDrivingInOut is camera-debounced.
         if self._should_fallback_to_plate_engine() and frame is not None:
             self._dispatch_plate_fallback(frame, force=True)
 
@@ -484,24 +425,16 @@ class DahuaEventDispatcher(threading.Thread):
         )
 
     def _handle_motion(self, event: DahuaEvent, frame: Optional["np.ndarray"]) -> None:
-        # Lowest priority — log only. Useful when the camera fires this in
-        # lieu of CrossLineDetection (older firmwares).
+        # Log only. Useful when older firmwares fire VideoMotion in lieu of IVS.
         self.deps.alert_engine.handle_behaviour_alert_simple(
             camera_id=self.camera_id,
             alert_type="motion",
             details={},
         )
-        # Weak signal — VideoMotion fires for any movement (people,
-        # trees, light shifts). Run ANPR fallback only when the camera
-        # lacks native ANPR AND we haven't tried recently. The plate
-        # filter rejects non-plate text so the worst-case cost is one
-        # OCR pass every 10 s per camera.
+        # Weak signal — both fallbacks run only when capable; cooldowns
+        # debounce. Behavior engine short-circuits if no zones drawn.
         if self._should_fallback_to_plate_engine() and frame is not None:
             self._dispatch_plate_fallback(frame, force=False)
-        # Behavior fallback — sample the scene every ~2 s when the
-        # camera has no IVS rules and an operator has drawn zones.
-        # Inside the engine, zero zones = early return, so this is
-        # cheap on cameras nobody's configured zones for yet.
         if self._should_fallback_to_behavior_engine() and frame is not None:
             self._dispatch_behavior_fallback(frame)
 
@@ -527,13 +460,8 @@ class DahuaEventDispatcher(threading.Thread):
         *,
         force: bool,
     ) -> bool:
-        """Run the Jetson PlateEngine; route a read into the alert engine.
-
-        `force=True` ignores the per-camera cooldown (used from the
-        strong CarDrivingInOut signal). `force=False` enforces the
-        cooldown (used from VideoMotion, which fires constantly).
-        Returns `True` if a plate was read and an alert was emitted.
-        """
+        """`force=True` skips cooldown (CarDrivingInOut). Returns True
+        if a plate was read and a plate_capture alert was emitted."""
         now = time.monotonic()
         if not force:
             if (now - self._plate_fallback_last_run) < self._plate_fallback_cooldown_s:
@@ -589,12 +517,7 @@ class DahuaEventDispatcher(threading.Thread):
         )
 
     def _dispatch_behavior_fallback(self, frame: "np.ndarray") -> bool:
-        """Run the BehaviorEngine; route synthesised IVS alerts.
-
-        Returns `True` if at least one synthetic alert was emitted.
-        Crash-isolated like the other fallbacks: any engine error
-        leaves the existing motion log path intact.
-        """
+        """Returns True if at least one synthesised alert was emitted."""
         now = time.monotonic()
         if (now - self._behavior_fallback_last_run) < self._behavior_fallback_cooldown_s:
             return False

@@ -1,13 +1,7 @@
-"""Persistent face-embedding DB for the Jetson-side recognition fallback.
+"""SQLite-backed face embedding DB for the Jetson recognition fallback.
 
-Mirrors the cloud personnel record set onto the local NVMe so cameras
-that lack the native faceRecognitionServer DB can still match a face
-without a round trip. SQLite for the same reasons as `PersonnelStore`:
-durable across reboots, single-writer-friendly, no daemon to babysit.
-
-Embeddings are stored as raw `float32` little-endian bytes (2048 bytes
-for a 512-d ArcFace vector). Avoids JSON-base64 ballooning the file on
-disk and keeps in-memory load to a single `np.frombuffer` call.
+Embeddings are raw little-endian float32 bytes — avoids JSON-base64
+bloat and keeps load to a single `np.frombuffer` call.
 """
 
 from __future__ import annotations
@@ -45,12 +39,7 @@ class EmbeddingRecord:
 
 
 class EmbeddingStore:
-    """Thread-safe SQLite-backed face embedding store.
-
-    `numpy` is imported lazily so importing this module doesn't drag
-    numpy into the v2 baseline (it's already a core dep — this is just
-    consistent with `face_engine`'s lazy posture).
-    """
+    """Thread-safe SQLite-backed face embedding store."""
 
     def __init__(self, db_path: Path) -> None:
         self._db_path = Path(db_path)
@@ -70,11 +59,11 @@ class EmbeddingStore:
     # ─── CRUD ─────────────────────────────────────────────────────────
 
     def upsert(self, *, person_id: str, full_name: str, embedding: "np.ndarray") -> None:
-        import numpy as np  # noqa: F401 — runtime guard
+        import numpy as np  # noqa: F401
         vec = embedding.astype("float32", copy=False)
         if vec.ndim != 1:
             raise ValueError(f"embedding must be 1-D, got shape {vec.shape}")
-        # Normalise on write so cosine similarity becomes a plain dot product.
+        # L2-normalise on write so cosine similarity is a plain dot product.
         norm = float((vec @ vec) ** 0.5)
         if norm > 0:
             vec = vec / norm
@@ -154,6 +143,6 @@ def _row_to_record(row: tuple) -> EmbeddingRecord:
     return EmbeddingRecord(
         person_id=str(person_id),
         full_name=str(full_name),
-        embedding=vec.copy(),  # detach from sqlite-owned buffer
+        embedding=vec.copy(),   # detach from sqlite-owned buffer
         dim=int(dim),
     )

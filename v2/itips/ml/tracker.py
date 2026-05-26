@@ -1,22 +1,8 @@
-"""Lightweight per-camera IoU tracker for the behavioral fallback.
+"""Lightweight per-camera IoU tracker for event-driven snapshots.
 
-Continuous-streaming trackers (ByteTrack, SORT) assume frames arrive
-at ~10 FPS. Our event-driven fallback gets a snapshot only when the
-camera fires `VideoMotion` (or similar), which can be 1 to several
-seconds apart. That gap is too long for motion-prediction trackers,
-so we keep the matching primitive — greedy IoU — and drop everything
-fancy.
-
-Design choices that come straight from the gap:
-
-  * **No motion model.** No Kalman filter. Track centroid moves
-    exactly where the next detection lands.
-  * **History is short.** We keep the last few centroids per track
-    only for line-crossing checks (need the previous position to
-    test segment intersection).
-  * **Age-out by wall-clock, not by frames.** A track is dropped
-    after `max_age_s` seconds without a matching detection — frames
-    don't tick at a fixed rate here.
+Event-driven sampling means frame gaps of 1+ seconds — too long for
+SORT/ByteTrack motion models, so we keep just greedy IoU matching
+and age tracks out by wall-clock rather than frame count.
 """
 
 from __future__ import annotations
@@ -32,9 +18,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class Detection:
-    """One bbox + class from the object detector."""
-
-    bbox: tuple[float, float, float, float]  # (x1, y1, x2, y2) in pixels
+    bbox: tuple[float, float, float, float]   # (x1, y1, x2, y2) pixels
     class_name: str
     confidence: float
 
@@ -49,8 +33,7 @@ class TrackedObject:
     first_seen_ts: float
     last_seen_ts: float
     update_count: int = 1
-    # Recent centroids (most-recent last) — enough for line-crossing
-    # which only needs the previous-vs-current segment.
+    # Most-recent-last centroid history — line-crossing needs prev vs curr.
     history: deque = field(default_factory=lambda: deque(maxlen=5))
 
     @property
@@ -59,7 +42,7 @@ class TrackedObject:
 
 
 class IoUTracker:
-    """Per-camera greedy IoU tracker with wall-clock age-out."""
+    """Greedy IoU matcher + wall-clock age-out, per camera."""
 
     def __init__(
         self,
@@ -73,27 +56,22 @@ class IoUTracker:
         self._next_id = 1
         self._lock = threading.Lock()
 
-    # ─── public API ───────────────────────────────────────────────────
-
     def update(
         self,
         camera_id: int,
         detections: list[Detection],
         ts: float,
     ) -> list[TrackedObject]:
-        """Assign detections to tracks. Returns live tracks for `camera_id`."""
+        """Assign detections to tracks. Returns live tracks for the camera."""
         with self._lock:
             tracks = self._tracks_by_camera.setdefault(camera_id, [])
-            # Drop stale tracks before matching so we don't compare
-            # against ghosts.
+            # Drop stale tracks first so matching doesn't see ghosts.
             tracks = [t for t in tracks if (ts - t.last_seen_ts) <= self._max_age_s]
 
             unmatched_dets: list[Detection] = []
             consumed_tracks: set[int] = set()
 
-            # Greedy IoU match — for each detection, take the best
-            # available track. Sort detections by confidence so
-            # the strongest ones win the best matches.
+            # Strongest detections claim the best matches first.
             sorted_dets = sorted(detections, key=lambda d: d.confidence, reverse=True)
             for det in sorted_dets:
                 best_idx, best_iou = -1, 0.0
@@ -122,14 +100,11 @@ class IoUTracker:
             return list(self._tracks_by_camera.get(camera_id, []))
 
     def reset(self, camera_id: Optional[int] = None) -> None:
-        """Drop all tracks (for the camera, or every camera)."""
         with self._lock:
             if camera_id is None:
                 self._tracks_by_camera.clear()
             else:
                 self._tracks_by_camera.pop(camera_id, None)
-
-    # ─── internals ────────────────────────────────────────────────────
 
     def _new_track(self, det: Detection, ts: float) -> TrackedObject:
         track_id = self._next_id

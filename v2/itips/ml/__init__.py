@@ -1,19 +1,8 @@
-"""Jetson-side ML fallback layer.
+"""Jetson-side ML fallback layer — engages per camera when
+`dahua_health` reports a missing native capability.
 
-Activated per camera when `dahua_health` reports a missing capability.
-Strictly event-driven — every entry point here is called from an existing
-event handler with a frame the camera already sent. Nothing in this
-package opens an RTSP stream or runs a continuous decode loop.
-
-Public surface, in dependency order:
-
-  CapabilityRouter   — answers "does cam N need a fallback for X?"
-  EmbeddingStore     — persistent face-embedding DB on the Jetson NVMe
-  FaceEngine         — InsightFace SCRFD+ArcFace, lazy-init, event-call
-
-The heavy ML deps (`insightface`, `onnxruntime`) live in the `ml` extra
-in pyproject — the core ITIPS-v2 runtime works fine without them and
-just disables the fallback. Install with `pip install itips-ai[ml]`.
+Strictly event-driven: nothing here opens an RTSP stream. Heavy deps
+live in the `ml` pyproject extra; the baseline runs without them.
 """
 
 from itips.ml.behavior_engine import (

@@ -1,35 +1,8 @@
-"""Event-driven license-plate OCR for cameras without native ANPR.
+"""PaddleOCR-backed plate reader for cameras without native ANPR.
 
-Backend: **PaddleOCR** (PP-OCR pipeline — detector + angle classifier
-+ recognizer). The earlier EasyOCR backend was swapped out because on
-Nigerian low-light/IR plate crops it tended to misread chars
-(`O↔0`, `1↔I↔L`, `5↔S`) and bin the result below the confidence
-floor, leaving operators with "no plate found" on plates that are
-clearly visible. PaddleOCR's PP-OCRv4 recognizer is noticeably more
-robust on the same crops.
-
-Mirrors the architecture of `face_engine.py`:
-
-  * No module-load side effects — `paddleocr` and `paddlepaddle` are
-    imported only inside `_ensure_model()`. The v2 baseline runs fine
-    without them.
-  * Singleton reader per process. ~250 MB resident on CPU; uses CUDA
-    when PaddlePaddle is built with GPU support (on Jetson, swap in
-    the JetPack-matched paddlepaddle wheel).
-  * Event-driven only. Frames arrive via the existing Dahua event
-    multipart path; we never open a video stream.
-
-Triggers (wired in `event_worker.py`):
-
-  * `CarDrivingInOut` — strong signal that the camera just saw a
-    vehicle at the gate. Always run if the camera lacks native ANPR.
-  * `VideoMotion`     — weak signal. Run only with a per-camera
-    cooldown so a tree in the wind can't pin the GPU.
-
-The result, when read, is routed through the same
-`AlertEngine.handle_plate_capture` handler that the native
-`TrafficCarMeasurement` path uses — so downstream behaviour (gate-open
-logic, evidence record, allow/deny list check) is identical.
+Lazy-loaded so the v2 baseline doesn't pay for paddleocr on import.
+Result routes through AlertEngine.handle_plate_capture — same handler
+the native TrafficCarMeasurement path uses.
 """
 
 from __future__ import annotations
@@ -48,25 +21,21 @@ logger = logging.getLogger(__name__)
 
 class PlateEngineUnavailable(RuntimeError):
     """Raised when `paddleocr` / `paddlepaddle` aren't installed.
-
-    The event worker catches this and degrades to the existing
-    motion-only / vehicle-gate alert (still drives the lifecycle).
-    """
+    Callers catch and degrade to the motion-only / vehicle-gate path."""
 
 
-# Permissive international plate filter — 5 to 10 alphanumeric chars,
-# at least 2 letters AND at least 2 digits, no all-letters and no
-# all-digits. Catches Nigerian "LAG-123-XY", US "ABC1234", EU "BMW 1234".
+# 5–10 alphanum, ≥2 letters AND ≥2 digits — catches Nigerian "LAG-123-XY",
+# US "ABC1234", EU "BMW 1234"; rejects pure numbers and street signs.
 _PLATE_CHARSET = re.compile(r"[A-Z0-9]")
 _PLATE_LEN_RANGE = (5, 10)
 
 
 @dataclass
 class PlateReadResult:
-    plate_number: str               # cleaned, uppercase, no separators
-    confidence: float               # OCR confidence in [0, 1]
-    bbox: tuple[float, float, float, float]  # plate region within frame
-    raw_text: str                   # what OCR emitted before filtering
+    plate_number: str
+    confidence: float
+    bbox: tuple[float, float, float, float]
+    raw_text: str
 
     @property
     def display(self) -> str:
@@ -83,15 +52,8 @@ class PlateEngine:
         use_gpu: bool = True,
         lang: str = "en",
     ) -> None:
-        # Threshold dropped from 0.5 → 0.4 because PaddleOCR reports
-        # honest-low confidences on motion-blurred / glare-affected
-        # plate crops where the read is still correct after the
-        # plate-pattern filter validates it.
         self._min_confidence = float(min_confidence)
         self._use_gpu = bool(use_gpu)
-        # Latin recognizer covers NG/EU/US plates. PaddleOCR ships a
-        # separate model per language family, so picking a wider set
-        # only bloats the install with no plate-OCR benefit.
         self._lang = lang
         self._reader = None
         self._init_lock = threading.Lock()
@@ -139,10 +101,8 @@ class PlateEngine:
                 "PlateEngine: loading PaddleOCR (lang=%s use_gpu=%s)",
                 self._lang, self._use_gpu,
             )
-            # `use_angle_cls=True` runs the orientation classifier so
-            # rotated plate crops (vehicle approaching at an angle)
-            # still read correctly. `show_log=False` silences Paddle's
-            # noisy boot-time output.
+            # use_angle_cls handles rotated plates (angled approach);
+            # show_log=False silences Paddle's noisy boot output.
             reader = PaddleOCR(
                 use_angle_cls=True,
                 lang=self._lang,
@@ -170,11 +130,7 @@ class PlateEngine:
         """
         reader = self._ensure_model()
         crop, (off_x, off_y) = _crop_for_vehicle(frame, vehicle_bbox)
-        # PaddleOCR's `ocr()` returns a list-of-lists: one outer slot
-        # per input image, each containing the per-detection rows.
-        # For a single image we always read `raw[0]`, but Paddle uses
-        # `[None]` (a list with one None) when the detector finds
-        # nothing — guard for both.
+        # Paddle returns [None] (not []) when its detector finds nothing.
         raw = reader.ocr(crop, cls=True)
         detections = (raw[0] if raw else None) or []
 
@@ -204,17 +160,10 @@ class PlateEngine:
 
 
 def _clean_plate_text(text: str) -> str:
-    """Uppercase, strip everything that isn't [A-Z0-9]."""
     return "".join(c for c in text.upper() if _PLATE_CHARSET.match(c))
 
 
 def _looks_like_plate(cleaned: str) -> bool:
-    """Permissive plate-pattern check.
-
-    Length 5–10, at least 2 letters AND at least 2 digits. Rejects
-    pure numbers ('123456' — likely a price tag) and pure letters
-    ('STOPSIGN' — likely a road sign).
-    """
     n = len(cleaned)
     if n < _PLATE_LEN_RANGE[0] or n > _PLATE_LEN_RANGE[1]:
         return False
@@ -227,7 +176,6 @@ def _crop_for_vehicle(
     frame: "np.ndarray",
     bbox: Optional[tuple[float, float, float, float]],
 ) -> tuple["np.ndarray", tuple[int, int]]:
-    """Optionally crop to the vehicle bbox; return (crop, (off_x, off_y))."""
     if bbox is None:
         return frame, (0, 0)
     x1, y1, x2, y2 = bbox
@@ -242,30 +190,20 @@ def _crop_for_vehicle(
 
 
 def _unpack_paddle_row(row):
-    """PaddleOCR returns `[points, (text, confidence)]` per detection.
-
-    `points` is a list of four (x, y) corners. The text/confidence
-    tuple is sometimes wrapped in extras depending on Paddle version,
-    so we defensively peel it. Returns `(text, conf, points)` or
-    `(None, 0.0, None)` on any malformed row — bad rows must not
-    propagate into the candidate ranking.
-    """
+    """Returns (text, conf, points) or (None, 0.0, None) on a malformed row."""
     if not row or len(row) < 2:
         return None, 0.0, None
     points = row[0]
     text_conf = row[1]
-    if isinstance(text_conf, (list, tuple)) and len(text_conf) >= 2:
-        text, conf = text_conf[0], text_conf[1]
-    else:
+    if not isinstance(text_conf, (list, tuple)) or len(text_conf) < 2:
         return None, 0.0, None
     try:
-        return str(text), float(conf), points
+        return str(text_conf[0]), float(text_conf[1]), points
     except (TypeError, ValueError):
         return None, 0.0, None
 
 
 def _points_to_bbox(points, off_x: int, off_y: int) -> tuple[float, float, float, float]:
-    """EasyOCR returns 4 corner points; convert to (x1, y1, x2, y2)."""
     if not points:
         return (0.0, 0.0, 0.0, 0.0)
     xs = [float(p[0]) for p in points]

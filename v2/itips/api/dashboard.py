@@ -71,11 +71,7 @@ def register_dashboard(
     def dashboard_assets(filename: str):  # noqa: ANN202
         return send_from_directory(_STATIC_ROOT, filename)
 
-    # JSON-only error responses for /api/* — otherwise Flask's default
-    # 404/500 HTML pages crash `res.json()` in the dashboard JS with
-    # `Unexpected token '<', "<!doctype "...`. Other paths keep their
-    # default HTML behaviour so static assets and the dashboard itself
-    # still render normally.
+    # JSON errors for /api/* — Flask's HTML 404/500 pages would break res.json().
     @app.errorhandler(404)
     def _api_404(err):  # noqa: ANN202
         if request.path.startswith("/api/"):
@@ -243,10 +239,7 @@ def register_dashboard(
 
     @app.get("/api/workers")
     def list_workers():  # noqa: ANN202
-        # Pull the Jetson EmbeddingStore once so each worker row can
-        # carry a `jetson_enrolled` flag. Operators reading the table
-        # need to see "Sam is on the Jetson" separately from "Sam is on
-        # camera N" — those are different fallback paths.
+        # Pull Jetson EmbeddingStore once so each row gets `jetson_enrolled`.
         jetson_ids: set[str] = set()
         if face_engine is not None:
             try:
@@ -319,10 +312,8 @@ def register_dashboard(
             person_id=person_id, full_name=full_name, per_camera=per_camera,
         )
 
-        # Mirror into the Jetson face DB so cameras without native
-        # faceRecognitionServer can still recognise this worker. Soft
-        # failure: a missing FaceEngine, missing ML extras, or a no-face
-        # enrolment image must not block the native-camera path.
+        # Mirror to Jetson face DB. Soft failure — missing engine /
+        # extras / no-face image must not block the native-camera path.
         ml_enrolled = False
         ml_error: str | None = None
         if face_engine is not None:
@@ -543,8 +534,7 @@ def register_dashboard(
 
     @app.get("/api/health/capabilities")
     def get_capability_summary():  # noqa: ANN202
-        """Per-camera capability vector the event worker is currently
-        routing on. Useful to verify which fallback paths are armed."""
+        """Per-camera capability vector + engine readiness + overrides."""
         if capability_router is None:
             return jsonify({"available": False, "cameras": {}})
         face_ready = bool(face_engine and face_engine.is_ready()) if face_engine else False
@@ -561,11 +551,7 @@ def register_dashboard(
 
     @app.post("/api/health/capabilities/<int:camera_id>/<cap>/override")
     def set_capability_override(camera_id: int, cap: str):  # noqa: ANN202
-        """Force the fallback (or pin to native) for a (camera, capability).
-
-        Body: `{"force_fallback": true|false|null}` — `null` clears the
-        override and the router goes back to following the probe.
-        """
+        """Body: `{"force_fallback": true|false|null}` — null clears."""
         if capability_router is None:
             return jsonify({"ok": False, "error": "capability router not wired"}), 503
         try:
@@ -590,13 +576,8 @@ def register_dashboard(
             "effective_needs_fallback": capability_router.needs_fallback(camera_id, cap_enum),
         })
 
-    # ─── ML Lab — direct engine invocation for testing ─────────────
-    # These routes let an operator exercise the FaceEngine / PlateEngine /
-    # BehaviorEngine with an uploaded image and see what they'd produce —
-    # without waiting for a real camera event to fire. When called with
-    # `?dispatch=1`, the result is ALSO routed through the AlertEngine so
-    # the Alerts tab lights up exactly as if a real camera had triggered
-    # the same fallback.
+    # ─── ML Lab — direct engine invocation ─────────────────────────
+    # `?dispatch=1` also routes the result through the AlertEngine.
 
     @app.get("/api/ml/status")
     def ml_status():  # noqa: ANN202
@@ -777,7 +758,7 @@ def register_dashboard(
             return jsonify({"ok": False, "error": "zone not found"}), 404
         return jsonify({"ok": True})
 
-    # ─── Sensors — AX PRO zone → PTZ preset mapping + test triggers ─
+    # ─── Sensors — AX PRO zone → PTZ preset map + test triggers ───
 
     @app.get("/api/sensors/map")
     def list_sensor_mappings():  # noqa: ANN202
@@ -818,11 +799,7 @@ def register_dashboard(
 
     @app.post("/api/sensors/simulate/<int:zone_id>")
     def simulate_sensor(zone_id: int):  # noqa: ANN202
-        """Hand-crafted sensor event for testing without an AX PRO hub.
-
-        The dispatcher can't tell a simulated event from a real one —
-        same pipeline runs: pan PTZ, snapshot, face-validate, alert.
-        """
+        """Inject a synthetic sensor event — same pipeline as a real hub event."""
         if sensor_dispatcher is None:
             return jsonify({"ok": False, "error": "sensor dispatcher not wired"}), 503
         from itips.sensors.sensor_event import SensorEvent
@@ -875,8 +852,7 @@ def register_dashboard(
 
     @app.get("/api/cameras/<int:camera_id>/presets")
     def list_camera_presets(camera_id: int):  # noqa: ANN202
-        """List the camera's onboard PTZ presets — operator picks one
-        when binding a sensor to this camera."""
+        """Camera's onboard PTZ presets — drives the binding dropdown."""
         client = dahua_manager.get(camera_id)
         if client is None:
             return jsonify({"ok": False, "error": "unknown camera"}), 404
@@ -1115,12 +1091,7 @@ def _zone_to_dict(zone) -> dict:
 
 
 def _zone_from_dict(body: dict):
-    """Build a `Zone` from a JSON request body.
-
-    Imported lazily so the dashboard can be wired without the ML
-    extras installed — only the zone routes need it, and they'll
-    have short-circuited on `zone_store is None` before reaching here.
-    """
+    """Lazy ml/ import so the dashboard works without the ml extras."""
     from itips.ml.zone_store import Zone
     return Zone(
         zone_id=str(body["zone_id"]),
@@ -1150,12 +1121,7 @@ def _engine_status(engine) -> dict:
 
 
 def _decode_upload(request) -> "np.ndarray | None":  # type: ignore[name-defined]
-    """Pull a multipart-upload image out of the request, decode to BGR.
-
-    Accepts the file under either `image` (used by the workers form) or
-    `file` (more generic). Returns None when nothing usable was sent —
-    the route turns that into a 400.
-    """
+    """Multipart image → BGR ndarray. Accepts `image` or `file` field."""
     f = request.files.get("image") or request.files.get("file")
     if f is None:
         return None
@@ -1193,9 +1159,7 @@ def _sensor_mapping_to_dict(m) -> dict:
 
 
 def _detection_to_dict(d, frame_w: int, frame_h: int) -> dict:
-    """Surface what YOLO saw, plus the anchor point we use for region
-    containment. Lets the operator confirm at a glance whether the
-    foot point landed inside any zone they've drawn."""
+    """Includes the bottom-center anchor — what region containment uses."""
     x1, y1, x2, y2 = d.bbox
     ax, ay = (x1 + x2) / 2.0, y2
     return {

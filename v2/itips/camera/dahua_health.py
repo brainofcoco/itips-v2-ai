@@ -1,12 +1,7 @@
-"""Per-camera capability probe.
+"""Per-camera capability probe — cheap HTTP checks with 2–3s timeouts.
 
-Runs a small battery of HTTP checks against each Dahua camera so the
-operator dashboard can show, at a glance, which features the camera
-actually exposes natively and which would need a Jetson-side backup.
-
-Probes are deliberately cheap (HEAD/GET with 2–3s timeouts). Designed
-to be re-runnable on demand from the dashboard — no persistent state
-beyond an in-memory result cache.
+Result feeds the dashboard's Health tab and the CapabilityRouter,
+which decides whether each camera needs the Jetson fallback path.
 """
 
 from __future__ import annotations
@@ -205,15 +200,10 @@ def probe_ivs_rules(ep: DahuaCameraEndpoint):
     return STATUS_OK, f"{n} rule(s) configured"
 
 
-# ─── additional probes — capabilities called out in docs/dahua-doc/ ───
-#
-# These tighten the "is this camera actually going to do its job" check.
-# probe_ivs_rules above only confirms the config endpoint exists; it can
-# return OK on a camera that has no rule deployed and will therefore
-# never fire CrossLine/CrossRegion. The probes below disambiguate.
+# Additional probes per docs/dahua-doc/. These disambiguate "endpoint
+# reachable" from "feature actually deployed / will actually fire".
 
-# Rule type appears either as ".Object.RuleType=" or ".Class=" depending
-# on firmware generation. Match both.
+# Rule type field name differs by firmware generation — match both.
 _IVS_RULE_TYPE_RE = re.compile(
     r"VideoAnalyseRule\[\d+\]\.(?:Object\.RuleType|Class)=(\w+)",
     re.IGNORECASE,
@@ -250,8 +240,7 @@ def probe_face_group_channel(ep: DahuaCameraEndpoint):
 @_probe("anpr_event_attach", "ANPR event subscription opens", "ai",
         backup_hint="Camera won't emit TrafficCarMeasurement. Plate Recognizer Stream must own this lane.")
 def probe_anpr_event_attach(ep: DahuaCameraEndpoint):
-    # Open the event stream, confirm headers, drop it. Just verifies the
-    # camera *would* deliver TrafficCarMeasurement if rules ever fire.
+    # Open + close — verifies the camera would deliver TrafficCarMeasurement.
     r = ep.get("/cgi-bin/eventManager.cgi",
                params={"action": "attach", "codes": "[TrafficCarMeasurement]"},
                timeout=2.0, stream=True)
@@ -287,8 +276,7 @@ def probe_alarm_out(ep: DahuaCameraEndpoint):
                timeout=2.0)
     if r.status_code != 200:
         return STATUS_MISSING, f"HTTP {r.status_code}"
-    # Count distinct channel indices — the same channel typically appears
-    # on multiple lines (Name=, Mode=, ...).
+    # Distinct channel indices — same channel appears on Name=, Mode=, etc.
     n = len(set(_ALARM_OUT_IDX_RE.findall(r.text)))
     if n == 0:
         return STATUS_MISSING, "no AlarmOut array"
@@ -316,6 +304,7 @@ def probe_sd_storage(ep: DahuaCameraEndpoint):
 
 
 _ACTIVE_PROBES = [
+    # Order matters — the integration test's response sequence pins it.
     probe_reachable,
     probe_snapshot,
     probe_mjpeg_sub,
@@ -325,8 +314,6 @@ _ACTIVE_PROBES = [
     probe_ptz,
     probe_deterrence,
     probe_ivs_rules,
-    # New probes appended so the integration test's positional response
-    # sequence for the first nine probes still lines up.
     probe_ivs_rule_types,
     probe_face_group_channel,
     probe_anpr_event_attach,

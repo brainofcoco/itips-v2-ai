@@ -1,35 +1,8 @@
-"""Behavioral fallback orchestrator — synthesises IVS-equivalent alerts.
+"""Detect → track → evaluate zones → emit synthetic IVS-equivalent alerts.
 
-Called from `event_worker._handle_motion` when the capability router
-says the camera has no IVS rules deployed. Pipeline:
-
-    frame  →  ObjectDetector  →  IoUTracker (per-camera)  →  ZoneStore
-                                       │
-                                       ▼
-                                BehaviorEngine.analyse()
-                                       │
-                                       ▼
-                          list[BehaviorAlert] → AlertEngine.handle_behaviour_alert_simple
-
-Alert types match the native Dahua events the AlertEngine already
-knows how to consume:
-
-  * `intrusion`     — person bbox centroid is inside a region zone
-                       on this single frame. Fires every analyse()
-                       while the person stays inside the zone.
-  * `loitering`     — person tracked inside the same region zone for
-                       at least `loiter_dwell_s` seconds across at
-                       least `loiter_min_events` consecutive analyses.
-                       Fires once per (track, zone) until the track
-                       leaves.
-  * `line_crossing` — the segment between this track's previous and
-                       current centroid crosses a configured line
-                       zone (CCW segment-intersection check).
-
-The engine does no I/O itself — `analyse()` is pure compute given a
-frame plus shared state. That makes it cheap to unit-test (mock the
-detector) and trivial to call from any handler that already has a
-frame in hand.
+Drives the fallback for cameras without native IVS. Alert types match
+the strings AlertEngine.handle_behaviour_alert_simple already accepts
+(intrusion / loitering / line_crossing).
 """
 
 from __future__ import annotations
@@ -57,20 +30,12 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-# Re-export so callers can `except BehaviorEngineUnavailable` symmetrically
-# with the other engines' error types.
+# Re-exported so callers catch the same error type for any engine.
 BehaviorEngineUnavailable = ObjectDetectorUnavailable
 
 
 @dataclass
 class BehaviorAlert:
-    """One synthesised IVS-equivalent alert.
-
-    `alert_type` maps 1:1 onto the strings `AlertEngine.handle_
-    behaviour_alert_simple` already accepts, so routing is a trivial
-    string pass-through.
-    """
-
     alert_type: str
     zone_id: str
     zone_name: str
@@ -82,16 +47,9 @@ class BehaviorAlert:
 
 @dataclass
 class BehaviorAnalysis:
-    """The richer return shape used by `analyse_full()`.
-
-    `analyse()` keeps returning a plain `list[BehaviorAlert]` so the
-    event worker doesn't have to change. The ML Lab route calls
-    `analyse_full()` so the dashboard can surface what YOLO actually
-    saw — critical when zones are set up correctly but no alert
-    fires, because the operator needs to know if YOLO missed the
-    person, if the person was outside every zone, or if the wrong
-    camera was selected.
-    """
+    """Returned by `analyse_full()` — adds detections + tracks for the
+    ML Lab so an operator can see why no alert fired (YOLO missed?
+    person outside every zone? wrong camera?)."""
 
     alerts: list[BehaviorAlert]
     detections: list[Detection]
@@ -120,15 +78,11 @@ class BehaviorEngine:
         self._dwell_state: dict[tuple[int, int, str], _DwellState] = {}
         self._dwell_lock = threading.Lock()
 
-    # ─── lifecycle pass-through ───────────────────────────────────────
-
     def warmup_async(self) -> None:
         self._detector.warmup_async()
 
     def is_ready(self) -> bool:
         return self._detector.is_ready()
-
-    # ─── main entry ───────────────────────────────────────────────────
 
     def analyse(
         self,
@@ -136,12 +90,8 @@ class BehaviorEngine:
         frame: "np.ndarray",
         ts: Optional[float] = None,
     ) -> list[BehaviorAlert]:
-        """Production entry point — returns just alerts.
-
-        Skips detection entirely when no zones are configured for the
-        camera (saves the GPU). The event worker calls this from
-        `_handle_motion` once per `VideoMotion` event.
-        """
+        """Production path. Skips detection when the camera has no
+        zones, to save the GPU on noisy VideoMotion events."""
         zones = self._zones.for_camera(camera_id)
         if not zones:
             return []
@@ -153,14 +103,8 @@ class BehaviorEngine:
         frame: "np.ndarray",
         ts: Optional[float] = None,
     ) -> BehaviorAnalysis:
-        """Same pipeline as `analyse()` but returns detections + tracks too.
-
-        Unlike `analyse()`, this DOES run the detector even when there
-        are no zones — so the ML Lab can show an operator "YOLO saw a
-        person here" even before any zones are drawn. That tells them
-        whether the gap is in the detector, the zone placement, or the
-        capability router.
-        """
+        """Always runs the detector — even with no zones — so the ML
+        Lab can surface what YOLO saw."""
         ts = float(ts) if ts is not None else time.time()
         zones = self._zones.for_camera(camera_id)
 
@@ -174,10 +118,7 @@ class BehaviorEngine:
         alerts: list[BehaviorAlert] = []
         if zones:
             for trk in tracks:
-                # Tracks that didn't get a fresh detection on this
-                # frame shouldn't trigger — they're stale carry-overs
-                # the tracker keeps around for one or two updates in
-                # case of a brief miss.
+                # Skip stale carry-over tracks (no detection this frame).
                 if abs(trk.last_seen_ts - ts) > 1e-3:
                     continue
                 for zone in zones:
@@ -189,8 +130,6 @@ class BehaviorEngine:
 
         return BehaviorAnalysis(alerts=alerts, detections=detections, tracks=tracks)
 
-    # ─── region zones: intrusion + loitering ──────────────────────────
-
     def _evaluate_region(
         self,
         camera_id: int,
@@ -200,13 +139,8 @@ class BehaviorEngine:
         w: int,
         h: int,
     ) -> list[BehaviorAlert]:
-        # Anchor at the bbox bottom-center — i.e. where the person's
-        # feet actually stand. Region zones are typically drawn on the
-        # floor an operator sees in the snapshot; the bbox centroid
-        # sits at hip level and floats well above any ground-mounted
-        # polygon, which made every "person inside compound" check
-        # silently miss. Using the foot point matches how operators
-        # think about ground zones.
+        # Anchor at the bbox bottom-center (feet), not the centroid —
+        # ground zones drawn at floor level miss the centroid (hip level).
         x1, _y1, x2, y2 = trk.bbox
         ax, ay = (x1 + x2) / 2.0, y2
         nx, ny = ax / max(1, w), ay / max(1, h)
@@ -227,7 +161,6 @@ class BehaviorEngine:
                      "action": "Inside"},
         ))
 
-        # Loitering bookkeeping.
         key = (camera_id, trk.track_id, zone.zone_id)
         with self._dwell_lock:
             state = self._dwell_state.get(key)
@@ -257,8 +190,6 @@ class BehaviorEngine:
                     ))
         return out
 
-    # ─── line zones: line crossing ────────────────────────────────────
-
     def _evaluate_line(
         self,
         trk: TrackedObject,
@@ -267,15 +198,12 @@ class BehaviorEngine:
         h: int,
     ) -> list[BehaviorAlert]:
         if len(trk.history) < 2:
-            return []  # need a previous centroid to draw a segment from
+            return []
         prev_px, curr_px = trk.history[-2], trk.history[-1]
-        # Normalise both centroids.
         prev = (prev_px[0] / max(1, w), prev_px[1] / max(1, h))
         curr = (curr_px[0] / max(1, w), curr_px[1] / max(1, h))
 
         out: list[BehaviorAlert] = []
-        # Walk segment-by-segment through the line zone (most zones
-        # are 2-point lines but the schema allows polylines).
         pts = zone.points
         for i in range(len(pts) - 1):
             seg_a, seg_b = pts[i], pts[i + 1]
@@ -296,17 +224,14 @@ class BehaviorEngine:
                     "direction": direction,
                 },
             ))
-            break  # one crossing per analyse() pass per zone
+            break   # one crossing per analyse() per zone
         return out
-
-    # ─── dwell state plumbing ─────────────────────────────────────────
 
     def _clear_dwell(self, camera_id: int, track_id: int, zone_id: str) -> None:
         with self._dwell_lock:
             self._dwell_state.pop((camera_id, track_id, zone_id), None)
 
     def _gc_dwell(self, camera_id: int, alive_tracks: list[TrackedObject]) -> None:
-        """Drop dwell entries whose tracks are no longer in the live set."""
         alive_ids = {t.track_id for t in alive_tracks}
         with self._dwell_lock:
             stale = [
@@ -317,13 +242,8 @@ class BehaviorEngine:
                 self._dwell_state.pop(k, None)
 
 
-# ─── helpers ─────────────────────────────────────────────────────────
-
-
 @dataclass
 class _DwellState:
-    """Per-(camera, track, zone) loitering bookkeeping."""
-
     first_seen_ts: float
     events_inside: int
     alerted: bool
@@ -334,19 +254,9 @@ def _crossing_direction(
     prev: tuple[float, float], curr: tuple[float, float],
     seg_a: tuple[float, float], seg_b: tuple[float, float],
 ) -> str:
-    """Direction of line crossing, matching Dahua's `Direction` strings.
-
-    The convention is the one operators draw: with the line going
-    seg_a → seg_b in image space (y-axis down), `LeftToRight` means
-    the centroid moved from the line's left side to its right side
-    in screen coordinates.
-
-    Cross product sign convention here: with screen-y flipped, the
-    formula `lx*(P.y - A.y) - ly*(P.x - A.x)` gives a NEGATIVE value
-    when P is to the screen-right of the line vector (vertical line
-    going top-to-bottom in screen). So `cross_prev > 0 → screen-left`
-    and `cross_prev < 0 → screen-right`.
-    """
+    """Matches Dahua's "LeftToRight" / "RightToLeft" — screen-relative,
+    not line-relative. y-axis is flipped (down), so cross_prev > 0
+    means P is to the screen-left of the line vector."""
     lx, ly = seg_b[0] - seg_a[0], seg_b[1] - seg_a[1]
     cross_prev = lx * (prev[1] - seg_a[1]) - ly * (prev[0] - seg_a[0])
     cross_curr = lx * (curr[1] - seg_a[1]) - ly * (curr[0] - seg_a[0])

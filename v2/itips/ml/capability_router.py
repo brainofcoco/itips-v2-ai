@@ -1,15 +1,8 @@
 """Per-camera capability routing for the ML fallback layer.
 
-The Dahua health check (`itips/camera/dahua_health.py`) produces a
-per-camera matrix of probe results. This module condenses that matrix
-into yes/no questions the event handlers care about:
-
-    "Does cam 3 do face recognition natively, or do I run InsightFace?"
-    "Does cam 1 do ANPR natively, or do I run OCR?"
-    "Does cam 4 have IVS rules deployed, or do I run zone logic?"
-
-Sits read-only on top of `dahua_health` — feed it a fresh health
-snapshot whenever one runs; query it cheaply from any event handler.
+Condenses the dahua_health probe matrix into yes/no decisions for
+event handlers: "does this camera need the Jetson fallback for X?"
+Operator overrides take precedence over probe results.
 """
 
 from __future__ import annotations
@@ -26,8 +19,6 @@ logger = logging.getLogger(__name__)
 
 
 class Capability(str, enum.Enum):
-    """The set of features for which a Jetson-side fallback exists."""
-
     FACE_RECOGNITION = "face_recognition"
     ANPR = "anpr"
     IVS_RULES = "ivs_rules"
@@ -36,9 +27,8 @@ class Capability(str, enum.Enum):
     LOCAL_STORAGE = "local_storage"
 
 
-# Which probe(s) decide whether a capability is "native". A capability
-# is considered native only if **all** of its probes report STATUS_OK.
-# Probes are referenced by the `name` field used in `dahua_health.py`.
+# A capability is "native" only if ALL its probes (named per
+# dahua_health.py) report STATUS_OK.
 _NATIVE_PROBES: dict[Capability, tuple[str, ...]] = {
     Capability.FACE_RECOGNITION: ("face_recognition_db", "face_group_channel"),
     Capability.ANPR: ("anpr_redlist", "anpr_event_attach"),
@@ -51,8 +41,6 @@ _NATIVE_PROBES: dict[Capability, tuple[str, ...]] = {
 
 @dataclass
 class CapabilitySnapshot:
-    """One camera's capability vector, as seen by the router."""
-
     camera_id: int
     native: dict[Capability, bool] = field(default_factory=dict)
     details: dict[Capability, str] = field(default_factory=dict)
@@ -62,42 +50,23 @@ class CapabilitySnapshot:
 
 
 class CapabilityRouter:
-    """Thread-safe snapshot store of per-camera capability decisions.
+    """Per-camera capability decisions, override-aware.
 
-    Two layers feed `needs_fallback`:
-
-    1. **Probe results** (the snapshot) — updated by `update_from_health`
-       whenever the dashboard re-runs the Dahua capability probe. A
-       missing native probe makes that capability fall back.
-    2. **Operator overrides** — explicit "I don't trust this camera's
-       native X, always run the Jetson model" toggles flipped from the
-       dashboard. Survive restart via `overrides_path` (a small JSON
-       file on the NVMe).
-
-    Overrides take precedence over probe results both ways: an
-    operator can force fallback on a camera the probe says is fine,
-    or pin a camera to native if they explicitly want to.
+    Two inputs: probe results (refreshed by `update_from_health`) and
+    operator overrides (persisted to `overrides_path`). Overrides win.
     """
 
     def __init__(self, overrides_path: Optional[Path] = None) -> None:
         self._lock = threading.Lock()
         self._by_camera: dict[int, CapabilitySnapshot] = {}
-        # (camera_id, Capability) → bool. True = force fallback,
-        # False = pin to native, missing key = follow the probe.
+        # (cam, cap) → True=force fallback, False=pin native, missing=follow probe.
         self._overrides: dict[tuple[int, Capability], bool] = {}
         self._overrides_path = overrides_path
         if overrides_path is not None:
             self._load_overrides()
 
-    # ─── feeding ──────────────────────────────────────────────────────
-
     def update_from_health(self, health_body: dict[str, Any]) -> None:
-        """Re-derive every capability from a `run_for_all` dict.
-
-        `health_body` is the structure returned by
-        `dahua_health.run_for_all` (or its `/api/health/cameras`
-        wrapping). Safe to call repeatedly — replaces in place.
-        """
+        """Re-derive from a `dahua_health.run_for_all` dict. Idempotent."""
         next_by_camera: dict[int, CapabilitySnapshot] = {}
         for cam in health_body.get("cameras", []):
             cam_id = int(cam.get("camera_id", -1))
@@ -121,22 +90,13 @@ class CapabilityRouter:
         logger.info("capability router refreshed: %d camera(s)", len(next_by_camera))
 
     def set_camera(self, snap: CapabilitySnapshot) -> None:
-        """Inject a single camera's snapshot. Mostly for tests."""
+        """Inject a snapshot directly — mainly for tests."""
         with self._lock:
             self._by_camera[snap.camera_id] = snap
 
-    # ─── querying ─────────────────────────────────────────────────────
-
     def needs_fallback(self, camera_id: int, cap: Capability) -> bool:
-        """`True` if cam doesn't natively do `cap` — run the ML fallback.
-
-        Override beats probe. Operator-forced fallback wins even when
-        the camera reports native support; operator-pinned-native wins
-        even when the probe says the feature is missing. Without
-        either signal we fall back to the probe; with no probe data
-        either we conservatively say "native" so we don't fire up
-        ML for cameras we know nothing about.
-        """
+        """Override beats probe. No data either → conservatively native
+        (don't spin up ML for cameras we know nothing about)."""
         with self._lock:
             forced = self._overrides.get((camera_id, cap))
         if forced is not None:
@@ -150,12 +110,7 @@ class CapabilityRouter:
         return self._snapshot(camera_id)
 
     def summary(self) -> dict[int, dict[str, bool]]:
-        """For the dashboard: `{cam_id: {cap_name: is_native}}`.
-
-        "is_native" here means the **effective** native flag — probe
-        flipped by any override the operator set. Lets the UI render
-        the same matrix regardless of how a decision was reached.
-        """
+        """`{cam_id: {cap_name: is_effective_native}}` — overrides applied."""
         with self._lock:
             out: dict[int, dict[str, bool]] = {}
             for cid, snap in self._by_camera.items():
@@ -163,23 +118,15 @@ class CapabilityRouter:
                 for cap in Capability:
                     override = self._overrides.get((cid, cap))
                     if override is not None:
-                        row[cap.value] = not override  # forced fallback ↔ not native
+                        row[cap.value] = not override
                     else:
                         row[cap.value] = snap.native.get(cap, False)
                 out[cid] = row
             return out
 
-    # ─── overrides ────────────────────────────────────────────────────
-
     def set_override(self, camera_id: int, cap: Capability,
                      force_fallback: Optional[bool]) -> None:
-        """Pin a camera's capability decision.
-
-        `True`  → always run the ML fallback for this (cam, cap).
-        `False` → always trust the native path even if the probe says
-                  the feature is missing.
-        `None`  → clear the override; fall back to probe behaviour.
-        """
+        """True=force fallback, False=pin native, None=follow probe."""
         key = (camera_id, cap)
         with self._lock:
             if force_fallback is None:
@@ -195,7 +142,7 @@ class CapabilityRouter:
         )
 
     def overrides(self) -> dict[int, dict[str, bool]]:
-        """`{cam_id: {cap_name: True_means_force_fallback}}` for the UI."""
+        """`{cam_id: {cap_name: True=force_fallback}}` for the dashboard."""
         with self._lock:
             out: dict[int, dict[str, bool]] = {}
             for (cid, cap), forced in self._overrides.items():
