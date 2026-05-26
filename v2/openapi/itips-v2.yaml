@@ -33,6 +33,30 @@ tags:
     description: Live event tap, PTZ jog, synthetic event injection, inbound proxy.
   - name: Inbound
     description: Backend → Jetson commands (B1–B5). Bearer auth.
+  - name: Capabilities
+    description: |
+      Per-camera capability matrix (probed from each Dahua camera) plus
+      operator overrides for forcing the Jetson fallback path instead
+      of trusting the camera's native feature.
+  - name: Zones
+    description: |
+      Polygon zone CRUD for the behavioral fallback. Region zones drive
+      `intrusion` + `loitering`; line zones drive `line_crossing`.
+      Coordinates are normalised `[0,1]` in image space so they survive
+      resolution changes.
+  - name: Sensors
+    description: |
+      AX PRO sensor pipeline. Operator binds each hub zone to a
+      `(camera, preset)` pair; on alarm the dispatcher pans, snapshots,
+      and runs face recognition. The Simulate endpoint drives the
+      exact same pipeline as a real hub event — use it to test without
+      an AX PRO hub on the network.
+  - name: ML
+    description: |
+      Jetson-side fallback engines (face, plate, behavior). The status,
+      warmup, and direct-invoke routes back the dashboard's ML Lab tab.
+      Pass `?dispatch=1` on recognize/read/analyse to also fire the
+      result through the AlertEngine — Alerts tab lights up in real time.
 security: []
 paths:
   /health:
@@ -525,6 +549,425 @@ paths:
         "200":
           description: OK
 
+  # ─── Capabilities + Health probes ────────────────────────────────
+
+  /api/health/cameras:
+    get:
+      tags: [Capabilities]
+      summary: Run the per-camera Dahua capability probe
+      description: |
+        Hits each camera with a small battery of HTTP checks (reachable,
+        snapshot, MJPEG, face DB, ANPR list, PTZ, deterrence, IVS rules,
+        face-group binding, ANPR event subscription, white-light, alarm-out,
+        SD storage) plus passive observation of which event codes the
+        camera has actually fired since boot. Cached for 20s; pass
+        `?force=1` to bypass the cache.
+      parameters:
+        - { name: force, in: query, required: false, schema: { type: string, enum: ["1", "true"] } }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/HealthProbeReport" }
+
+  /api/health/capabilities:
+    get:
+      tags: [Capabilities]
+      summary: Per-camera capability decisions + engine readiness
+      description: |
+        Distills the raw probe matrix into yes/no answers the event
+        worker actually uses — for each camera, is `face_recognition`,
+        `anpr`, `ivs_rules`, `deterrence`, `snapshot`, `local_storage`
+        currently being served natively or via the Jetson fallback?
+        The `overrides` field surfaces any operator-pinned decisions.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CapabilitySummary" }
+
+  /api/health/capabilities/{camera_id}/{capability}/override:
+    post:
+      tags: [Capabilities]
+      summary: Force the fallback (or pin to native) for one capability
+      description: |
+        Operator override that beats the probe result. Set
+        `force_fallback=true` to make the event worker route this
+        camera's capability through the Jetson fallback even when the
+        camera reports native support — useful when a camera's onboard
+        face DB is empty or unreliable. Set `false` to pin to native.
+        Set `null` to clear and revert to following the probe.
+        Persisted to `/opt/itips/var/ml_overrides.json`.
+      parameters:
+        - { name: camera_id, in: path, required: true, schema: { type: integer } }
+        - { name: capability, in: path, required: true,
+            schema: { type: string, enum: [face_recognition, anpr, ivs_rules,
+                       deterrence, snapshot, local_storage] } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [force_fallback]
+              properties:
+                force_fallback:
+                  oneOf: [{ type: boolean }, { type: "null" }]
+      responses:
+        "200": { description: Override applied }
+        "400": { description: Invalid capability or body }
+
+  /api/cameras/{camera_id}/presets:
+    get:
+      tags: [Cameras]
+      summary: List the camera's onboard PTZ presets
+      description: |
+        Drives the preset dropdown in the Sensors tab — operator picks
+        a preset by name when binding a sensor zone to a camera.
+      parameters:
+        - { name: camera_id, in: path, required: true, schema: { type: integer } }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  camera_id: { type: integer }
+                  presets:
+                    type: array
+                    items: { $ref: "#/components/schemas/PresetInfo" }
+        "404": { description: Unknown camera }
+
+  # ─── Zones (behavioral fallback) ─────────────────────────────────
+
+  /api/zones/{camera_id}:
+    get:
+      tags: [Zones]
+      summary: List polygon zones for a camera
+      parameters:
+        - { name: camera_id, in: path, required: true, schema: { type: integer } }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  available: { type: boolean }
+                  camera_id: { type: integer }
+                  zones:
+                    type: array
+                    items: { $ref: "#/components/schemas/Zone" }
+    post:
+      tags: [Zones]
+      summary: Upsert a polygon zone for the camera
+      description: |
+        Coordinates are normalised `[0,1]` in image space. Region zones
+        need ≥3 points; line zones need ≥2. `zone_id` is the upsert key.
+      parameters:
+        - { name: camera_id, in: path, required: true, schema: { type: integer } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/Zone" }
+      responses:
+        "200": { description: Zone saved }
+        "400": { description: Validation failed }
+
+  /api/zones/{camera_id}/{zone_id}:
+    delete:
+      tags: [Zones]
+      summary: Delete a polygon zone
+      parameters:
+        - { name: camera_id, in: path, required: true, schema: { type: integer } }
+        - { name: zone_id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: Deleted }
+        "404": { description: Zone not found }
+
+  # ─── Sensors ─────────────────────────────────────────────────────
+
+  /api/sensors/listener/status:
+    get:
+      tags: [Sensors]
+      summary: AX PRO hub listener health
+      description: |
+        Drives the topbar pill and the Sensors tab's hub indicator.
+        When `wired=false`, `ITIPS_AXPRO_HOST` is unset and only the
+        Simulate endpoint can drive the dispatcher. When `wired=true`,
+        `connected` reflects the live hub session; `armed` reflects
+        the cached `subsystem_status()` reading; `last_error` carries
+        the most recent connection/poll exception (cleared on success).
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ListenerStatus" }
+
+  /api/sensors/map:
+    get:
+      tags: [Sensors]
+      summary: List zone → camera+preset bindings
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  available: { type: boolean }
+                  mappings:
+                    type: array
+                    items: { $ref: "#/components/schemas/SensorMapping" }
+    post:
+      tags: [Sensors]
+      summary: Upsert a sensor → camera+preset binding
+      description: |
+        Persisted to `/opt/itips/var/sensor_map.json`. `zone_id` is
+        the upsert key. `preset_name` must match a preset defined on
+        the camera (use `/api/cameras/{id}/presets` to enumerate).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SensorMapping" }
+      responses:
+        "200": { description: Mapping saved }
+        "400": { description: Validation failed }
+
+  /api/sensors/map/{zone_id}:
+    delete:
+      tags: [Sensors]
+      summary: Remove a sensor binding
+      parameters:
+        - { name: zone_id, in: path, required: true, schema: { type: integer } }
+      responses:
+        "200": { description: Deleted }
+        "404": { description: Zone not in map }
+
+  /api/sensors/simulate/{zone_id}:
+    post:
+      tags: [Sensors]
+      summary: Inject a synthetic sensor event
+      description: |
+        Queues a `SensorEvent` with `source=simulate` straight into the
+        dispatcher — exactly the same pipeline a real AX PRO event
+        would trigger (pan PTZ → snapshot → face validate → alert).
+        Use this to test without a hub on the network.
+      parameters:
+        - { name: zone_id, in: path, required: true, schema: { type: integer } }
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                event_type: { type: string, default: doorContact,
+                              description: "PIR | doorContact | vibration | pircam | smoke" }
+                event_state: { type: string, default: alarm }
+                zone_name: { type: string }
+      responses:
+        "200":
+          description: Event queued
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  queued: { type: boolean }
+                  event: { $ref: "#/components/schemas/SensorEvent" }
+        "503": { description: Dispatcher not wired or queue full }
+
+  /api/sensors/events/recent:
+    get:
+      tags: [Sensors]
+      summary: Recent sensor events + dispatcher verdicts (ring buffer)
+      parameters:
+        - { name: limit, in: query, required: false, schema: { type: integer, default: 50 } }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  available: { type: boolean }
+                  events:
+                    type: array
+                    items: { $ref: "#/components/schemas/SensorEventRecord" }
+    delete:
+      tags: [Sensors]
+      summary: Clear the recent-events ring buffer
+      responses:
+        "200": { description: Cleared }
+
+  # ─── ML Lab — direct engine invocation ───────────────────────────
+
+  /api/ml/status:
+    get:
+      tags: [ML]
+      summary: Per-engine wired / ready state
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  face:     { $ref: "#/components/schemas/MLEngineStatus" }
+                  plate:    { $ref: "#/components/schemas/MLEngineStatus" }
+                  behavior: { $ref: "#/components/schemas/MLEngineStatus" }
+
+  /api/ml/warmup:
+    post:
+      tags: [ML]
+      summary: Trigger `warmup_async()` on every wired engine
+      description: |
+        Engines lazy-load on first use; this kicks each one's warmup
+        thread so the first real event doesn't pay the 3–5s cold-start
+        tax. Idempotent.
+      responses:
+        "200":
+          description: OK (returns same shape as `/api/ml/status`)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  face:     { $ref: "#/components/schemas/MLEngineStatus" }
+                  plate:    { $ref: "#/components/schemas/MLEngineStatus" }
+                  behavior: { $ref: "#/components/schemas/MLEngineStatus" }
+
+  /api/ml/face/enrolled:
+    get:
+      tags: [ML]
+      summary: List people enrolled in the Jetson face DB
+      description: |
+        Mirror of the EmbeddingStore — populated by `POST /api/workers`.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  available: { type: boolean }
+                  count: { type: integer }
+                  people:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        person_id: { type: string }
+                        full_name: { type: string }
+                        dim: { type: integer, description: "embedding dimension (512 for ArcFace)" }
+
+  /api/ml/face/recognize:
+    post:
+      tags: [ML]
+      summary: Run InsightFace against an uploaded image
+      description: |
+        Pass an image as multipart `image=`. With `?dispatch=1`, the
+        result is also routed through the AlertEngine — match fires
+        `personnel_seen`, no match fires `face_intruder`. Multipart
+        `camera_id` is the cam attributed in the dispatched alert.
+      parameters:
+        - { name: dispatch, in: query, required: false,
+            schema: { type: string, enum: ["1", "true"] } }
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [image]
+              properties:
+                image: { type: string, format: binary }
+                camera_id: { type: string, description: "for the dispatch path" }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/FaceRecognizeResult" }
+        "503": { description: Face engine not wired }
+
+  /api/ml/plate/read:
+    post:
+      tags: [ML]
+      summary: Run PaddleOCR + plate-pattern filter against an uploaded image
+      description: |
+        Pass an image as multipart `image=`. With `?dispatch=1` the
+        read also fires `handle_plate_capture`. The filter requires
+        5–10 alphanum chars with at least 2 letters AND 2 digits.
+        Confidence floor defaults to 0.4.
+      parameters:
+        - { name: dispatch, in: query, required: false,
+            schema: { type: string, enum: ["1", "true"] } }
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [image]
+              properties:
+                image: { type: string, format: binary }
+                camera_id: { type: string }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PlateReadResult" }
+        "503": { description: Plate engine not wired }
+
+  /api/ml/behavior/{camera_id}/analyse:
+    post:
+      tags: [ML]
+      summary: Run YOLOv8 + IoU tracker + zone evaluation
+      description: |
+        Pass an image as multipart `image=`. Response includes both
+        synthesised alerts AND raw YOLO detections + the camera's
+        zones — so when no alert fires you can see whether YOLO
+        missed the person, the person was outside every zone, or
+        the wrong camera_id was selected. With `?dispatch=1`, each
+        alert is also routed through `handle_behaviour_alert_simple`.
+      parameters:
+        - { name: camera_id, in: path, required: true, schema: { type: integer } }
+        - { name: dispatch, in: query, required: false,
+            schema: { type: string, enum: ["1", "true"] } }
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [image]
+              properties:
+                image: { type: string, format: binary }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/BehaviorAnalysisResult" }
+        "503": { description: Behavior engine not wired }
+
 components:
   securitySchemes:
     bearerAuth:
@@ -711,3 +1154,295 @@ components:
               items: { type: number }
             frame_width: { type: integer }
             frame_height: { type: integer }
+
+    # ─── Capabilities / Health ──────────────────────────────────────
+
+    HealthProbeReport:
+      type: object
+      properties:
+        timestamp: { type: string, format: date-time }
+        cached: { type: boolean }
+        cameras:
+          type: array
+          items:
+            type: object
+            properties:
+              camera_id: { type: integer }
+              endpoint: { type: string }
+              model: { type: string, nullable: true }
+              green_count: { type: integer }
+              red_count: { type: integer }
+              checks:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    name: { type: string,
+                            description: "reachable, snapshot, face_recognition_db, anpr_redlist, ptz, deterrence, …" }
+                    label: { type: string }
+                    status: { type: string,
+                              enum: [ok, missing, error, unknown, "n/a"] }
+                    category: { type: string,
+                                enum: [core, media, ai, control, events] }
+                    detail: { type: string, nullable: true }
+                    backup_hint: { type: string, nullable: true,
+                                   description: "what to do if this is missing/error" }
+              backup_recommendations:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    check: { type: string }
+                    label: { type: string }
+                    hint: { type: string }
+
+    CapabilitySummary:
+      type: object
+      properties:
+        available: { type: boolean }
+        face_engine_ready: { type: boolean }
+        plate_engine_ready: { type: boolean }
+        behavior_engine_ready: { type: boolean }
+        cameras:
+          type: object
+          description: |
+            Keyed by camera_id (stringified). Each value's flags are
+            effective decisions — operator overrides already applied.
+          additionalProperties:
+            type: object
+            properties:
+              face_recognition: { type: boolean }
+              anpr:             { type: boolean }
+              ivs_rules:        { type: boolean }
+              deterrence:       { type: boolean }
+              snapshot:         { type: boolean }
+              local_storage:    { type: boolean }
+        overrides:
+          type: object
+          description: |
+            `{cam_id_str: {cap_name: true_if_forced_fallback}}`. Missing
+            keys = follow the probe; only set keys override.
+          additionalProperties:
+            type: object
+            additionalProperties: { type: boolean }
+
+    PresetInfo:
+      type: object
+      properties:
+        index: { type: integer }
+        name: { type: string }
+        pan:  { type: number, nullable: true }
+        tilt: { type: number, nullable: true }
+        zoom: { type: number, nullable: true }
+
+    # ─── Zones ──────────────────────────────────────────────────────
+
+    Zone:
+      type: object
+      required: [zone_id, zone_type, points]
+      properties:
+        zone_id: { type: string, description: "operator-chosen, unique per camera" }
+        zone_type:
+          type: string
+          enum: [region, line]
+          description: |
+            * `region` — closed polygon (≥3 pts). Drives intrusion + loitering.
+            * `line`   — open polyline (≥2 pts). Drives line_crossing.
+        points:
+          type: array
+          description: |
+            Sequence of `[nx, ny]` pairs, normalised `[0,1]` in image
+            space. Engine resolves to pixels at evaluation time so
+            zones survive snapshot resolution changes.
+          items:
+            type: array
+            minItems: 2
+            maxItems: 2
+            items: { type: number }
+        name: { type: string }
+        direction:
+          type: string
+          enum: [Any, LeftToRight, RightToLeft]
+          default: Any
+          description: "Only meaningful for line zones."
+        metadata: { type: object, additionalProperties: true }
+
+    # ─── Sensors ────────────────────────────────────────────────────
+
+    SensorMapping:
+      type: object
+      required: [zone_id, camera_id, preset_name]
+      properties:
+        zone_id: { type: integer, description: "from the AX PRO hub" }
+        camera_id: { type: integer }
+        preset_name:
+          type: string
+          description: "must match an existing preset on the camera (see /api/cameras/{id}/presets)"
+        sensor_type:
+          type: string
+          description: "PIR | doorContact | vibration | pircam | smoke (advisory)"
+        description: { type: string }
+        metadata: { type: object, additionalProperties: true }
+
+    SensorEvent:
+      type: object
+      properties:
+        zone_id: { type: integer }
+        event_type: { type: string }
+        event_state: { type: string, default: alarm }
+        zone_name: { type: string }
+        source: { type: string, enum: [axpro, simulate] }
+        received_ts: { type: number, description: "unix epoch seconds" }
+        raw: { type: object, additionalProperties: true }
+
+    SensorEventRecord:
+      allOf:
+        - $ref: "#/components/schemas/SensorEvent"
+        - type: object
+          properties:
+            seq: { type: integer, description: "monotonic per-process counter" }
+            outcome:
+              type: object
+              description: |
+                Dispatcher's verdict for this event. `verdict` is the
+                primary key; other keys depend on which branch fired.
+              properties:
+                verdict:
+                  type: string
+                  enum:
+                    - authorised
+                    - intruder
+                    - unverified_no_face
+                    - unverified_no_engine
+                    - engine_error
+                    - cooldown
+                    - unmapped
+                    - no_camera
+                    - pan_failed
+                    - snapshot_failed
+                camera_id:    { type: integer, nullable: true }
+                preset_name:  { type: string,  nullable: true }
+                person_id:    { type: string,  nullable: true }
+                full_name:    { type: string,  nullable: true }
+                similarity:   { type: number,  nullable: true }
+                remaining_s:  { type: number,  nullable: true }
+
+    ListenerStatus:
+      type: object
+      properties:
+        wired:
+          type: boolean
+          description: "false if ITIPS_AXPRO_HOST is unset (listener disabled)."
+        reason: { type: string, description: "Set only when wired=false." }
+        host:        { type: string }
+        connected:   { type: boolean }
+        armed:       { type: boolean, description: "cached subsystem_status() reading" }
+        last_error:  { type: string, nullable: true }
+        thread_alive: { type: boolean }
+
+    # ─── ML Lab ─────────────────────────────────────────────────────
+
+    MLEngineStatus:
+      type: object
+      properties:
+        wired: { type: boolean }
+        ready: { type: boolean,
+                 description: "true once the engine's warmup_async has finished" }
+
+    FaceRecognizeResult:
+      type: object
+      properties:
+        ok: { type: boolean }
+        engine_ready: { type: boolean }
+        matched: { type: boolean }
+        person_id: { type: string, nullable: true }
+        full_name: { type: string, nullable: true }
+        similarity: { type: number, description: "cosine in [-1, 1]" }
+        dispatched:
+          type: boolean
+          description: "true if ?dispatch=1 and we fired through the AlertEngine"
+
+    PlateReadResult:
+      type: object
+      properties:
+        ok: { type: boolean }
+        engine_ready: { type: boolean }
+        found: { type: boolean }
+        plate_number: { type: string, nullable: true,
+                         description: "uppercase, separators stripped" }
+        confidence: { type: number, nullable: true, description: "[0,1]" }
+        bbox:
+          type: array
+          minItems: 4
+          maxItems: 4
+          items: { type: number }
+          nullable: true
+        raw_text: { type: string, nullable: true,
+                     description: "OCR output before the plate-pattern filter" }
+        dispatched: { type: boolean }
+
+    BehaviorAlert:
+      type: object
+      properties:
+        alert_type:
+          type: string
+          enum: [intrusion, loitering, line_crossing]
+        zone_id: { type: string }
+        zone_name: { type: string }
+        track_id: { type: integer }
+        class_name: { type: string,
+                       description: "person | car | bicycle | motorcycle | bus | truck" }
+        bbox:
+          type: array
+          minItems: 4
+          maxItems: 4
+          items: { type: number }
+        details: { type: object, additionalProperties: true }
+
+    DetectionRecord:
+      type: object
+      properties:
+        class_name: { type: string }
+        confidence: { type: number }
+        bbox:
+          type: array
+          minItems: 4
+          maxItems: 4
+          items: { type: number }
+        anchor_px:
+          type: array
+          minItems: 2
+          maxItems: 2
+          items: { type: number }
+          description: "bottom-center of bbox in pixels — what the region check uses"
+        anchor_norm:
+          type: array
+          minItems: 2
+          maxItems: 2
+          items: { type: number }
+          description: "same as anchor_px but normalised to [0,1]"
+
+    BehaviorAnalysisResult:
+      type: object
+      properties:
+        ok: { type: boolean }
+        engine_ready: { type: boolean }
+        camera_id: { type: integer }
+        frame_size:
+          type: array
+          minItems: 2
+          maxItems: 2
+          items: { type: integer }
+          description: "[width, height] in pixels"
+        zone_count: { type: integer }
+        zones:
+          type: array
+          items: { $ref: "#/components/schemas/Zone" }
+        detections:
+          type: array
+          items: { $ref: "#/components/schemas/DetectionRecord" }
+        alerts:
+          type: array
+          items: { $ref: "#/components/schemas/BehaviorAlert" }
+        dispatched: { type: integer,
+                       description: "count of alerts routed to AlertEngine" }

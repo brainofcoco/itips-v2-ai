@@ -1,6 +1,6 @@
-"""PlateEngine — OCR filtering + bbox math, with a fake EasyOCR reader.
+"""PlateEngine — OCR filtering + bbox math, with a fake PaddleOCR reader.
 
-Real EasyOCR is never imported. The engine's `_ensure_model` hook is
+Real PaddleOCR is never imported. The engine's `_ensure_model` hook is
 overridden so we can drop a stub `reader` into place without the dep.
 This validates the plate-pattern filter, confidence threshold, bbox
 offset arithmetic, and crop handling — not the underlying CRNN.
@@ -19,24 +19,30 @@ from itips.ml.plate_engine import (
 )
 
 
-class _FakeReader:
-    """Stand-in for `easyocr.Reader`. Returns a queued list per call."""
+class _FakePaddle:
+    """Stand-in for `paddleocr.PaddleOCR`. Returns a list-of-lists per call,
+    matching Paddle's `ocr()` shape: outer list one slot per image,
+    each slot a list of `[points, (text, conf)]` detections (or
+    `[None]` when nothing is detected)."""
 
     def __init__(self, rows):
-        self.rows = list(rows)
+        # `rows` is the per-image detection list. Empty rows ⇒ Paddle
+        # returns `[None]` (a list with a single None), which the
+        # engine treats as "no detections" — mimic that here.
+        self._rows = list(rows) if rows else None
         self.calls: list[tuple[int, int]] = []  # (h, w) of each crop
 
-    def readtext(self, frame, **kwargs):
+    def ocr(self, frame, **kwargs):
         self.calls.append((frame.shape[0], frame.shape[1]))
-        return list(self.rows)
+        return [list(self._rows) if self._rows is not None else None]
 
 
 def _row(points, text, conf):
-    """EasyOCR's `detail=1` row shape."""
-    return [points, text, conf]
+    """PaddleOCR row shape — [points_4xy, (text, confidence)]."""
+    return [points, (text, conf)]
 
 
-def _make_engine(reader: _FakeReader, threshold: float = 0.5) -> PlateEngine:
+def _make_engine(reader: _FakePaddle, threshold: float = 0.4) -> PlateEngine:
     engine = PlateEngine(min_confidence=threshold)
     engine._reader = reader
     engine._ready.set()
@@ -78,7 +84,7 @@ def test_clean_plate_text_strips_separators_and_uppercases():
 
 
 def test_read_plate_picks_highest_confidence_plate_like_text():
-    reader = _FakeReader([
+    reader = _FakePaddle([
         _row([(0, 0), (50, 0), (50, 20), (0, 20)], "STOPSIGN", 0.92),  # ignored
         _row([(0, 0), (100, 0), (100, 30), (0, 30)], "LAG-123-XY", 0.81),
         _row([(0, 0), (100, 0), (100, 30), (0, 30)], "ABC-99-DE", 0.65),
@@ -91,15 +97,15 @@ def test_read_plate_picks_highest_confidence_plate_like_text():
 
 
 def test_read_plate_returns_none_below_confidence_floor():
-    reader = _FakeReader([
-        _row([(0, 0), (50, 0), (50, 20), (0, 20)], "LAG-123-XY", 0.40),
+    reader = _FakePaddle([
+        _row([(0, 0), (50, 0), (50, 20), (0, 20)], "LAG-123-XY", 0.30),
     ])
-    engine = _make_engine(reader, threshold=0.5)
+    engine = _make_engine(reader, threshold=0.4)
     assert engine.read_plate(_frame()) is None
 
 
 def test_read_plate_returns_none_when_no_plate_like_strings():
-    reader = _FakeReader([
+    reader = _FakePaddle([
         _row([(0, 0), (50, 0), (50, 20), (0, 20)], "WELCOME", 0.99),
         _row([(0, 0), (50, 0), (50, 20), (0, 20)], "555-1234", 0.95),
     ])
@@ -107,10 +113,18 @@ def test_read_plate_returns_none_when_no_plate_like_strings():
     assert engine.read_plate(_frame()) is None
 
 
+def test_read_plate_returns_none_when_paddle_finds_nothing():
+    """PaddleOCR returns [None] (not []) when its detector fires zero
+    boxes — the engine must treat that as "no detections", not crash."""
+    reader = _FakePaddle([])    # internal _rows = None → ocr() returns [None]
+    engine = _make_engine(reader)
+    assert engine.read_plate(_frame()) is None
+
+
 def test_vehicle_bbox_translates_plate_bbox_back_to_frame_coords():
     """If we cropped to a vehicle bbox, the returned plate bbox must
     be in the original frame's coordinate system."""
-    reader = _FakeReader([
+    reader = _FakePaddle([
         _row([(10, 10), (110, 10), (110, 40), (10, 40)], "LAG-123-XY", 0.9),
     ])
     engine = _make_engine(reader)
@@ -126,7 +140,7 @@ def test_vehicle_bbox_translates_plate_bbox_back_to_frame_coords():
 
 
 def test_vehicle_bbox_hands_smaller_array_to_reader():
-    reader = _FakeReader([])
+    reader = _FakePaddle([])
     engine = _make_engine(reader)
     engine.read_plate(_frame(h=480, w=640), vehicle_bbox=(100, 100, 300, 300))
     seen_h, seen_w = reader.calls[-1]
@@ -134,7 +148,7 @@ def test_vehicle_bbox_hands_smaller_array_to_reader():
 
 
 def test_invalid_vehicle_bbox_falls_back_to_full_frame():
-    reader = _FakeReader([])
+    reader = _FakePaddle([])
     engine = _make_engine(reader)
     # bbox outside the frame → engine should hand the full frame in.
     engine.read_plate(_frame(h=240, w=320), vehicle_bbox=(500, 500, 600, 600))
@@ -145,12 +159,12 @@ def test_invalid_vehicle_bbox_falls_back_to_full_frame():
 # ─── error surface ──────────────────────────────────────────────────
 
 
-def test_plate_engine_unavailable_when_easyocr_missing(monkeypatch):
+def test_plate_engine_unavailable_when_paddleocr_missing(monkeypatch):
     engine = PlateEngine()
     real_import = __import__
 
     def fake_import(name, *args, **kwargs):
-        if name.startswith("easyocr"):
+        if name.startswith("paddleocr"):
             raise ImportError("simulated missing")
         return real_import(name, *args, **kwargs)
 
@@ -158,7 +172,7 @@ def test_plate_engine_unavailable_when_easyocr_missing(monkeypatch):
     try:
         engine._ensure_model()
     except PlateEngineUnavailable as e:
-        assert "easyocr" in str(e).lower()
+        assert "paddleocr" in str(e).lower()
     else:
         raise AssertionError("expected PlateEngineUnavailable")
 

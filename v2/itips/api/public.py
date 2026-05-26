@@ -35,6 +35,10 @@ class PublicApiServer(threading.Thread):
         plate_engine=None,
         behavior_engine=None,
         zone_store=None,
+        sensor_map=None,
+        sensor_dispatcher=None,
+        sensor_event_tap=None,
+        axpro_listener=None,
     ) -> None:
         super().__init__(name="api-public", daemon=True)
         self._frame_bus = frame_bus
@@ -47,6 +51,10 @@ class PublicApiServer(threading.Thread):
         self._plate_engine = plate_engine
         self._behavior_engine = behavior_engine
         self._zone_store = zone_store
+        self._sensor_map = sensor_map
+        self._sensor_dispatcher = sensor_dispatcher
+        self._sensor_event_tap = sensor_event_tap
+        self._axpro_listener = axpro_listener
         self._app = self._build_app()
         self._server = None
 
@@ -68,6 +76,10 @@ class PublicApiServer(threading.Thread):
             plate_engine=self._plate_engine,
             behavior_engine=self._behavior_engine,
             zone_store=self._zone_store,
+            sensor_map=self._sensor_map,
+            sensor_dispatcher=self._sensor_dispatcher,
+            sensor_event_tap=self._sensor_event_tap,
+            axpro_listener=self._axpro_listener,
         )
 
         @app.get("/health")

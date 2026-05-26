@@ -95,6 +95,31 @@ def _build_deps():
         overrides_path=personnel_store_path.parent / "ml_overrides.json",
     )
 
+    # ─── Sensor pipeline ──────────────────────────────────────────────
+    # Same posture as the ML layer: best-effort wiring. SensorMap is
+    # always safe to build (it's just JSON-on-disk). The dispatcher
+    # needs the alert engine + dahua manager, which we have here, and
+    # *optionally* the FaceEngine for the validation branch. Without
+    # the FaceEngine, dispatches still pan + snapshot + log — just
+    # without the auto-recognise step.
+    from itips.runtime.sensor_dispatcher import SensorDispatcher
+    from itips.sensors.sensor_event import SensorEventTap
+    from itips.sensors.sensor_map import SensorMap
+    sensor_map = SensorMap(path=personnel_store_path.parent / "sensor_map.json")
+    sensor_event_tap = SensorEventTap()
+    sensor_dispatcher = SensorDispatcher(
+        alert_engine=alert_engine,
+        dahua_manager=dahua_manager,
+        sensor_map=sensor_map,
+        event_tap=sensor_event_tap,
+        face_engine=ml_state.face_engine,
+    )
+
+    # AX PRO hub listener — only constructed when the operator has
+    # supplied credentials AND hikaxpro is installed. Otherwise the
+    # dispatcher still runs and the Simulate button still works.
+    axpro_listener = _build_axpro_listener(sensor_dispatcher)
+
     deps = WorkerDeps(
         alert_engine=alert_engine,
         frame_bus=frame_bus,
@@ -117,6 +142,10 @@ def _build_deps():
         plate_engine=ml_state.plate_engine,
         behavior_engine=ml_state.behavior_engine,
         zone_store=ml_state.zone_store,
+        sensor_map=sensor_map,
+        sensor_dispatcher=sensor_dispatcher,
+        sensor_event_tap=sensor_event_tap,
+        axpro_listener=axpro_listener,
     )
     inbound_api = InboundApiServer(
         dahua_manager=dahua_manager,
@@ -134,7 +163,52 @@ def _build_deps():
     ]
     if ml_state.embedding_store is not None:
         services.append(ml_state.embedding_store)
+    services.append(sensor_dispatcher)
+    if axpro_listener is not None:
+        services.append(axpro_listener)
     return deps, services
+
+
+def _build_axpro_listener(dispatcher):
+    """Best-effort AX PRO hub listener construction.
+
+    Returns `None` when:
+      * `ITIPS_AXPRO_HOST` is unset / empty (operator hasn't wired a
+        hub — that's fine, the Simulate button still works), OR
+      * `hikaxpro` isn't installed in this build of the image, OR
+      * any other unexpected failure during construction.
+
+    The orchestrator's start-all loop will call `start()` on the
+    listener if one is returned; the listener itself raises
+    `AxProUnavailable` if the lib isn't importable, which we catch
+    here too so a missing dep can't kill the boot sequence.
+    """
+    import os
+    logger = logging.getLogger("itips.app.axpro")
+    host = (os.environ.get("ITIPS_AXPRO_HOST") or "").strip()
+    if not host:
+        logger.info("AX PRO listener disabled (ITIPS_AXPRO_HOST not set) — "
+                    "use the dashboard's Simulate button to drive the sensor pipeline")
+        return None
+    username = (os.environ.get("ITIPS_AXPRO_USERNAME") or "").strip()
+    password = os.environ.get("ITIPS_AXPRO_PASSWORD") or ""
+    if not username or not password:
+        logger.warning(
+            "AX PRO listener disabled — ITIPS_AXPRO_HOST is set but "
+            "ITIPS_AXPRO_USERNAME / ITIPS_AXPRO_PASSWORD are not"
+        )
+        return None
+    try:
+        from itips.sensors.axpro_listener import AxProListener
+    except Exception:
+        logger.exception("AX PRO listener import failed")
+        return None
+    poll_ms = int(os.environ.get("ITIPS_AXPRO_POLL_MS", "500") or "500")
+    return AxProListener(
+        host=host, username=username, password=password,
+        dispatcher=dispatcher,
+        poll_interval_s=max(0.1, poll_ms / 1000.0),
+    )
 
 
 class _MlLayerState:

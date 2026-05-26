@@ -24,6 +24,38 @@
     }
   }
 
+  // Topbar AX PRO hub pill — visible from every tab. Lives in the
+  // shell rather than the Sensors tab so an operator who's looking at
+  // Live or Alerts still sees "hub disconnected" the moment it happens.
+  async function pollHubPill() {
+    const pill = document.getElementById("topbar-hub-pill");
+    if (!pill) return;
+    try {
+      const res = await fetch("/api/sensors/listener/status");
+      const body = await res.json();
+      if (!body.wired) {
+        pill.className = "pill pill-idle";
+        pill.textContent = "hub: not wired";
+        pill.title = body.reason || "ITIPS_AXPRO_HOST is not set";
+        return;
+      }
+      const hostLine = `host=${body.host}` +
+        (body.last_error ? ` · last_error=${body.last_error}` : "");
+      if (body.connected) {
+        pill.className = body.armed ? "pill pill-ok" : "pill pill-warn";
+        pill.textContent = body.armed ? "hub: armed" : "hub: disarmed";
+      } else {
+        pill.className = "pill pill-err";
+        pill.textContent = "hub: disconnected";
+      }
+      pill.title = hostLine;
+    } catch (e) {
+      pill.className = "pill pill-err";
+      pill.textContent = "hub: ?";
+      pill.title = String(e);
+    }
+  }
+
   async function loadCameras() {
     const res = await fetch("/api/cameras");
     const body = await res.json();
@@ -58,6 +90,8 @@
     await loadCameras();
     window.ITIPS.state = state;
     window.ITIPS.reloadCameras = loadCameras;
+    pollHubPill();
+    setInterval(pollHubPill, 5000);
 
     if (window.ITIPS.live) window.ITIPS.live.init(state);
     if (window.ITIPS.workers) window.ITIPS.workers.init(state);
@@ -66,12 +100,13 @@
     if (window.ITIPS.incidents) window.ITIPS.incidents.init(state);
     if (window.ITIPS.health) window.ITIPS.health.init(state);
     if (window.ITIPS.zones) window.ITIPS.zones.init(state);
+    if (window.ITIPS.sensors) window.ITIPS.sensors.init(state);
     if (window.ITIPS.mllab) window.ITIPS.mllab.init(state);
     if (window.ITIPS.testing) window.ITIPS.testing.init(state);
     activateTab("live");
   }
 
-  const modules = ["live.js", "workers.js", "plates.js", "alerts.js", "incidents.js", "health.js", "zones.js", "ml-lab.js", "testing.js"];
+  const modules = ["live.js", "workers.js", "plates.js", "alerts.js", "incidents.js", "health.js", "zones.js", "sensors.js", "ml-lab.js", "testing.js"];
   let loaded = 0;
   modules.forEach((src) => {
     const s = document.createElement("script");

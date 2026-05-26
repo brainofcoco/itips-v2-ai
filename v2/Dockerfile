@@ -84,8 +84,10 @@ RUN apt-get update \
     && pip install --no-cache-dir \
         "insightface==0.7.3" \
         "onnxruntime>=1.16,<2" \
-        "easyocr>=1.7,<2" \
+        "paddleocr>=2.10,<3" \
+        "paddlepaddle>=2.6,<4" \
         "ultralytics>=8.2,<9" \
+        "hikaxpro>=2.0" \
     && apt-get purge -y build-essential \
     && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/*
@@ -102,7 +104,7 @@ COPY openapi/ ./openapi/
 # volume mount keeps every cache alive across container restarts —
 # critical on the Jetson where the PRD mandates offline-by-design.
 ENV INSIGHTFACE_HOME=/opt/itips/models/insightface \
-    EASYOCR_MODULE_PATH=/opt/itips/models/easyocr \
+    PADDLEOCR_HOME=/opt/itips/models/paddleocr \
     YOLO_CONFIG_DIR=/opt/itips/models/yolo \
     TORCH_HOME=/opt/itips/models/torch \
     HF_HOME=/opt/itips/models/huggingface
@@ -114,11 +116,17 @@ RUN useradd --uid 1000 --create-home --shell /bin/bash itips \
     && mkdir -p /opt/itips/var \
                 /opt/itips/evidence_store \
                 /opt/itips/models/insightface \
-                /opt/itips/models/easyocr \
+                /opt/itips/models/paddleocr \
                 /opt/itips/models/yolo \
                 /opt/itips/models/torch \
                 /opt/itips/models/huggingface \
-    && chown -R itips:itips /opt/itips /app
+    # PaddleOCR hardcodes `~/.paddleocr/` and ignores PADDLEOCR_HOME,
+    # so first-run downloads of the detector/recognizer/cls models
+    # would land outside the persistent volume and re-download on
+    # every restart. Symlink the home path into the mounted model
+    # tree so the cache survives container recreation.
+    && ln -s /opt/itips/models/paddleocr /home/itips/.paddleocr \
+    && chown -R itips:itips /opt/itips /app /home/itips/.paddleocr
 USER itips
 
 EXPOSE 5050 8443

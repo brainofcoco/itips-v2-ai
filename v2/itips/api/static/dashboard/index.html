@@ -12,6 +12,11 @@
     <span class="dot"></span>
     <h1>ITIPS V2</h1>
     <span class="subtitle" id="site-label">…</span>
+    <span class="subtitle"> · </span>
+    <span class="pill pill-idle" id="topbar-hub-pill" title="AX PRO hub listener status">
+      hub: …
+    </span>
+    <a class="subtitle topbar-docs-link" href="/docs" target="_blank" rel="noopener">API ↗</a>
   </div>
   <nav class="tabs">
     <button data-tab="live" class="active">Live</button>
@@ -21,6 +26,7 @@
     <button data-tab="incidents">Incidents</button>
     <button data-tab="health">Health</button>
     <button data-tab="zones">Zones</button>
+    <button data-tab="sensors">Sensors</button>
     <button data-tab="mllab">ML Lab</button>
     <button data-tab="testing">Test Console</button>
     <a class="tab-link" href="/streams" target="_blank" rel="noopener">Streams ↗</a>
@@ -156,6 +162,59 @@
     </div>
   </section>
 
+  <!-- SENSORS TAB — AX PRO zone → PTZ preset binding + manual test triggers -->
+  <section data-tabpanel="sensors" class="panel">
+    <div class="toolbar">
+      <span class="muted">Hub:</span>
+      <span id="sensor-hub-pill" class="pill pill-idle">checking…</span>
+      <span class="muted" id="sensor-hub-host"></span>
+      <span class="spacer"></span>
+    </div>
+    <div class="toolbar">
+      <span class="muted">Add a sensor → PTZ binding</span>
+      <input id="sensor-zone-id" type="number" min="1" placeholder="zone_id (from AX PRO hub)" />
+      <select id="sensor-camera"></select>
+      <select id="sensor-preset">
+        <option value="">— pick a preset —</option>
+      </select>
+      <select id="sensor-type">
+        <option value="doorContact">doorContact</option>
+        <option value="PIR">PIR</option>
+        <option value="vibration">vibration</option>
+        <option value="pircam">pircam</option>
+        <option value="smoke">smoke</option>
+      </select>
+      <input id="sensor-description" placeholder="description (optional)" />
+      <button id="sensor-add" class="primary">Save binding</button>
+      <span class="spacer"></span>
+      <button id="sensor-refresh">Refresh</button>
+    </div>
+    <p class="muted">
+      When the AX PRO hub fires an alarm on a mapped zone, the dispatcher
+      pans the bound camera to its preset, snapshots the scene, and runs
+      the Jetson FaceEngine against the snapshot. Matched workers fire
+      a personnel_seen alert; unmatched faces fire face_intruder;
+      no face = sensor_unverified. Until the hub listener lands (Phase 2),
+      use the <em>Simulate trigger</em> button to exercise the same pipeline
+      end-to-end.
+    </p>
+
+    <div class="workers-layout">
+      <div>
+        <h3>Sensor bindings</h3>
+        <ul id="sensor-mappings" class="alerts"></ul>
+      </div>
+      <div>
+        <h3>Recent sensor events</h3>
+        <p class="muted">
+          Outcome column shows the dispatcher's verdict: authorised,
+          intruder, unverified, cooldown, unmapped, pan_failed, …
+        </p>
+        <ul id="sensor-events" class="alerts"></ul>
+      </div>
+    </div>
+  </section>
+
   <!-- ML LAB TAB — direct invocation of the Jetson fallback engines -->
   <section data-tabpanel="mllab" class="panel">
     <div class="toolbar">
@@ -208,7 +267,7 @@
       <!-- Plate -->
       <div class="test-col">
         <h3>Plate reader</h3>
-        <p class="muted">EasyOCR detect+read, filtered by a Nigerian-friendly plate pattern.</p>
+        <p class="muted">PaddleOCR detect + recognize, filtered by a Nigerian-friendly plate pattern.</p>
         <div class="form-stack">
           <input id="ml-plate-image" type="file" accept="image/jpeg,image/png" />
           <input id="ml-plate-camera" type="number" min="0" value="0" placeholder="camera_id (for dispatch)" />

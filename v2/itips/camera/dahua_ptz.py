@@ -81,6 +81,33 @@ class DahuaPTZ:
             "arg3": 0,
         })
 
+    def goto_preset_by_name(self, name: str) -> bool:
+        """Move to a preset addressed by its operator-visible name.
+
+        Sensor-to-PTZ mappings store preset NAMES rather than indices —
+        names survive a camera re-init that renumbers presets, and they
+        let the operator pick "Gate View" from a dropdown instead of
+        looking up which slot the camera assigned. Resolves the name
+        to an index via `list_presets()` (case-insensitive, trimmed)
+        and then fires the same GotoPreset PTZ command the index-based
+        path uses. Returns False if the camera has no preset with that
+        name — caller decides whether to fall back to home, log, or
+        retry.
+        """
+        if not name:
+            return False
+        target = name.strip().lower()
+        for preset in self.list_presets():
+            if (preset.name or "").strip().lower() == target:
+                self.go_to_preset(preset.index)
+                return True
+        logger.info(
+            "PTZ cam %d: no preset matching name=%r — known names=%s",
+            self.camera_id, name,
+            ", ".join(p.name for p in self.list_presets()) or "(none)",
+        )
+        return False
+
     def list_presets(self) -> list[PresetInfo]:
         from re import compile as re_compile
 

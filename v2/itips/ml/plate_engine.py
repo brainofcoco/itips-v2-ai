@@ -1,12 +1,21 @@
 """Event-driven license-plate OCR for cameras without native ANPR.
 
+Backend: **PaddleOCR** (PP-OCR pipeline — detector + angle classifier
++ recognizer). The earlier EasyOCR backend was swapped out because on
+Nigerian low-light/IR plate crops it tended to misread chars
+(`O↔0`, `1↔I↔L`, `5↔S`) and bin the result below the confidence
+floor, leaving operators with "no plate found" on plates that are
+clearly visible. PaddleOCR's PP-OCRv4 recognizer is noticeably more
+robust on the same crops.
+
 Mirrors the architecture of `face_engine.py`:
 
-  * No module-load side effects — `easyocr` and `torch` are imported
-    only inside `_ensure_model()`. The v2 baseline runs fine without
-    them.
-  * Singleton reader per process. ~150 MB GPU on CUDA; CPU fallback
-    works but is ~10× slower per call.
+  * No module-load side effects — `paddleocr` and `paddlepaddle` are
+    imported only inside `_ensure_model()`. The v2 baseline runs fine
+    without them.
+  * Singleton reader per process. ~250 MB resident on CPU; uses CUDA
+    when PaddlePaddle is built with GPU support (on Jetson, swap in
+    the JetPack-matched paddlepaddle wheel).
   * Event-driven only. Frames arrive via the existing Dahua event
     multipart path; we never open a video stream.
 
@@ -38,7 +47,7 @@ logger = logging.getLogger(__name__)
 
 
 class PlateEngineUnavailable(RuntimeError):
-    """Raised when `easyocr` / `torch` aren't installed.
+    """Raised when `paddleocr` / `paddlepaddle` aren't installed.
 
     The event worker catches this and degrades to the existing
     motion-only / vehicle-gate alert (still drives the lifecycle).
@@ -65,20 +74,25 @@ class PlateReadResult:
 
 
 class PlateEngine:
-    """EasyOCR-backed plate OCR with a Nigerian-plate-aware filter."""
+    """PaddleOCR-backed plate OCR with a Nigerian-plate-aware filter."""
 
     def __init__(
         self,
         *,
-        min_confidence: float = 0.5,
-        gpu: bool = True,
-        languages: Optional[list[str]] = None,
+        min_confidence: float = 0.4,
+        use_gpu: bool = True,
+        lang: str = "en",
     ) -> None:
+        # Threshold dropped from 0.5 → 0.4 because PaddleOCR reports
+        # honest-low confidences on motion-blurred / glare-affected
+        # plate crops where the read is still correct after the
+        # plate-pattern filter validates it.
         self._min_confidence = float(min_confidence)
-        self._gpu = bool(gpu)
-        # English alphabet covers Latin plates in NG/EU/US. Adding more
-        # languages bloats the model with no plate-OCR benefit.
-        self._languages = languages or ["en"]
+        self._use_gpu = bool(use_gpu)
+        # Latin recognizer covers NG/EU/US plates. PaddleOCR ships a
+        # separate model per language family, so picking a wider set
+        # only bloats the install with no plate-OCR benefit.
+        self._lang = lang
         self._reader = None
         self._init_lock = threading.Lock()
         self._warmup_thread: Optional[threading.Thread] = None
@@ -115,17 +129,26 @@ class PlateEngine:
             if self._reader is not None:
                 return self._reader
             try:
-                import easyocr  # type: ignore
+                from paddleocr import PaddleOCR  # type: ignore
             except ImportError as exc:
                 raise PlateEngineUnavailable(
-                    "easyocr is not installed. `pip install itips-ai[ml]` "
+                    "paddleocr is not installed. `pip install itips-ai[ml]` "
                     "or disable the plate fallback in settings."
                 ) from exc
             logger.info(
-                "PlateEngine: loading EasyOCR reader (lang=%s gpu=%s)",
-                self._languages, self._gpu,
+                "PlateEngine: loading PaddleOCR (lang=%s use_gpu=%s)",
+                self._lang, self._use_gpu,
             )
-            reader = easyocr.Reader(self._languages, gpu=self._gpu)
+            # `use_angle_cls=True` runs the orientation classifier so
+            # rotated plate crops (vehicle approaching at an angle)
+            # still read correctly. `show_log=False` silences Paddle's
+            # noisy boot-time output.
+            reader = PaddleOCR(
+                use_angle_cls=True,
+                lang=self._lang,
+                use_gpu=self._use_gpu,
+                show_log=False,
+            )
             self._reader = reader
             self._ready.set()
             logger.info("PlateEngine ready")
@@ -147,14 +170,17 @@ class PlateEngine:
         """
         reader = self._ensure_model()
         crop, (off_x, off_y) = _crop_for_vehicle(frame, vehicle_bbox)
-        # `detail=1` returns [bbox_points, text, confidence] tuples.
-        # `paragraph=False` keeps each text region separate so we can
-        # rank candidates individually instead of EasyOCR mashing them.
-        raw = reader.readtext(crop, detail=1, paragraph=False)
+        # PaddleOCR's `ocr()` returns a list-of-lists: one outer slot
+        # per input image, each containing the per-detection rows.
+        # For a single image we always read `raw[0]`, but Paddle uses
+        # `[None]` (a list with one None) when the detector finds
+        # nothing — guard for both.
+        raw = reader.ocr(crop, cls=True)
+        detections = (raw[0] if raw else None) or []
 
         best: Optional[PlateReadResult] = None
-        for item in raw:
-            text, conf, points = _unpack_readtext_row(item)
+        for det in detections:
+            text, conf, points = _unpack_paddle_row(det)
             if text is None:
                 continue
             cleaned = _clean_plate_text(text)
@@ -215,13 +241,27 @@ def _crop_for_vehicle(
     return frame[yy1:yy2, xx1:xx2], (xx1, yy1)
 
 
-def _unpack_readtext_row(row):
-    """EasyOCR's `detail=1` shape is `[points, text, conf]`."""
+def _unpack_paddle_row(row):
+    """PaddleOCR returns `[points, (text, confidence)]` per detection.
+
+    `points` is a list of four (x, y) corners. The text/confidence
+    tuple is sometimes wrapped in extras depending on Paddle version,
+    so we defensively peel it. Returns `(text, conf, points)` or
+    `(None, 0.0, None)` on any malformed row — bad rows must not
+    propagate into the candidate ranking.
+    """
+    if not row or len(row) < 2:
+        return None, 0.0, None
+    points = row[0]
+    text_conf = row[1]
+    if isinstance(text_conf, (list, tuple)) and len(text_conf) >= 2:
+        text, conf = text_conf[0], text_conf[1]
+    else:
+        return None, 0.0, None
     try:
-        points, text, conf = row
+        return str(text), float(conf), points
     except (TypeError, ValueError):
         return None, 0.0, None
-    return str(text), float(conf), points
 
 
 def _points_to_bbox(points, off_x: int, off_y: int) -> tuple[float, float, float, float]:

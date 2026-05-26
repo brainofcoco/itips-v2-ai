@@ -47,6 +47,10 @@ def register_dashboard(
     plate_engine=None,
     behavior_engine=None,
     zone_store=None,
+    sensor_map=None,
+    sensor_dispatcher=None,
+    sensor_event_tap=None,
+    axpro_listener=None,
 ) -> None:
     """Wire all dashboard routes onto the given Flask app.
 
@@ -773,6 +777,123 @@ def register_dashboard(
             return jsonify({"ok": False, "error": "zone not found"}), 404
         return jsonify({"ok": True})
 
+    # ─── Sensors — AX PRO zone → PTZ preset mapping + test triggers ─
+
+    @app.get("/api/sensors/map")
+    def list_sensor_mappings():  # noqa: ANN202
+        if sensor_map is None:
+            return jsonify({"available": False, "mappings": []})
+        return jsonify({
+            "available": True,
+            "mappings": [_sensor_mapping_to_dict(m) for m in sensor_map.all()],
+        })
+
+    @app.post("/api/sensors/map")
+    def upsert_sensor_mapping():  # noqa: ANN202
+        if sensor_map is None:
+            return jsonify({"ok": False, "error": "sensor map not wired"}), 503
+        body = request.get_json(silent=True) or {}
+        try:
+            from itips.sensors.sensor_map import SensorMapping
+            mapping = SensorMapping(
+                zone_id=int(body["zone_id"]),
+                camera_id=int(body["camera_id"]),
+                preset_name=str(body["preset_name"]),
+                sensor_type=str(body.get("sensor_type", "")),
+                description=str(body.get("description", "")),
+                metadata=dict(body.get("metadata") or {}),
+            )
+        except (KeyError, ValueError, TypeError) as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 400
+        sensor_map.upsert(mapping)
+        return jsonify({"ok": True, "mapping": _sensor_mapping_to_dict(mapping)})
+
+    @app.delete("/api/sensors/map/<int:zone_id>")
+    def delete_sensor_mapping(zone_id: int):  # noqa: ANN202
+        if sensor_map is None:
+            return jsonify({"ok": False, "error": "sensor map not wired"}), 503
+        if not sensor_map.remove(zone_id):
+            return jsonify({"ok": False, "error": "zone not found"}), 404
+        return jsonify({"ok": True})
+
+    @app.post("/api/sensors/simulate/<int:zone_id>")
+    def simulate_sensor(zone_id: int):  # noqa: ANN202
+        """Hand-crafted sensor event for testing without an AX PRO hub.
+
+        The dispatcher can't tell a simulated event from a real one —
+        same pipeline runs: pan PTZ, snapshot, face-validate, alert.
+        """
+        if sensor_dispatcher is None:
+            return jsonify({"ok": False, "error": "sensor dispatcher not wired"}), 503
+        from itips.sensors.sensor_event import SensorEvent
+        body = request.get_json(silent=True) or {}
+        event = SensorEvent(
+            zone_id=zone_id,
+            event_type=str(body.get("event_type", "doorContact")),
+            event_state=str(body.get("event_state", "alarm")),
+            zone_name=str(body.get("zone_name", f"sim-zone-{zone_id}")),
+            source="simulate",
+        )
+        accepted = sensor_dispatcher.dispatch(event)
+        if not accepted:
+            return jsonify({"ok": False, "error": "queue full"}), 503
+        return jsonify({"ok": True, "queued": True, "event": event.to_dict()})
+
+    @app.get("/api/sensors/events/recent")
+    def recent_sensor_events():  # noqa: ANN202
+        if sensor_event_tap is None:
+            return jsonify({"available": False, "events": []})
+        limit = request.args.get("limit", type=int, default=50)
+        return jsonify({
+            "available": True,
+            "events": sensor_event_tap.recent(limit=limit),
+        })
+
+    @app.delete("/api/sensors/events/recent")
+    def clear_sensor_events():  # noqa: ANN202
+        if sensor_event_tap is None:
+            return jsonify({"ok": False, "error": "tap not wired"}), 503
+        sensor_event_tap.clear()
+        return jsonify({"ok": True})
+
+    @app.get("/api/sensors/listener/status")
+    def axpro_listener_status():  # noqa: ANN202
+        """AX PRO hub listener health — drives the pill in the Sensors tab."""
+        if axpro_listener is None:
+            return jsonify({
+                "wired": False,
+                "reason": "ITIPS_AXPRO_HOST not set — use Simulate to test",
+            })
+        return jsonify({
+            "wired": True,
+            "host": axpro_listener.host,
+            "connected": bool(axpro_listener.is_connected),
+            "armed": bool(axpro_listener.is_armed),
+            "last_error": axpro_listener.last_error,
+            "thread_alive": axpro_listener.is_alive(),
+        })
+
+    @app.get("/api/cameras/<int:camera_id>/presets")
+    def list_camera_presets(camera_id: int):  # noqa: ANN202
+        """List the camera's onboard PTZ presets — operator picks one
+        when binding a sensor to this camera."""
+        client = dahua_manager.get(camera_id)
+        if client is None:
+            return jsonify({"ok": False, "error": "unknown camera"}), 404
+        try:
+            presets = client.ptz.list_presets()
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"ok": False, "error": str(exc)}), 502
+        return jsonify({
+            "ok": True,
+            "camera_id": camera_id,
+            "presets": [
+                {"index": p.index, "name": p.name,
+                 "pan": p.pan, "tilt": p.tilt, "zoom": p.zoom}
+                for p in presets
+            ],
+        })
+
     # ─── test console ──────────────────────────────────────────────
     # Routes prefixed `/api/test/*` are for the in-dashboard Test Console.
     # They give an operator a live view into the raw Dahua event stream
@@ -1057,6 +1178,17 @@ def _behavior_alert_to_dict(a) -> dict:
         "class_name": a.class_name,
         "bbox": list(a.bbox),
         "details": dict(a.details),
+    }
+
+
+def _sensor_mapping_to_dict(m) -> dict:
+    return {
+        "zone_id": m.zone_id,
+        "camera_id": m.camera_id,
+        "preset_name": m.preset_name,
+        "sensor_type": m.sensor_type,
+        "description": m.description,
+        "metadata": dict(m.metadata or {}),
     }
 
 

@@ -38,8 +38,19 @@ dev = [
 ml = [
     "insightface==0.7.3",
     "onnxruntime>=1.16,<2",
-    "easyocr>=1.7,<2",
+    # PaddleOCR + PaddlePaddle for the plate-OCR fallback. Pinned to
+    # the 2.x line for a stable `ocr()` API; bump to 3.x only when
+    # we've validated the new `predict()` shape downstream.
+    # Jetson swap: replace `paddlepaddle` with the NVIDIA-published
+    # JetPack-matched wheel; `paddleocr` itself is pure Python.
+    "paddleocr>=2.10,<3",
+    "paddlepaddle>=2.6,<4",
     "ultralytics>=8.2,<9",
+]
+# AX PRO hub listener — lifts state-transition dedup'd events off the
+# Hikvision sensor hub into the SensorDispatcher pipeline.
+sensors = [
+    "hikaxpro>=2.0",
 ]
 
 [project.scripts]
