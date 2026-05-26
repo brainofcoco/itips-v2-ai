@@ -16,6 +16,8 @@ dependencies = [
     "numpy<2",
     "opencv-python==4.10.0.84",
     "pillow==10.4.0",
+    # Incident summary PDF (PRD §4.3 REQ-EV-01) — small pure-Python dep.
+    "reportlab>=4.0,<5",
 ]
 
 [project.optional-dependencies]
@@ -46,6 +48,8 @@ ml = [
     "paddleocr>=2.10,<3",
     "paddlepaddle>=2.6,<4",
     "ultralytics>=8.2,<9",
+    # OpenAI vision validator — lazy-imported, optional kill-switch.
+    "openai>=1.40,<2",
 ]
 # AX PRO hub listener — lifts state-transition dedup'd events off the
 # Hikvision sensor hub into the SensorDispatcher pipeline.

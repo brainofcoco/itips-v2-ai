@@ -136,6 +136,113 @@
     }
   }
 
+  async function populateOpenAIScenarios(scenarios) {
+    const sel = document.getElementById("ml-openai-scenario");
+    if (!sel) return;
+    const existing = sel.value;
+    sel.innerHTML = "";
+    (scenarios || []).forEach((name) => {
+      sel.appendChild(el("option", { value: name }, name));
+    });
+    if (existing && (scenarios || []).includes(existing)) sel.value = existing;
+  }
+
+  async function runOpenAIScenario() {
+    const scenario = document.getElementById("ml-openai-scenario").value;
+    const file = pickFile("ml-openai-image");
+    const resultEl = document.getElementById("ml-openai-result");
+    if (!scenario) { resultEl.textContent = "Pick a scenario."; return; }
+    if (!file) { resultEl.textContent = "Pick an image first."; return; }
+    const form = fileToForm(file);
+    const cam = document.getElementById("ml-openai-camera").value;
+    const zone = document.getElementById("ml-openai-zone").value;
+    const conf = document.getElementById("ml-openai-confidence").value;
+    if (cam) form.append("camera_id", cam);
+    if (zone) form.append("zone_name", zone);
+    if (conf) form.append("confidence", conf);
+    resultEl.textContent = "running… (vision calls take 2–6s)";
+    resultEl.style.color = "var(--muted)";
+    try {
+      const res = await fetch(`/api/ml/openai/validate/${scenario}`, {
+        method: "POST", body: form,
+      });
+      const body = await res.json();
+      resultEl.textContent = JSON.stringify(body, null, 2);
+      resultEl.style.color = res.ok ? "var(--text)" : "var(--err)";
+      loadOpenAIStatus();
+    } catch (e) {
+      resultEl.textContent = "fetch failed: " + e;
+      resultEl.style.color = "var(--err)";
+    }
+  }
+
+  async function loadOpenAIStatus() {
+    const pill = document.getElementById("ml-openai-pill");
+    const modelEl = document.getElementById("ml-openai-model");
+    const tokensEl = document.getElementById("ml-openai-tokens");
+    const ul = document.getElementById("ml-openai-recent");
+    if (!pill) return;
+    try {
+      const res = await fetch("/api/ml/openai/status");
+      const body = await res.json();
+      if (!body.wired) {
+        pill.className = "pill pill-idle";
+        pill.textContent = "openai: not wired";
+        modelEl.textContent = body.reason || "";
+        tokensEl.textContent = "";
+        ul.innerHTML = "";
+        ul.appendChild(el("li", { class: "muted" },
+          "Set ITIPS_OPENAI_ENABLED=true and ITIPS_OPENAI_API_KEY to enable."));
+        return;
+      }
+      if (body.enabled) {
+        pill.className = "pill pill-ok";
+        pill.textContent = "openai: ready";
+      } else {
+        pill.className = "pill pill-warn";
+        pill.textContent = "openai: disabled";
+      }
+      modelEl.textContent = `model=${body.model || "?"}`;
+      const used = body.tokens_used_hour ?? 0;
+      const cap = body.tokens_cap_hour ?? 0;
+      tokensEl.textContent = cap
+        ? `${used.toLocaleString()} / ${cap.toLocaleString()} tokens (1h)`
+        : "";
+      populateOpenAIScenarios(body.scenarios);
+      ul.innerHTML = "";
+      const recent = body.recent || [];
+      if (!recent.length) {
+        ul.appendChild(el("li", { class: "muted" }, "No verdicts yet."));
+      } else {
+        recent.forEach((r) => ul.appendChild(renderVerdict(r)));
+      }
+    } catch (e) {
+      pill.className = "pill pill-err";
+      pill.textContent = "openai: fetch failed";
+    }
+  }
+
+  function renderVerdict(v) {
+    const verdictClass =
+      v.verdict === "real" ? "pill pill-err" :
+      v.verdict === "false_positive" ? "pill pill-ok" :
+      "pill pill-warn";
+    const ts = v.ts ? new Date(v.ts * 1000).toLocaleTimeString() : "";
+    return el("li", {},
+      el("div", { class: "row" },
+        el("span", { class: "kind" }, v.scenario),
+        el("span", { class: verdictClass },
+          `${v.verdict}/${v.category}`),
+        el("span", { class: "muted" },
+          ` conf=${(v.confidence ?? 0).toFixed(2)}`),
+        el("span", { class: "muted" },
+          v.cached ? " · cached" : ` · ${v.tokens_used ?? 0}t`),
+        el("span", { class: "ts" }, ts),
+      ),
+      el("pre", {}, v.summary || ""),
+    );
+  }
+
   async function loadEnrolled() {
     const ul = document.getElementById("ml-face-enrolled");
     ul.innerHTML = "";
@@ -265,10 +372,13 @@
       refreshStatus();
       loadEnrolled();
       loadOverrides();
+      loadOpenAIStatus();
     });
     document.getElementById("ml-face-run").addEventListener("click", runFace);
     document.getElementById("ml-plate-run").addEventListener("click", runPlate);
     document.getElementById("ml-behavior-run").addEventListener("click", runBehavior);
+    const openaiBtn = document.getElementById("ml-openai-run");
+    if (openaiBtn) openaiBtn.addEventListener("click", runOpenAIScenario);
   }
 
   function onShow() {
@@ -276,6 +386,7 @@
     loadCamerasIntoBehaviorSelect();
     loadEnrolled();
     loadOverrides();
+    loadOpenAIStatus();
   }
 
   window.ITIPS = window.ITIPS || {};

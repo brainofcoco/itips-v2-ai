@@ -85,8 +85,9 @@ class EvidenceConfig:
     store_path: Path = field(default_factory=lambda: Path(_env(
         "ITIPS_EVIDENCE_STORE_PATH", "/opt/itips/evidence_store",
     )))
-    pre_event_seconds: int = field(default_factory=lambda: _env_int("ITIPS_PRE_EVENT_BUFFER_SECONDS", 60))
-    post_event_seconds: int = field(default_factory=lambda: _env_int("ITIPS_POST_EVENT_BUFFER_SECONDS", 120))
+    # PRD §2.3: 15-min pre, 30-min post. Operator can shrink for dev.
+    pre_event_seconds: int = field(default_factory=lambda: _env_int("ITIPS_PRE_EVENT_BUFFER_SECONDS", 900))
+    post_event_seconds: int = field(default_factory=lambda: _env_int("ITIPS_POST_EVENT_BUFFER_SECONDS", 1800))
 
     @property
     def hmac_key_hex(self) -> str:

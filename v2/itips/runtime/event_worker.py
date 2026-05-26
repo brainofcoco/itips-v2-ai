@@ -54,6 +54,7 @@ class WorkerDeps:
         face_engine: Optional[Any] = None,
         plate_engine: Optional[Any] = None,
         behavior_engine: Optional[Any] = None,
+        openai_validator: Optional[Any] = None,
     ) -> None:
         self.alert_engine = alert_engine
         self.frame_bus = frame_bus
@@ -65,6 +66,8 @@ class WorkerDeps:
         self.face_engine = face_engine
         self.plate_engine = plate_engine
         self.behavior_engine = behavior_engine
+        # Optional LLM second-opinion layer; None disables it.
+        self.openai_validator = openai_validator
 
 
 class DahuaEventDispatcher(threading.Thread):
@@ -298,6 +301,33 @@ class DahuaEventDispatcher(threading.Thread):
             self.camera_id, Capability.FACE_RECOGNITION,
         )
 
+    def _maybe_validate(
+        self,
+        scenario: str,
+        frame: Optional["np.ndarray"],
+        context: dict,
+        *,
+        local_confidence: float,
+        cooldown_key: Any = None,
+    ):
+        """Optional second-opinion through OpenAIValidator. Returns the
+        ValidationResult or None — None means caller proceeds normally."""
+        validator = self.deps.openai_validator
+        if validator is None or frame is None:
+            return None
+        try:
+            if not validator.should_validate(
+                scenario, local_confidence=local_confidence,
+                cooldown_key=cooldown_key,
+            ):
+                return None
+            return validator.validate(
+                scenario, frame, context, cooldown_key=cooldown_key,
+            )
+        except Exception:
+            logger.exception("openai validator crashed for %s", scenario)
+            return None
+
     def _dispatch_face_fallback(
         self,
         frame: "np.ndarray",
@@ -329,21 +359,38 @@ class DahuaEventDispatcher(threading.Thread):
                 group_id="jetson-fallback",
                 name=result.full_name or "",
                 similarity=int(round(result.similarity * 100)),
+                jpeg=_encode_face_jpeg(frame, bbox),
             )
             logger.info(
                 "cam %d face fallback MATCH person_id=%s sim=%.2f",
                 self.camera_id, result.person_id, result.similarity,
             )
-        else:
-            self.deps.alert_engine.handle_face_intruder(
-                camera_id=self.camera_id,
-                face_bbox=bbox,
-                name="INTRUDER",
-            )
-            logger.info(
-                "cam %d face fallback NO-MATCH best_sim=%.2f",
-                self.camera_id, result.similarity,
-            )
+            return True
+
+        # No match → INTRUDER. Optional LLM check decorates / suppresses.
+        validation = self._maybe_validate(
+            "face_intruder", frame,
+            context={"camera_id": self.camera_id,
+                     "confidence": result.similarity},
+            local_confidence=result.similarity,
+            cooldown_key=("face_intruder", self.camera_id),
+        )
+        if validation and validation.should_suppress:
+            logger.info("cam %d face_intruder suppressed by AI: %s",
+                        self.camera_id, validation.summary)
+            return True
+        intruder_details = _ai_details(validation)
+        face_jpeg = _encode_face_jpeg(frame, bbox)
+        self.deps.alert_engine.handle_face_intruder(
+            camera_id=self.camera_id,
+            face_bbox=bbox,
+            name="INTRUDER",
+            details=intruder_details,
+            jpeg=face_jpeg,
+        )
+        logger.info("cam %d face fallback NO-MATCH best_sim=%.2f%s",
+                    self.camera_id, result.similarity,
+                    f" ai={validation.category}/{validation.verdict}" if validation else "")
         return True
 
     def _handle_perimeter_breach(self, event: DahuaEvent, _frame: Optional["np.ndarray"]) -> None:
@@ -496,6 +543,8 @@ class DahuaEventDispatcher(threading.Thread):
             plate_color=None,
             vehicle_color=None,
             speed=None,
+            confidence=result.confidence,
+            jpeg=_encode_face_jpeg(frame, result.bbox, padding=0.1),
         )
         logger.info(
             "cam %d plate fallback READ plate=%s conf=%.2f",
@@ -543,6 +592,31 @@ class DahuaEventDispatcher(threading.Thread):
         if not alerts:
             return False
         for alert in alerts:
+            scenario = _BEHAVIOR_SCENARIO_MAP.get(alert.alert_type)
+            validation = self._maybe_validate(
+                scenario, frame,
+                context={"camera_id": self.camera_id,
+                         "zone_id": alert.zone_id,
+                         "zone_name": alert.zone_name,
+                         "class_name": alert.class_name,
+                         "confidence": float(alert.details.get("confidence", 0.7)),
+                         "direction": alert.details.get("direction", ""),
+                         "dwell_seconds": alert.details.get("dwell_seconds", 0.0),
+                         "events_inside": alert.details.get("events_inside", 0)},
+                local_confidence=0.5,    # mid-band so always asks within scenario range
+                cooldown_key=(alert.alert_type, alert.zone_id),
+            ) if scenario else None
+
+            if validation and validation.should_suppress:
+                logger.info("cam %d %s zone=%s suppressed by AI: %s",
+                            self.camera_id, alert.alert_type, alert.zone_id,
+                            validation.summary)
+                continue
+
+            if validation and validation.should_escalate:
+                self._dispatch_ai_escalation(validation, frame)
+                continue
+
             self.deps.alert_engine.handle_behaviour_alert_simple(
                 camera_id=self.camera_id,
                 alert_type=alert.alert_type,
@@ -552,14 +626,39 @@ class DahuaEventDispatcher(threading.Thread):
                     "track_id": alert.track_id,
                     "class_name": alert.class_name,
                     "bbox": list(alert.bbox),
+                    **_ai_details(validation),
                 },
             )
             logger.info(
-                "cam %d behavior fallback %s zone=%s track=%d class=%s",
+                "cam %d behavior fallback %s zone=%s track=%d class=%s%s",
                 self.camera_id, alert.alert_type, alert.zone_id,
                 alert.track_id, alert.class_name,
+                f" ai={validation.category}/{validation.verdict}" if validation else "",
             )
         return True
+
+    def _dispatch_ai_escalation(self, validation, frame) -> None:
+        """Auto-routes fire / smoke / weapon categories regardless of source."""
+        if validation.category == "fire":
+            self.deps.alert_engine.handle_fire(
+                camera_id=self.camera_id,
+                details={"source": "ai_validator",
+                         "ai_summary": validation.summary,
+                         "ai_confidence": validation.confidence},
+            )
+        elif validation.category == "smoke":
+            self.deps.alert_engine.handle_smoke(
+                camera_id=self.camera_id,
+                details={"source": "ai_validator",
+                         "ai_summary": validation.summary,
+                         "ai_confidence": validation.confidence},
+            )
+        elif validation.category == "weapon":
+            self.deps.alert_engine.handle_face_intruder(
+                camera_id=self.camera_id, face_bbox=(0, 0, 0, 0),
+                name="WEAPON_INTRUDER",
+                details=_ai_details(validation, extra={"severity": "high"}),
+            )
 
 
 # Backwards-compatible alias so the orchestrator import path holds.
@@ -571,3 +670,62 @@ def _face_bbox(face: dict[str, Any]) -> tuple[float, float, float, float]:
     if isinstance(bbox, list) and len(bbox) >= 4:
         return (float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3]))
     return (0.0, 0.0, 0.0, 0.0)
+
+
+# BehaviorAlert.alert_type → OpenAIValidator scenario key.
+_BEHAVIOR_SCENARIO_MAP: dict[str, str] = {
+    "intrusion":     "behavior_intrusion",
+    "line_crossing": "behavior_line_crossing",
+    "loitering":     "behavior_loitering",
+}
+
+
+def _encode_face_jpeg(frame, bbox, *, padding: float = 0.25) -> Optional[bytes]:
+    """Crop the bbox with padding, JPEG-encode for the evidence package."""
+    if frame is None:
+        return None
+    try:
+        import cv2
+        h, w = frame.shape[:2]
+        x1, y1, x2, y2 = bbox
+        bw, bh = max(1.0, x2 - x1), max(1.0, y2 - y1)
+        px, py = bw * padding, bh * padding
+        xx1 = max(0, int(x1 - px))
+        yy1 = max(0, int(y1 - py))
+        xx2 = min(w, int(x2 + px))
+        yy2 = min(h, int(y2 + py))
+        if xx2 <= xx1 or yy2 <= yy1:
+            return None
+        crop = frame[yy1:yy2, xx1:xx2]
+        ok, buf = cv2.imencode(".jpg", crop, [int(cv2.IMWRITE_JPEG_QUALITY), 88])
+        return buf.tobytes() if ok else None
+    except Exception:
+        logger.exception("face jpeg encode failed")
+        return None
+
+
+def _encode_full_frame_jpeg(frame) -> Optional[bytes]:
+    if frame is None:
+        return None
+    try:
+        import cv2
+        ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+        return buf.tobytes() if ok else None
+    except Exception:
+        return None
+
+
+def _ai_details(validation, *, extra: Optional[dict] = None) -> dict:
+    """Pack validator output into the alert's details dict; empty when None."""
+    if validation is None:
+        return dict(extra or {})
+    out = {
+        "ai_summary": validation.summary,
+        "ai_category": validation.category,
+        "ai_verdict": validation.verdict,
+        "ai_confidence": round(float(validation.confidence), 3),
+        "ai_model": validation.model,
+    }
+    if extra:
+        out.update(extra)
+    return out

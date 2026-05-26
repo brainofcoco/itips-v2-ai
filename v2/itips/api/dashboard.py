@@ -28,6 +28,7 @@ from itips.camera.dahua_face_db import DahuaFaceDBError
 from itips.camera.dahua_health import run_for_all as run_health_for_all
 from itips.camera.dahua_manager import DahuaManager
 from itips.camera.dahua_plate_db import BLACK_LIST, RED_LIST, PlateListUnsupported
+from itips.utils.clock import now_iso
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +52,7 @@ def register_dashboard(
     sensor_dispatcher=None,
     sensor_event_tap=None,
     axpro_listener=None,
+    openai_validator=None,
 ) -> None:
     """Wire all dashboard routes onto the given Flask app.
 
@@ -466,6 +468,73 @@ def register_dashboard(
 
     # ─── incidents ─────────────────────────────────────────────────
 
+    @app.post("/api/evidence/test/run")
+    def evidence_test_run():  # noqa: ANN202
+        """Build a complete test package end-to-end. Real packager,
+        real signature, real PDF — just synthetic JPEG+event payloads.
+        Returns the package dir + signature so the operator can jump
+        straight to inspecting it in the Incidents tab."""
+        import cv2
+        import numpy as np
+        packager = getattr(alert_engine, "_packager", None)
+        if packager is None:
+            return jsonify({"ok": False, "error": "no packager wired"}), 503
+        incident_id = packager.start_incident(
+            site_id=settings.tenant.site_id or "test-site",
+            operator_id=settings.tenant.operator_id or "test-operator",
+            device_id=settings.tenant.device_id or "test-device",
+        )
+        # Synthesise tiny but valid JPEGs so the package contains real
+        # face + plate evidence files.
+        fake = np.zeros((120, 160, 3), dtype="uint8")
+        cv2.putText(fake, "TEST", (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 1.0,
+                    (255, 255, 255), 2)
+        ok, buf = cv2.imencode(".jpg", fake)
+        jpeg = buf.tobytes() if ok else b""
+        packager.attach_face_capture(incident_id, jpeg=jpeg,
+                                       confidence=0.78, name="TEST_PERSON")
+        packager.attach_plate_capture(incident_id, jpeg=jpeg,
+                                        plate_number="LAG-T35-XY",
+                                        confidence=0.81)
+        packager.attach_event(incident_id, {
+            "kind": "stage_change", "stage": "PRELIMINARY",
+            "signal": "first_event", "camera_id": 4,
+            "timestamp_utc": now_iso(),
+        })
+        packager.attach_event(incident_id, {
+            "kind": "sensor_alarm", "camera_id": 4, "zone_id": 1,
+            "sensor_type": "doorContact", "timestamp_utc": now_iso(),
+        })
+        packager.attach_event(incident_id, {
+            "kind": "stage_change", "stage": "CONFIRMED",
+            "signal": "face_intruder", "camera_id": 4,
+            "timestamp_utc": now_iso(),
+        })
+        packager.update_metadata(incident_id, {
+            "incident_classification": "perimeter_breach",
+            "gps_coordinates": [
+                float(settings.tenant.latitude or 0.0),
+                float(settings.tenant.longitude or 0.0),
+            ],
+            "responder_dispatch_log": [],
+        })
+        try:
+            package_dir = packager.finalize(incident_id,
+                                              closed_reason="dashboard_test",
+                                              timeout=20.0)
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"ok": False, "error": exc.__class__.__name__,
+                            "message": str(exc)}), 502
+        sig_path = Path(package_dir) / "signature.sha256"
+        sig = _read_json(sig_path) or {}
+        return jsonify({
+            "ok": True,
+            "incident_id": incident_id,
+            "package_dir": str(package_dir),
+            "signature": sig.get("signature"),
+            "manifest_hash": sig.get("manifest_hash"),
+        })
+
     @app.get("/api/incidents")
     def list_incidents():  # noqa: ANN202
         root = Path(settings.evidence.store_path) / "incidents"
@@ -484,23 +553,96 @@ def register_dashboard(
         package = _safe_incident_dir(incident_id)
         if package is None:
             abort(404)
+        meta = _read_json(package / "incident_metadata.json")
+        manifest = _read_json(package / "manifest.json")
+        sig = _read_json(package / "signature.sha256")
+
+        def _list_subdir(name: str) -> list[dict]:
+            sub = package / name
+            if not sub.is_dir():
+                return []
+            return [{"filename": f"{name}/{f.name}",
+                     "bytes": f.stat().st_size}
+                    for f in sorted(sub.iterdir()) if f.is_file()]
+
+        # Index manifest entries by kind for quick UI lookups.
+        manifest_files = (manifest or {}).get("files", []) or []
+        kinds = {entry["kind"] for entry in manifest_files if "kind" in entry}
+        has_pdf = any(e.get("kind") == "summary_pdf" for e in manifest_files)
+        has_highlight = any(e.get("kind") == "video_highlight" for e in manifest_files)
         return jsonify({
             "incident_id": incident_id,
-            "metadata": _read_json(package / "incident_metadata.json"),
-            "manifest": _read_json(package / "manifest.json"),
-            "signature": _read_json(package / "signature.sha256"),
-            "files": [f.name for f in sorted(package.rglob("*")) if f.is_file()],
+            "metadata": meta,
+            "manifest": manifest,
+            "signature": sig,
+            "files": [f.relative_to(package).as_posix()
+                      for f in sorted(package.rglob("*")) if f.is_file()],
+            "face_captures": _list_subdir("face_captures"),
+            "plate_captures": _list_subdir("plate_captures"),
+            "video_files": [e["filename"] for e in manifest_files
+                            if e.get("kind", "").startswith("video_")],
+            "has_pdf": has_pdf,
+            "has_highlight": has_highlight,
+            "manifest_kinds": sorted(kinds),
+        })
+
+    @app.post("/api/incidents/<incident_id>/verify")
+    def verify_incident(incident_id: str):  # noqa: ANN202
+        """Recompute every file's SHA-256 against the manifest, then
+        recompute the manifest hash. Surfaces tampering with file-level
+        granularity — UI can show a green/red badge."""
+        package = _safe_incident_dir(incident_id)
+        if package is None:
+            return jsonify({"ok": False, "error": "incident not found"}), 404
+        manifest = _read_json(package / "manifest.json")
+        if not manifest:
+            return jsonify({"ok": False, "error": "manifest missing"}), 400
+        from itips.evidence.signing import compute_file_hash
+        file_checks = []
+        all_ok = True
+        for entry in manifest.get("files", []):
+            fp = package / entry["filename"]
+            if not fp.exists():
+                file_checks.append({"filename": entry["filename"],
+                                    "status": "missing"})
+                all_ok = False
+                continue
+            actual = compute_file_hash(fp)
+            ok = actual == entry["sha256"]
+            file_checks.append({
+                "filename": entry["filename"],
+                "status": "ok" if ok else "mismatch",
+                "expected": entry["sha256"],
+                "actual": actual if not ok else None,
+            })
+            if not ok:
+                all_ok = False
+        # Recompute manifest hash to confirm signature integrity end-to-end.
+        import hashlib
+        manifest_body = (package / "manifest.json").read_bytes()
+        actual_manifest_hash = hashlib.sha256(manifest_body).hexdigest()
+        sig = _read_json(package / "signature.sha256") or {}
+        signed_hash = sig.get("manifest_hash")
+        manifest_ok = signed_hash == actual_manifest_hash
+        return jsonify({
+            "ok": all_ok and manifest_ok,
+            "manifest_hash_signed": signed_hash,
+            "manifest_hash_actual": actual_manifest_hash,
+            "manifest_hash_ok": manifest_ok,
+            "files": file_checks,
         })
 
     @app.get("/api/incidents/<incident_id>/files/<path:filename>")
     def download_incident_file(incident_id: str, filename: str):  # noqa: ANN202
+        """`?inline=1` for inline render (thumbnails / PDF preview)."""
         package = _safe_incident_dir(incident_id)
         if package is None:
             abort(404)
         candidate = (package / filename).resolve()
         if not candidate.is_file() or package not in candidate.parents:
             abort(404)
-        return send_file(candidate, as_attachment=True)
+        inline = _truthy(request.args.get("inline"))
+        return send_file(candidate, as_attachment=not inline)
 
     # ─── health checks ─────────────────────────────────────────────
     # Per-camera capability matrix. Caches a result briefly so a click-happy
@@ -686,6 +828,58 @@ def register_dashboard(
             "bbox": list(result.bbox) if result else None,
             "raw_text": result.raw_text if result else None,
             "dispatched": dispatched,
+        })
+
+    @app.get("/api/ml/openai/status")
+    def ml_openai_status():  # noqa: ANN202
+        if openai_validator is None:
+            return jsonify({"wired": False,
+                            "reason": "ITIPS_OPENAI_ENABLED not set"})
+        used, cap = openai_validator.hourly_token_usage()
+        return jsonify({
+            "wired": True,
+            "enabled": openai_validator.is_enabled(),
+            "configured": openai_validator.is_configured(),
+            "model": openai_validator.default_model,
+            "scenarios": openai_validator.scenarios,
+            "tokens_used_hour": used,
+            "tokens_cap_hour": cap,
+            "recent": openai_validator.recent(limit=20),
+        })
+
+    @app.post("/api/ml/openai/validate/<scenario>")
+    def ml_openai_validate(scenario: str):  # noqa: ANN202
+        """Direct probe — bypass should_validate so operators can test any
+        prompt regardless of confidence band or cooldown. Token quota
+        still applies (the kill-switch matters even for testing)."""
+        if openai_validator is None or not openai_validator.is_enabled():
+            return jsonify({"ok": False, "error": "openai validator not enabled"}), 503
+        if scenario not in openai_validator.scenarios:
+            return jsonify({"ok": False, "error": f"unknown scenario {scenario!r}",
+                            "known": openai_validator.scenarios}), 400
+        frame = _decode_upload(request)
+        if frame is None:
+            return jsonify({"ok": False, "error": "no image provided"}), 400
+        context = {k: v for k, v in request.form.items() if k != "image"}
+        try:
+            result = openai_validator.validate(scenario, frame, context)
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"ok": False, "error": exc.__class__.__name__,
+                            "message": str(exc)}), 502
+        if result is None:
+            return jsonify({"ok": False, "error": "validator returned None "
+                            "(quota exhausted or API error — check logs)"}), 502
+        return jsonify({
+            "ok": True,
+            "scenario": result.scenario,
+            "verdict": result.verdict,
+            "category": result.category,
+            "confidence": result.confidence,
+            "summary": result.summary,
+            "model": result.model,
+            "tokens_used": result.tokens_used,
+            "should_suppress": result.should_suppress,
+            "should_escalate": result.should_escalate,
         })
 
     @app.post("/api/ml/behavior/<int:camera_id>/analyse")

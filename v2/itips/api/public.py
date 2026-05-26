@@ -39,6 +39,7 @@ class PublicApiServer(threading.Thread):
         sensor_dispatcher=None,
         sensor_event_tap=None,
         axpro_listener=None,
+        openai_validator=None,
     ) -> None:
         super().__init__(name="api-public", daemon=True)
         self._frame_bus = frame_bus
@@ -55,6 +56,7 @@ class PublicApiServer(threading.Thread):
         self._sensor_dispatcher = sensor_dispatcher
         self._sensor_event_tap = sensor_event_tap
         self._axpro_listener = axpro_listener
+        self._openai_validator = openai_validator
         self._app = self._build_app()
         self._server = None
 
@@ -80,6 +82,7 @@ class PublicApiServer(threading.Thread):
             sensor_dispatcher=self._sensor_dispatcher,
             sensor_event_tap=self._sensor_event_tap,
             axpro_listener=self._axpro_listener,
+            openai_validator=self._openai_validator,
         )
 
         @app.get("/health")

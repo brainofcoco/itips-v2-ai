@@ -40,6 +40,7 @@ import cv2
 import numpy as np
 
 from itips.evidence.buffer import RingBuffer
+from itips.evidence.video_writer import open_writer
 
 logger = logging.getLogger(__name__)
 
@@ -174,10 +175,9 @@ class IncidentRecorder:
         fps = max(_MIN_FPS, min(_MAX_FPS, fps))
         return float(fps), (w, h)
 
-    def _open_writer(self, path: Path, fps: float, size: tuple[int, int]) -> Optional[cv2.VideoWriter]:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        writer = cv2.VideoWriter(str(path), fourcc, fps, size)
+    def _open_writer(self, path: Path, fps: float, size: tuple[int, int]):
+        # H.265 via ffmpeg when available, cv2/mp4v fallback otherwise.
+        writer = open_writer(path, fps=fps, size=size)
         if not writer.isOpened():
             logger.error("cam%d: could not open writer at %s", self.camera_id, path)
             return None

@@ -129,15 +129,29 @@ class AlertEngine:
             if elapsed >= state.dwell_required_s or alert_type == "loitering":
                 self._promote(state, signal=f"dwell:{alert_type}")
 
-    def handle_face_intruder(self, *, camera_id: int, face_bbox, name: str) -> None:
+    def handle_face_intruder(
+        self,
+        *,
+        camera_id: int,
+        face_bbox,
+        name: str,
+        details: dict[str, Any] | None = None,
+        jpeg: Optional[bytes] = None,
+    ) -> None:
         state = self._touch_incident(camera_id)
         record = self._record("face_intruder", {
             "camera_id": camera_id,
             "bbox": [float(x) for x in face_bbox],
             "name": name,
+            **(details or {}),
         }, incident_id=state.incident_id)
         self._publish(record, priority=Priority.MEDIA_CAPTURE, endpoint="A6",
                       incident_id=state.incident_id)
+        if jpeg:
+            self._packager.attach_face_capture(
+                state.incident_id, jpeg=jpeg,
+                confidence=0.0, name=name,
+            )
         if state.stage == STAGE_PRELIMINARY:
             self._promote(state, signal="face_intruder")
 
@@ -149,6 +163,8 @@ class AlertEngine:
         group_id: str,
         name: str,
         similarity: int,
+        details: dict[str, Any] | None = None,
+        jpeg: Optional[bytes] = None,
     ) -> None:
         """Camera matched a face to the workers group. Log only — no incident."""
         record = self._record("personnel_seen", {
@@ -157,7 +173,19 @@ class AlertEngine:
             "group_id": group_id,
             "name": name,
             "similarity": similarity,
+            **(details or {}),
         })
+        # personnel_seen is presence-tracking, not an incident, so face
+        # JPEGs only land in the package if an incident is already open
+        # for this camera (e.g. concurrent intruder alert).
+        if jpeg:
+            with self._lock:
+                state = self._incidents.get(camera_id)
+            if state is not None:
+                self._packager.attach_face_capture(
+                    state.incident_id, jpeg=jpeg,
+                    confidence=float(similarity) / 100.0, name=name,
+                )
         # Personnel sightings go to the intake at low priority so HQ can
         # build a presence log; they don't trigger A3/A8.
         self._publish(record, priority=Priority.HEARTBEAT, endpoint="A1",
@@ -171,6 +199,8 @@ class AlertEngine:
         plate_color: Optional[str] = None,
         vehicle_color: Optional[str] = None,
         speed: Optional[float] = None,
+        jpeg: Optional[bytes] = None,
+        confidence: float = 0.0,
     ) -> None:
         record = self._record("plate_capture", {
             "camera_id": camera_id,
@@ -178,12 +208,21 @@ class AlertEngine:
             "plate_color": plate_color,
             "vehicle_color": vehicle_color,
             "speed": speed,
+            "confidence": confidence,
         })
-        # The camera's onboard TrafficBlackList / TrafficRedList already
-        # gates which plates trigger its own alarm rails. Here we always
-        # forward the read so the backend can audit it.
+        # TrafficBlackList / TrafficRedList on the camera gate alarms;
+        # we always forward the read so the backend can audit.
         self._publish(record, priority=Priority.MEDIA_CAPTURE, endpoint="A6",
                       incident_id=None)
+        # Persist the plate crop into the package when an incident is open.
+        if jpeg:
+            with self._lock:
+                state = self._incidents.get(camera_id)
+            if state is not None:
+                self._packager.attach_plate_capture(
+                    state.incident_id, jpeg=jpeg,
+                    plate_number=plate_number, confidence=confidence,
+                )
 
     def handle_fire(self, *, camera_id: int, details: dict[str, Any]) -> None:
         state = self._touch_incident(camera_id)
@@ -271,6 +310,15 @@ class AlertEngine:
                 recorder.begin(incident_id, package_dir)
             except Exception:
                 logger.exception("cam%d: recorder.begin failed", camera_id)
+        # Record the opening transition so finalize() can write
+        # alert_stage_log per PRD §4.3 REQ-EV-01.
+        self._packager.attach_event(incident_id, {
+            "kind": "stage_change",
+            "stage": STAGE_PRELIMINARY,
+            "signal": "first_event",
+            "camera_id": camera_id,
+            "timestamp_utc": now_iso(),
+        })
         logger.info("cam%d: incident %s opened (preliminary)", camera_id, incident_id)
         return state
 
@@ -297,6 +345,13 @@ class AlertEngine:
             },
             incident_id=state.incident_id,
         )
+        self._packager.attach_event(state.incident_id, {
+            "kind": "stage_change",
+            "stage": STAGE_CONFIRMED,
+            "signal": signal,
+            "camera_id": state.camera_id,
+            "timestamp_utc": now_iso(),
+        })
         logger.info("cam%d: incident %s CONFIRMED via %s",
                     state.camera_id, state.incident_id, signal)
 

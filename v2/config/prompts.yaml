@@ -1,0 +1,185 @@
+# OpenAIValidator prompt registry.
+#
+# Each scenario keys into the validator's `validate(scenario, ...)` call.
+# Per scenario:
+#   model           — override the default model (env: ITIPS_OPENAI_MODEL)
+#   confidence_band — [low, high]. Validator only fires when the local
+#                     engine's confidence is in (low, high). Outside the
+#                     band we trust the local result and skip the LLM.
+#   cooldown_s      — per-(scenario, zone_or_camera) reuse window.
+#   system          — system message handed to the model.
+#   user_template   — Python format() string. Available keys per scenario
+#                     are documented inline.
+#
+# The model is asked to return STRICT JSON matching:
+#   {"verdict":     "real" | "false_positive" | "inconclusive",
+#    "category":    "human" | "worker" | "animal" | "vehicle"
+#                   | "environmental" | "fire" | "smoke" | "weapon" | "unclear",
+#    "confidence":  0.0 - 1.0,
+#    "summary":     one-sentence operator-readable description}
+#
+# `category` drives auto-escalation: fire/smoke/weapon route through the
+# corresponding AlertEngine handlers regardless of the original alert type.
+
+scenarios:
+
+  behavior_intrusion:
+    model: gpt-4o-mini
+    confidence_band: [0.35, 0.85]
+    cooldown_s: 30
+    system: |
+      You are a security validation assistant for Nigerian telecom-tower
+      cameras. You see one snapshot at a time and decide whether a
+      perimeter-intrusion alert is real. Respond with ONE JSON object
+      only — no prose, no markdown.
+    user_template: |
+      Alert: behavior_intrusion
+      Camera {camera_id}, zone "{zone_name}" (id={zone_id})
+      Local detector: {class_name} (YOLO conf {confidence:.2f})
+
+      Decide:
+      1. Is a real human intruder present inside the highlighted zone?
+      2. Or is the trigger a false positive — animal (dog, cat, goat,
+         monkey), wind-blown debris, light/shadow shift, parked vehicle,
+         camera reflection?
+      3. If a person is present, are they in worker uniform (high-vis
+         jacket, hard hat, branded coveralls) — category="worker" — or
+         unmarked — category="human"?
+      4. If you see fire, smoke, or a weapon, raise it via category even
+         if the original trigger was intrusion.
+
+      Return JSON: {{"verdict": "real|false_positive|inconclusive",
+                     "category": "human|worker|animal|vehicle|environmental|fire|smoke|weapon|unclear",
+                     "confidence": <your certainty as a number between 0.0 and 1.0>,
+                     "summary": "one-sentence operator-readable description"}}
+
+  behavior_line_crossing:
+    model: gpt-4o-mini
+    confidence_band: [0.35, 0.85]
+    cooldown_s: 30
+    system: |
+      You are validating a line-crossing alarm from a tower-protection
+      camera. Respond with one JSON object only.
+    user_template: |
+      Alert: behavior_line_crossing
+      Camera {camera_id}, line "{zone_name}" (id={zone_id}), direction {direction}
+      Local detector: {class_name} (YOLO conf {confidence:.2f})
+
+      Decide whether something genuinely crossed the line:
+      - Real human or vehicle crossing → verdict=real
+      - Animal crossing → verdict=false_positive, category=animal (still log)
+      - Light/shadow only → verdict=false_positive, category=environmental
+      Note vehicles: if a vehicle crossed, set category="vehicle" so the
+      pipeline can re-route to the gate handler.
+
+      Return JSON: {{"verdict": "real|false_positive|inconclusive",
+                     "category": "human|worker|animal|vehicle|environmental|fire|smoke|weapon|unclear",
+                     "confidence": <your certainty as a number between 0.0 and 1.0>,
+                     "summary": "one-sentence operator-readable description"}}
+
+  behavior_loitering:
+    model: gpt-4o-mini
+    confidence_band: [0.30, 0.90]
+    cooldown_s: 60
+    system: |
+      You are validating a loitering alert. Determine intent signals only
+      from what is visible. Respond with one JSON object only.
+    user_template: |
+      Alert: behavior_loitering
+      Camera {camera_id}, zone "{zone_name}" (id={zone_id})
+      Dwell: {dwell_seconds:.0f}s, events_inside={events_inside}
+      Local detector: {class_name} (YOLO conf {confidence:.2f})
+
+      Decide:
+      - Person observing the site / pacing the fence / hiding → verdict=real
+      - Worker on a clear task (carrying tools, focused on equipment) → category=worker
+      - Person waiting passively (waiting for ride, on phone) → verdict=inconclusive
+      - No person actually in frame (track was stale) → verdict=false_positive
+
+      Return JSON: {{"verdict": "real|false_positive|inconclusive",
+                     "category": "human|worker|animal|vehicle|environmental|fire|smoke|weapon|unclear",
+                     "confidence": <your certainty as a number between 0.0 and 1.0>,
+                     "summary": "one-sentence operator-readable description"}}
+
+  face_intruder:
+    model: gpt-4o-mini
+    confidence_band: [0.0, 0.55]   # only ask when face match was weak/none
+    cooldown_s: 20
+    system: |
+      You are validating a face-intruder alert. The local face recognizer
+      could not match this person to enrolled personnel. Respond JSON only.
+    user_template: |
+      Alert: face_intruder
+      Camera {camera_id}, best local similarity {confidence:.2f}
+
+      Decide:
+      - Worker uniform visible (high-vis vest, hard hat, ITIPS/operator
+        branding) → category="worker", verdict=false_positive, summary
+        should say "uniformed worker, manual identity verification needed"
+      - Delivery person (branded uniform, package, vehicle nearby) →
+        category="worker", verdict=inconclusive
+      - Camera artifact (lens reflection, water droplet, no real face) →
+        verdict=false_positive, category=environmental
+      - Unknown person, no uniform, on-site without escort → verdict=real,
+        category=human
+
+      Return JSON: {{"verdict": "real|false_positive|inconclusive",
+                     "category": "human|worker|animal|vehicle|environmental|fire|smoke|weapon|unclear",
+                     "confidence": <your certainty as a number between 0.0 and 1.0>,
+                     "summary": "one-sentence operator-readable description"}}
+
+  sensor_unverified:
+    # Highest-value scenario — sensor fired, no face found, why?
+    # Worth gpt-4o (vs mini) because the answer drives RAPID dispatch.
+    model: gpt-4o
+    confidence_band: [0.0, 1.0]    # always ask — local has no answer
+    cooldown_s: 15
+    system: |
+      A perimeter sensor fired (PIR / vibration / door contact) but the
+      camera's face detector found no human face in the snapshot taken
+      after the camera panned to the zone. Identify the actual cause.
+      Respond JSON only.
+    user_template: |
+      Alert: sensor_unverified
+      Camera {camera_id}, panned to preset "{preset_name}"
+      Sensor: zone {zone_id} "{zone_name}", type "{sensor_type}"
+
+      Decide what tripped the sensor:
+      - Human just out of frame (partial body, back turned, moving fast) →
+        verdict=real, category=human, summary names the visible cue
+      - Animal (dog, goat, livestock, bird hitting fence) → verdict=
+        false_positive, category=animal
+      - Wind/vibration (swaying tree, blowing dust, fence rattling, rain) →
+        verdict=false_positive, category=environmental
+      - Vehicle that left the frame → verdict=inconclusive, category=vehicle
+      - Visible fire or smoke → verdict=real, category=fire OR smoke
+      - Nothing distinguishable → verdict=inconclusive, category=unclear
+
+      Return JSON: {{"verdict": "real|false_positive|inconclusive",
+                     "category": "human|worker|animal|vehicle|environmental|fire|smoke|weapon|unclear",
+                     "confidence": <your certainty as a number between 0.0 and 1.0>,
+                     "summary": "one-sentence operator-readable description"}}
+
+  sensor_intruder:
+    model: gpt-4o-mini
+    confidence_band: [0.0, 0.60]    # only when local face match was weak
+    cooldown_s: 20
+    system: |
+      A perimeter sensor fired and the camera saw an unknown face.
+      Respond JSON only.
+    user_template: |
+      Alert: sensor_intruder
+      Camera {camera_id}, preset "{preset_name}"
+      Sensor zone {zone_id} ("{sensor_type}")
+      Local face match: best similarity {confidence:.2f} (no enrolled match)
+
+      Decide:
+      - Unknown person, no uniform → verdict=real, category=human
+      - Worker uniform but not enrolled → verdict=inconclusive, category=worker
+      - Visible weapon → verdict=real, category=weapon (escalate)
+      - Multiple people / coordinated activity → mention in summary
+
+      Return JSON: {{"verdict": "real|false_positive|inconclusive",
+                     "category": "human|worker|animal|vehicle|environmental|fire|smoke|weapon|unclear",
+                     "confidence": <your certainty as a number between 0.0 and 1.0>,
+                     "summary": "one-sentence operator-readable description"}}

@@ -32,9 +32,11 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 # Runtime libs cv2 + torch need at import time. libgomp1 is for OpenMP
 # threading inside ONNX / Torch; libstdc++ comes with the base.
+# ffmpeg is the H.265 encoder for PRD §4.3 REQ-EV-01 video evidence.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libgl1 libglib2.0-0 libsm6 libxext6 libxrender1 libgomp1 \
         curl ca-certificates tini \
+        ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -51,7 +53,8 @@ RUN pip install --no-cache-dir \
         pydantic==2.8.2 \
         pyyaml==6.0.2 \
         opencv-python-headless==4.10.0.84 \
-        pillow==10.4.0
+        pillow==10.4.0 \
+        "reportlab>=4.0,<5"
 
 # ─── Layer 2: ML fallback layer ───────────────────────────────────────
 # easyocr + ultralytics pull torch + torchvision transitively. By
@@ -88,6 +91,7 @@ RUN apt-get update \
         "paddlepaddle>=2.6,<4" \
         "ultralytics>=8.2,<9" \
         "hikaxpro>=2.0" \
+        "openai>=1.40,<2" \
     && apt-get purge -y build-essential \
     && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/*

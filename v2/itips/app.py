@@ -88,6 +88,7 @@ def _build_deps():
         zones_path=personnel_store_path.parent / "zones.json",
         overrides_path=personnel_store_path.parent / "ml_overrides.json",
     )
+    openai_validator = _build_openai_validator()
 
     # Sensor pipeline. Dispatcher works without face_engine — just
     # pans + snapshots without the auto-validate step.
@@ -102,6 +103,7 @@ def _build_deps():
         sensor_map=sensor_map,
         event_tap=sensor_event_tap,
         face_engine=ml_state.face_engine,
+        openai_validator=openai_validator,
     )
 
     # AX PRO hub listener — None unless ITIPS_AXPRO_* env are set.
@@ -116,6 +118,7 @@ def _build_deps():
         face_engine=ml_state.face_engine,
         plate_engine=ml_state.plate_engine,
         behavior_engine=ml_state.behavior_engine,
+        openai_validator=openai_validator,
     )
 
     public_api = PublicApiServer(
@@ -133,6 +136,7 @@ def _build_deps():
         sensor_dispatcher=sensor_dispatcher,
         sensor_event_tap=sensor_event_tap,
         axpro_listener=axpro_listener,
+        openai_validator=openai_validator,
     )
     inbound_api = InboundApiServer(
         dahua_manager=dahua_manager,
@@ -154,6 +158,33 @@ def _build_deps():
     if axpro_listener is not None:
         services.append(axpro_listener)
     return deps, services
+
+
+def _build_openai_validator():
+    """Returns None unless ITIPS_OPENAI_ENABLED=true and key + prompts exist."""
+    import os
+    logger = logging.getLogger("itips.app.openai")
+    if (os.environ.get("ITIPS_OPENAI_ENABLED") or "").lower() not in {"1", "true", "yes"}:
+        return None
+    api_key = (os.environ.get("ITIPS_OPENAI_API_KEY") or "").strip()
+    if not api_key:
+        logger.warning("OpenAI validator disabled — ITIPS_OPENAI_ENABLED=true "
+                       "but ITIPS_OPENAI_API_KEY is empty")
+        return None
+    try:
+        from itips.ml import OpenAIValidator
+    except Exception:
+        logger.exception("OpenAIValidator import failed")
+        return None
+    prompts_path = Path(os.environ.get("ITIPS_OPENAI_PROMPTS_PATH",
+                                       "config/prompts.yaml"))
+    model = os.environ.get("ITIPS_OPENAI_MODEL", "gpt-4o-mini")
+    max_tokens = int(os.environ.get("ITIPS_OPENAI_MAX_TOKENS_PER_HOUR", "100000") or "100000")
+    return OpenAIValidator(
+        api_key=api_key, prompts_path=prompts_path,
+        default_model=model, enabled=True,
+        max_tokens_per_hour=max_tokens,
+    )
 
 
 def _build_axpro_listener(dispatcher):

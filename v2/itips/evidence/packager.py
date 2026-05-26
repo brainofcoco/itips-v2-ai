@@ -26,6 +26,7 @@ from typing import Any, Optional
 from config.settings import settings
 from itips.evidence.manifest import Manifest, ManifestEntry
 from itips.evidence.signing import compute_file_hash, sign_manifest
+from itips.evidence.summary import build_highlight, build_pdf_summary
 from itips.utils.clock import now_iso
 
 logger = logging.getLogger(__name__)
@@ -40,6 +41,13 @@ class _IncidentState:
     device_id: str
     event_log: list[dict[str, Any]] = field(default_factory=list)
     manifest: Manifest = None  # type: ignore[assignment]
+    # Filled progressively from attach calls; written to incident_metadata.json
+    # at finalize to satisfy PRD §4.3 REQ-EV-01.
+    metadata_patch: dict[str, Any] = field(default_factory=dict)
+    camera_ids_active: set[int] = field(default_factory=set)
+    alert_stage_log: list[dict[str, Any]] = field(default_factory=list)
+    face_seq: int = 0
+    plate_seq: int = 0
 
 
 @dataclass
@@ -64,9 +72,34 @@ class _AttachEvent:
 
 
 @dataclass
+class _AttachFaceCapture:
+    incident_id: str
+    jpeg: bytes
+    confidence: float
+    name: str
+    ts: str
+
+
+@dataclass
+class _AttachPlateCapture:
+    incident_id: str
+    jpeg: bytes
+    plate_number: str
+    confidence: float
+    ts: str
+
+
+@dataclass
+class _UpdateMetadata:
+    incident_id: str
+    patch: dict[str, Any]
+
+
+@dataclass
 class _Finalize:
     incident_id: str
     done: threading.Event
+    closed_reason: str = "idle_timeout"
     result: dict[str, Any] = field(default_factory=dict)
 
 
@@ -83,7 +116,7 @@ class EvidencePackager(threading.Thread):
         self.pre_event_seconds = pre_event_seconds
         self.post_event_seconds = post_event_seconds
         self._ops: queue.Queue = queue.Queue()
-        self._stop = threading.Event()
+        self._stop_event = threading.Event()
         self._states: dict[str, _IncidentState] = {}
 
     # ─── public surface ────────────────────────────────────────────
@@ -100,9 +133,39 @@ class EvidencePackager(threading.Thread):
     def attach_event(self, incident_id: str, event: dict[str, Any]) -> None:
         self._ops.put(_AttachEvent(incident_id, dict(event)))
 
-    def finalize(self, incident_id: str, timeout: float = 30.0) -> Path:
+    def attach_face_capture(self, incident_id: str, *, jpeg: bytes,
+                            confidence: float = 0.0, name: str = "",
+                            ts: Optional[str] = None) -> None:
+        """Persist a face crop to face_captures/face_NN_<ts>_<conf>.jpg."""
+        self._ops.put(_AttachFaceCapture(
+            incident_id=incident_id, jpeg=jpeg,
+            confidence=float(confidence), name=name,
+            ts=ts or now_iso(),
+        ))
+
+    def attach_plate_capture(self, incident_id: str, *, jpeg: bytes,
+                             plate_number: str = "", confidence: float = 0.0,
+                             ts: Optional[str] = None) -> None:
+        """Persist a plate crop to plate_captures/plate_NN_<ts>_<plate>.jpg."""
+        self._ops.put(_AttachPlateCapture(
+            incident_id=incident_id, jpeg=jpeg,
+            plate_number=plate_number, confidence=float(confidence),
+            ts=ts or now_iso(),
+        ))
+
+    def update_metadata(self, incident_id: str, patch: dict[str, Any]) -> None:
+        """Merge fields into incident_metadata.json at finalize.
+
+        Use for camera_ids_active, incident_classification, gps_coordinates,
+        responder_dispatch_log, etc. — fields PRD §4.3 REQ-EV-01 mandates
+        but only become known partway through the incident lifecycle.
+        """
+        self._ops.put(_UpdateMetadata(incident_id, dict(patch)))
+
+    def finalize(self, incident_id: str, *, closed_reason: str = "idle_timeout",
+                 timeout: float = 30.0) -> Path:
         """Block until the package is signed and on disk."""
-        op = _Finalize(incident_id, threading.Event())
+        op = _Finalize(incident_id, threading.Event(), closed_reason=closed_reason)
         self._ops.put(op)
         if not op.done.wait(timeout):
             raise TimeoutError(f"Finalize timed out after {timeout}s for {incident_id}")
@@ -112,14 +175,14 @@ class EvidencePackager(threading.Thread):
         return Path(result["package_dir"])
 
     def stop(self) -> None:
-        self._stop.set()
+        self._stop_event.set()
 
     # ─── thread body ───────────────────────────────────────────────
 
     def run(self) -> None:
         self.store_root.mkdir(parents=True, exist_ok=True)
         logger.info("EvidencePackager ready at %s", self.store_root)
-        while not self._stop.is_set() or not self._ops.empty():
+        while not self._stop_event.is_set() or not self._ops.empty():
             try:
                 op = self._ops.get(timeout=0.25)
             except queue.Empty:
@@ -137,6 +200,12 @@ class EvidencePackager(threading.Thread):
             self._handle_attach_file(op)
         elif isinstance(op, _AttachEvent):
             self._handle_attach_event(op)
+        elif isinstance(op, _AttachFaceCapture):
+            self._handle_attach_face(op)
+        elif isinstance(op, _AttachPlateCapture):
+            self._handle_attach_plate(op)
+        elif isinstance(op, _UpdateMetadata):
+            self._handle_update_metadata(op)
         elif isinstance(op, _Finalize):
             self._handle_finalize(op)
 
@@ -189,6 +258,75 @@ class EvidencePackager(threading.Thread):
         if not state:
             return
         state.event_log.append(op.event)
+        # Pick up evidence-shaping signals as side-effects of normal events.
+        cam = op.event.get("camera_id")
+        if isinstance(cam, int) and cam > 0:
+            state.camera_ids_active.add(cam)
+        if op.event.get("kind") == "stage_change":
+            state.alert_stage_log.append({
+                "stage": op.event.get("stage"),
+                "signal": op.event.get("signal"),
+                "ts": op.event.get("timestamp_utc"),
+            })
+
+    def _handle_attach_face(self, op: _AttachFaceCapture) -> None:
+        state = self._states.get(op.incident_id)
+        if not state:
+            return
+        state.face_seq += 1
+        safe_ts = _safe_filename_ts(op.ts)
+        fname = f"face_{state.face_seq:03d}_{safe_ts}_conf{int(op.confidence * 100):02d}.jpg"
+        path = state.package_dir / "face_captures" / fname
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(op.jpeg)
+        digest = compute_file_hash(path)
+        state.manifest.add(ManifestEntry(
+            filename=f"face_captures/{fname}",
+            sha256=digest,
+            bytes=path.stat().st_size,
+            kind="face_capture",
+        ))
+        # Log so face captures appear in event_log too — gives investigators
+        # a single chronological view.
+        state.event_log.append({
+            "kind": "face_capture",
+            "filename": f"face_captures/{fname}",
+            "confidence": op.confidence,
+            "name": op.name,
+            "timestamp_utc": op.ts,
+        })
+
+    def _handle_attach_plate(self, op: _AttachPlateCapture) -> None:
+        state = self._states.get(op.incident_id)
+        if not state:
+            return
+        state.plate_seq += 1
+        safe_ts = _safe_filename_ts(op.ts)
+        safe_plate = "".join(c for c in op.plate_number if c.isalnum()) or "unknown"
+        fname = f"plate_{state.plate_seq:03d}_{safe_ts}_{safe_plate}.jpg"
+        path = state.package_dir / "plate_captures" / fname
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(op.jpeg)
+        digest = compute_file_hash(path)
+        state.manifest.add(ManifestEntry(
+            filename=f"plate_captures/{fname}",
+            sha256=digest,
+            bytes=path.stat().st_size,
+            kind="plate_capture",
+        ))
+        state.event_log.append({
+            "kind": "plate_capture",
+            "filename": f"plate_captures/{fname}",
+            "plate_number": op.plate_number,
+            "confidence": op.confidence,
+            "timestamp_utc": op.ts,
+        })
+
+    def _handle_update_metadata(self, op: _UpdateMetadata) -> None:
+        state = self._states.get(op.incident_id)
+        if not state:
+            return
+        state.metadata_patch.update(op.patch)
 
     def _handle_finalize(self, op: _Finalize) -> None:
         state = self._states.pop(op.incident_id, None)
@@ -197,6 +335,8 @@ class EvidencePackager(threading.Thread):
             op.done.set()
             return
         try:
+            # Split sensor events into their own log per PRD §4.3.
+            sensor_log = [e for e in state.event_log if _is_sensor_event(e)]
             event_log_path = state.package_dir / "event_log.json"
             event_log_path.write_text(
                 json.dumps(state.event_log, sort_keys=True, separators=(",", ":")),
@@ -208,12 +348,81 @@ class EvidencePackager(threading.Thread):
                 bytes=event_log_path.stat().st_size,
                 kind="event_log",
             ))
+            if sensor_log:
+                sensor_log_path = state.package_dir / "sensor_log.json"
+                sensor_log_path.write_text(
+                    json.dumps(sensor_log, sort_keys=True, separators=(",", ":")),
+                    encoding="utf-8",
+                )
+                state.manifest.add(ManifestEntry(
+                    filename="sensor_log.json",
+                    sha256=compute_file_hash(sensor_log_path),
+                    bytes=sensor_log_path.stat().st_size,
+                    kind="sensor_log",
+                ))
+
+            # Rewrite incident_metadata.json with chain-of-custody + status.
+            metadata_path = state.package_dir / "incident_metadata.json"
+            existing = {}
+            try:
+                existing = json.loads(metadata_path.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+            final_metadata = {
+                **existing,
+                **state.metadata_patch,
+                "camera_ids_active": sorted(state.camera_ids_active),
+                "alert_stage_log": list(state.alert_stage_log),
+                "event_count": len(state.event_log),
+                "sensor_event_count": len(sensor_log),
+                "face_capture_count": state.face_seq,
+                "plate_capture_count": state.plate_seq,
+                "status": "complete",
+                "closed_reason": op.closed_reason,
+                "finalized_utc": now_iso(),
+            }
+            metadata_path.write_text(
+                json.dumps(final_metadata, sort_keys=True, separators=(",", ":")),
+                encoding="utf-8",
+            )
             state.manifest.add(ManifestEntry(
                 filename="incident_metadata.json",
-                sha256=compute_file_hash(state.package_dir / "incident_metadata.json"),
-                bytes=(state.package_dir / "incident_metadata.json").stat().st_size,
+                sha256=compute_file_hash(metadata_path),
+                bytes=metadata_path.stat().st_size,
                 kind="metadata",
             ))
+
+            # Highlight clips — first 30s of each video_post file.
+            for entry in list(state.manifest.entries):
+                if entry.kind != "video_post":
+                    continue
+                src = state.package_dir / entry.filename
+                hl = build_highlight(src, duration_s=30.0)
+                if hl is not None and hl.exists():
+                    rel = hl.relative_to(state.package_dir)
+                    state.manifest.add(ManifestEntry(
+                        filename=str(rel),
+                        sha256=compute_file_hash(hl),
+                        bytes=hl.stat().st_size,
+                        kind="video_highlight",
+                    ))
+
+            # Human-readable summary PDF for law enforcement.
+            pdf = build_pdf_summary(
+                package_dir=state.package_dir,
+                metadata=final_metadata,
+                event_log=state.event_log,
+                face_count=state.face_seq,
+                plate_count=state.plate_seq,
+                sensor_count=len(sensor_log),
+            )
+            if pdf is not None and pdf.exists():
+                state.manifest.add(ManifestEntry(
+                    filename="incident_summary.pdf",
+                    sha256=compute_file_hash(pdf),
+                    bytes=pdf.stat().st_size,
+                    kind="summary_pdf",
+                ))
 
             manifest_path = state.package_dir / "manifest.json"
             manifest_hash = state.manifest.write(manifest_path)
@@ -247,3 +456,18 @@ class EvidencePackager(threading.Thread):
             op.result.update(status="error", reason=str(exc))
         finally:
             op.done.set()
+
+
+_SENSOR_EVENT_KINDS = {
+    "sensor_alarm", "sensor_unverified", "sensor_intruder",
+}
+
+
+def _is_sensor_event(event: dict[str, Any]) -> bool:
+    kind = event.get("kind") or event.get("alert_type") or ""
+    return str(kind) in _SENSOR_EVENT_KINDS
+
+
+def _safe_filename_ts(ts: str) -> str:
+    # ISO timestamps contain ":" which Windows refuses + most tools dislike.
+    return "".join(c if c.isalnum() else "-" for c in ts)[:24]

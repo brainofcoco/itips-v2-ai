@@ -276,6 +276,41 @@
         <pre id="ml-plate-result" class="muted">No result yet.</pre>
       </div>
 
+      <!-- OpenAI Validator -->
+      <div class="test-col">
+        <h3>OpenAI validator</h3>
+        <p class="muted">
+          Second-opinion layer for ambiguous alerts. Confidence-band
+          gated and per-zone cooldown debounced; hourly token cap is
+          the safety net. Auto-escalates fire / smoke / weapon.
+        </p>
+        <div class="toolbar">
+          <span id="ml-openai-pill" class="pill pill-idle">openai: —</span>
+          <span class="muted" id="ml-openai-model"></span>
+          <span class="spacer"></span>
+          <span class="muted" id="ml-openai-tokens"></span>
+        </div>
+        <h4>Test a scenario</h4>
+        <p class="muted">
+          Pick a scenario, upload a snapshot, optionally fill in context
+          fields. Bypasses the confidence-band gate so any prompt can be
+          probed directly — but the hourly token cap still applies.
+        </p>
+        <div class="form-stack">
+          <select id="ml-openai-scenario"></select>
+          <input id="ml-openai-image" type="file" accept="image/jpeg,image/png" />
+          <input id="ml-openai-camera" type="number" placeholder="camera_id (optional)" />
+          <input id="ml-openai-zone" placeholder="zone_name (optional)" />
+          <input id="ml-openai-confidence" type="number" step="0.01" min="0" max="1"
+                 placeholder="local confidence 0.0–1.0 (optional)" />
+          <button id="ml-openai-run" class="primary">Run validator</button>
+        </div>
+        <pre id="ml-openai-result" class="muted">No verdict yet.</pre>
+
+        <h4>Recent verdicts</h4>
+        <ul id="ml-openai-recent" class="alerts"></ul>
+      </div>
+
       <!-- Behavior -->
       <div class="test-col">
         <h3>Behavior analysis</h3>
@@ -408,6 +443,7 @@
   <section data-tabpanel="incidents" class="panel">
     <div class="toolbar">
       <button id="incidents-refresh">Refresh</button>
+      <button id="incidents-test" class="primary">Run test incident</button>
       <span class="spacer"></span>
       <span class="muted" id="incidents-meta"></span>
     </div>

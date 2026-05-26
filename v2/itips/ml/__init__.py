@@ -18,6 +18,11 @@ from itips.ml.capability_router import (
 from itips.ml.embedding_store import EmbeddingRecord, EmbeddingStore
 from itips.ml.face_engine import FaceEngine, FaceEngineUnavailable, RecognitionResult
 from itips.ml.object_detector import ObjectDetector, ObjectDetectorUnavailable
+from itips.ml.openai_validator import (
+    OpenAIValidator,
+    OpenAIValidatorUnavailable,
+    ValidationResult,
+)
 from itips.ml.plate_engine import PlateEngine, PlateEngineUnavailable, PlateReadResult
 from itips.ml.tracker import Detection, IoUTracker, TrackedObject
 from itips.ml.zone_store import Zone, ZoneStore
@@ -37,6 +42,9 @@ __all__ = [
     "IoUTracker",
     "ObjectDetector",
     "ObjectDetectorUnavailable",
+    "OpenAIValidator",
+    "OpenAIValidatorUnavailable",
+    "ValidationResult",
     "PlateEngine",
     "PlateEngineUnavailable",
     "PlateReadResult",
