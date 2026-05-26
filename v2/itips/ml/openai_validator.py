@@ -83,7 +83,7 @@ class OpenAIValidator:
         enabled: bool = True,
         max_tokens_per_hour: int = 100_000,
         max_image_edge_px: int = 768,
-        timeout_s: float = 12.0,
+        timeout_s: float = 30.0,
     ) -> None:
         self._api_key = api_key
         self._default_model = default_model

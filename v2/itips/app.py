@@ -180,10 +180,12 @@ def _build_openai_validator():
                                        "config/prompts.yaml"))
     model = os.environ.get("ITIPS_OPENAI_MODEL", "gpt-4o-mini")
     max_tokens = int(os.environ.get("ITIPS_OPENAI_MAX_TOKENS_PER_HOUR", "100000") or "100000")
+    timeout_s = float(os.environ.get("ITIPS_OPENAI_TIMEOUT_S", "30") or "30")
     return OpenAIValidator(
         api_key=api_key, prompts_path=prompts_path,
         default_model=model, enabled=True,
         max_tokens_per_hour=max_tokens,
+        timeout_s=timeout_s,
     )
 
 
