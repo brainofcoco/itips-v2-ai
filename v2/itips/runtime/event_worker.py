@@ -55,6 +55,7 @@ class WorkerDeps:
         plate_engine: Optional[Any] = None,
         behavior_engine: Optional[Any] = None,
         openai_validator: Optional[Any] = None,
+        threat_evaluator: Optional[Any] = None,
     ) -> None:
         self.alert_engine = alert_engine
         self.frame_bus = frame_bus
@@ -68,6 +69,10 @@ class WorkerDeps:
         self.behavior_engine = behavior_engine
         # Optional LLM second-opinion layer; None disables it.
         self.openai_validator = openai_validator
+        # Multi-frame decision engine. When present, primary triggers
+        # (line cross, region, face) route through it instead of opening
+        # an incident on the spot.
+        self.threat_evaluator = threat_evaluator
 
 
 class DahuaEventDispatcher(threading.Thread):
@@ -209,7 +214,10 @@ class DahuaEventDispatcher(threading.Thread):
                 monotonic_ns=monotonic_ns(),
                 preset_id="default",
             ))
-            self._feed_recorder(frame)
+            # Recorder is now fed by the continuous RtspFrameGrabber in
+            # itips.camera.rtsp_grabber. Event JPEGs and RTSP frames have
+            # different resolutions, and the recorder fixes frame_size at
+            # begin(); dual-feeding would silently drop one stream.
 
     def _frame_for(self, event: DahuaEvent) -> Optional["np.ndarray"]:
         if event.jpeg:
@@ -226,20 +234,24 @@ class DahuaEventDispatcher(threading.Thread):
             return None
         return self._endpoint.snapshot(timeout=4.0)
 
-    def _feed_recorder(self, frame: "np.ndarray") -> None:
-        rec = self.deps.recorders.get(self.camera_id)
-        if rec is None:
-            return
-        try:
-            rec.feed(frame)
-        except Exception:
-            logger.exception("cam %d: recorder.feed crashed", self.camera_id)
-
     # ─── per-event handlers ───────────────────────────────────────────
 
     def _handle_face_recognition(self, event: DahuaEvent, frame: Optional["np.ndarray"]) -> None:
-        """Default: trust the camera's `Candidates`. With the operator
-        override on: ignore them and re-run Jetson FR on the event JPEG."""
+        """Camera's onboard FR result.
+
+        Order of operations matters:
+
+        1. **Operator-forced Jetson FR**: the camera's match is ignored
+           and the Jetson re-decides identity. Must run BEFORE we trust
+           the camera's `Candidates` list, otherwise a stale enrollment
+           on the camera can mask a true intruder.
+        2. **Camera matched (Candidates non-empty)**: log personnel_seen
+           directly. No multi-frame gate needed — the camera made the
+           call, end of story.
+        3. **Camera unmatched (Candidates empty)**: route into the
+           evaluator's decision window so a single back-to-camera frame
+           doesn't fire INTRUDER on its own.
+        """
         face = event.data.get("Face", {}) or {}
         bbox = _face_bbox(face)
 
@@ -265,25 +277,45 @@ class DahuaEventDispatcher(threading.Thread):
             )
             return
 
-        # No match → intruder.
+        if self.deps.threat_evaluator is not None:
+            self.deps.threat_evaluator.trigger(
+                camera_id=self.camera_id,
+                trigger_kind="camera:face_unmatched",
+                initial_frame=frame,
+                details={"bbox": list(bbox)},
+            )
+            return
+
+        # Legacy direct INTRUDER path — runs only when neither the
+        # evaluator nor the Jetson FR fallback is available.
         self.deps.alert_engine.handle_face_intruder(
             camera_id=self.camera_id,
             face_bbox=bbox,
             name="INTRUDER",
         )
-        logger.info("cam %d FaceRecognition INTRUDER (no candidates)", self.camera_id)
+        logger.info("cam %d FaceRecognition INTRUDER (no evaluator, no candidates)",
+                    self.camera_id)
 
     def _handle_face_detection(self, event: DahuaEvent, frame: Optional["np.ndarray"]) -> None:
-        """If the camera lacks native FR (or override is on), Jetson FR
-        runs and promotes to personnel_seen / face_intruder. Otherwise
-        log the bare bbox and let the camera's FaceRecognition decide."""
+        """Bare face-detected event from the camera.
+
+        With the evaluator wired, this opens (or extends) the camera's
+        decision window so a single back-to-camera frame never produces
+        an INTRUDER on its own. Without the evaluator, fall back to the
+        Jetson FR fallback / behaviour log path."""
         face = event.data.get("Face", {}) or {}
         bbox = _face_bbox(face)
-
+        if self.deps.threat_evaluator is not None:
+            self.deps.threat_evaluator.trigger(
+                camera_id=self.camera_id,
+                trigger_kind="camera:face_detected",
+                initial_frame=frame,
+                details={"bbox": list(bbox)},
+            )
+            return
         if self._should_fallback_to_face_engine() and frame is not None:
             if self._dispatch_face_fallback(frame, bbox):
                 return
-
         self.deps.alert_engine.handle_behaviour_alert_simple(
             camera_id=self.camera_id,
             alert_type="face_detected",
@@ -393,26 +425,42 @@ class DahuaEventDispatcher(threading.Thread):
                     f" ai={validation.category}/{validation.verdict}" if validation else "")
         return True
 
-    def _handle_perimeter_breach(self, event: DahuaEvent, _frame: Optional["np.ndarray"]) -> None:
-        direction = event.data.get("Direction", "")
+    def _handle_perimeter_breach(self, event: DahuaEvent, frame: Optional["np.ndarray"]) -> None:
+        details = {
+            "direction": event.data.get("Direction", ""),
+            "rule_name": event.data.get("Name", ""),
+        }
+        if self.deps.threat_evaluator is not None:
+            self.deps.threat_evaluator.trigger(
+                camera_id=self.camera_id,
+                trigger_kind="camera:line_cross",
+                initial_frame=frame,
+                details=details,
+            )
+            return
+        # Fallback: no evaluator available (e.g. ML extras not installed).
+        # Keep the legacy direct-to-incident path so we still alert.
         self.deps.alert_engine.handle_behaviour_alert_simple(
             camera_id=self.camera_id,
             alert_type="line_crossing",
-            details={
-                "direction": direction,
-                "rule_name": event.data.get("Name", ""),
-            },
+            details=details,
         )
 
-    def _handle_intrusion(self, event: DahuaEvent, _frame: Optional["np.ndarray"]) -> None:
+    def _handle_intrusion(self, event: DahuaEvent, frame: Optional["np.ndarray"]) -> None:
         action = event.data.get("Action", "")  # Appear|Disappear|Cross|Inside
+        details = {"action": action, "rule_name": event.data.get("Name", "")}
+        if self.deps.threat_evaluator is not None:
+            self.deps.threat_evaluator.trigger(
+                camera_id=self.camera_id,
+                trigger_kind="camera:region_intrusion",
+                initial_frame=frame,
+                details=details,
+            )
+            return
         self.deps.alert_engine.handle_behaviour_alert_simple(
             camera_id=self.camera_id,
             alert_type="intrusion",
-            details={
-                "action": action,
-                "rule_name": event.data.get("Name", ""),
-            },
+            details=details,
         )
 
     def _handle_loitering(self, event: DahuaEvent, _frame: Optional["np.ndarray"]) -> None:

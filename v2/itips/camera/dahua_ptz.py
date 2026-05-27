@@ -30,6 +30,10 @@ logger = logging.getLogger(__name__)
 _DAHUA_COORD_MAX = 8192
 
 
+class PtzCommandError(RuntimeError):
+    """Camera returned 200 with an error body, or non-200 status."""
+
+
 @dataclass(frozen=True)
 class PresetInfo:
     index: int
@@ -96,6 +100,105 @@ class DahuaPTZ:
             ", ".join(p.name for p in self.list_presets()) or "(none)",
         )
         return False
+
+    def save_current_as_preset(
+        self, name: str, *, index: Optional[int] = None,
+    ) -> "PresetInfo":
+        """Write the camera's *current* PTZ position as a named preset.
+
+        Used by the calibration wizard: operator jogs to a sensor's
+        physical location, then this freezes that pose into a preset
+        the dispatcher can recall on every future activation.
+
+        Naming sequence:
+          1. Pick an index — caller's choice, or the next free slot in
+             [1..255] derived from `list_presets()`.
+          2. Save the position via `code=SetPreset` (this is the
+             operation Dahua's web UI emits when you click "Save").
+          3. Set the human-readable name via `configManager.cgi`.
+             Naming is a *separate* call — `SetPreset` only writes the
+             pose, never the label. If naming fails we still return the
+             saved index so the binding can use it numerically.
+        """
+        if index is None:
+            used = {p.index for p in self.list_presets()}
+            index = next((i for i in range(1, 256) if i not in used), None)
+            if index is None:
+                raise PtzCommandError(
+                    "no free preset slots (255 used) — delete an old preset first"
+                )
+        index = int(index)
+        # 1. Freeze the position.
+        self._call({
+            "action": "start",
+            "code":   "SetPreset",
+            "channel": self._channel,
+            "arg1": 0,
+            "arg2": index,
+            "arg3": 0,
+        })
+        # 2. Best-effort name. Some firmwares require the array slot
+        # (index-1), others want the preset id directly. Set both.
+        clean = (name or f"preset_{index}").strip()[:31]
+        name_ok = self._try_set_preset_name(index, clean)
+        if not name_ok:
+            logger.info(
+                "PTZ %s: preset %d saved but name '%s' did not stick — "
+                "camera may not support config-mgr naming",
+                self._endpoint.safe_label(), index, clean,
+            )
+        # 3. Echo back what the camera says it has, so the caller binds
+        # against the truth rather than what we asked for.
+        for preset in self.list_presets():
+            if preset.index == index:
+                return preset
+        # Fallback — the camera doesn't list our new preset yet (some
+        # firmwares lag on getPresets). Synthesize a record.
+        return PresetInfo(index=index, name=clean)
+
+    def _try_set_preset_name(self, index: int, name: str) -> bool:
+        # Dahua's configManager addresses presets either as a 0-based
+        # array slot (PtzPreset[0]) or as a 1-based PresetTitle list.
+        # We try the array form first because that's what we observe
+        # most cameras emit, and fall back silently if it 404s.
+        params = {
+            "action": "setConfig",
+            f"PtzPreset[{index - 1}].Name":     name,
+            f"PtzPreset[{index - 1}].PresetID": str(index),
+        }
+        try:
+            r = self._endpoint.get(
+                "/cgi-bin/configManager.cgi", params=params, timeout=self._timeout,
+            )
+            if r.status_code == 200 and "ok" in (r.text or "").lower():
+                return True
+        except Exception:
+            logger.exception("PTZ %s: preset-name PtzPreset config failed", self._endpoint.safe_label())
+        # Fallback — PresetTitle list form (older firmwares).
+        params2 = {
+            "action": "setConfig",
+            f"PresetTitle[{self._channel - 1}].Name[{index - 1}]": name,
+        }
+        try:
+            r2 = self._endpoint.get(
+                "/cgi-bin/configManager.cgi", params=params2, timeout=self._timeout,
+            )
+            return r2.status_code == 200 and "ok" in (r2.text or "").lower()
+        except Exception:
+            return False
+
+    def delete_preset(self, index: int) -> None:
+        """Drop a preset by index. Used by the wizard when an operator
+        rebinds a zone to a different position — we clean up the old
+        preset so the camera's preset table doesn't grow forever."""
+        self._call({
+            "action": "start",
+            "code":   "ClearPreset",
+            "channel": self._channel,
+            "arg1": 0,
+            "arg2": int(index),
+            "arg3": 0,
+        })
 
     def list_presets(self) -> list[PresetInfo]:
         from re import compile as re_compile
@@ -243,26 +346,78 @@ class DahuaPTZ:
     # ─── internals ────────────────────────────────────────────────────
 
     def _call(self, params: dict) -> None:
-        r = self._endpoint.get("/cgi-bin/ptz.cgi", params=params, timeout=self._timeout)
+        """Send a ptz.cgi command and raise if the camera rejects it.
+
+        Dahua frequently returns HTTP 200 with a body like
+        `Error: Unknown PTZ Code` or `Error: Invalid Channel` when a
+        command lands on a channel that doesn't have a movable lens
+        (common on multi-sensor panoramic + PTZ cameras where only
+        channel 2 is steerable). Status-only checks miss this entirely
+        — the test console gets a green 200, the camera never moves,
+        and there's nothing in the logs to explain why. So we inspect
+        the body too and surface the camera-side message.
+        """
+        r = self._endpoint.get(
+            "/cgi-bin/ptz.cgi", params=params, timeout=self._timeout,
+        )
+        body = (r.text or "").strip()
         if r.status_code != 200:
-            logger.warning(
-                "PTZ %s: %s rejected (HTTP %d %r)",
-                self._endpoint.safe_label(), params, r.status_code, r.text[:80],
-            )
+            msg = f"HTTP {r.status_code} {body[:120]!r}"
+            logger.warning("PTZ %s: %s rejected — %s",
+                           self._endpoint.safe_label(), params, msg)
+            raise PtzCommandError(msg)
+        # Camera-side rejection. Dahua's success body is "OK" (sometimes
+        # with trailing whitespace); anything containing "Error" is a
+        # rejection wrapped in a 200.
+        if "error" in body.lower():
+            msg = body[:160] or "camera returned non-OK body"
+            logger.warning("PTZ %s: %s rejected by camera — %s",
+                           self._endpoint.safe_label(), params, msg)
+            raise PtzCommandError(msg)
 
     def _probe(self) -> None:
-        """Cheap connection check — list presets on a dedicated short timeout."""
-        try:
-            r = self._endpoint.get(
-                "/cgi-bin/ptz.cgi",
-                params={"action": "getPresets", "channel": self._channel},
-                timeout=2.0,
-            )
-            self._connected = r.status_code == 200
-        except Exception:
+        """Probe channel 1, fall back to channel 2 for multi-sensor models.
+
+        On dual-sensor (panoramic + PTZ) Dahua cameras, channel 1 is
+        usually the fixed panoramic lens and channel 2 is the steerable
+        head. `getPresets` against the wrong channel returns 200 OK
+        with body `Error: Bad Channel` (or similar) — so we sniff the
+        body, not just the status.
+        """
+        candidates = (self._channel,) if self._channel != 1 else (1, 2)
+        chosen, last_body = None, ""
+        for ch in candidates:
+            try:
+                r = self._endpoint.get(
+                    "/cgi-bin/ptz.cgi",
+                    params={"action": "getPresets", "channel": ch},
+                    timeout=2.0,
+                )
+            except Exception:
+                continue
+            body = (r.text or "").strip()
+            last_body = body
+            if r.status_code == 200 and "error" not in body.lower():
+                chosen = ch
+                break
+        if chosen is None:
             self._connected = False
-        if self._connected:
-            logger.info("PTZ cam %d ready at %s", self.camera_id, self._endpoint.safe_label())
+            logger.info(
+                "PTZ cam %d: no responsive channel — last body=%r",
+                self.camera_id, last_body[:120],
+            )
+            return
+        if chosen != self._channel:
+            logger.info(
+                "PTZ cam %d: channel %d had no PTZ — using channel %d instead",
+                self.camera_id, self._channel, chosen,
+            )
+            self._channel = chosen
+        self._connected = True
+        logger.info(
+            "PTZ cam %d ready at %s (channel=%d)",
+            self.camera_id, self._endpoint.safe_label(), self._channel,
+        )
 
 
 # ─── factory ──────────────────────────────────────────────────────────
@@ -286,7 +441,18 @@ def build_all() -> dict[int, DahuaPTZ]:
         endpoint = endpoints.get(cam_id)
         if endpoint is None:
             continue
-        out[cam_id] = DahuaPTZ(endpoint, camera_id=cam_id)
+        # Optional pin for multi-sensor models where auto-detect can't
+        # reach channel 2 (firmware quirk, ONVIF permissions, etc.).
+        ch_raw = os.getenv(f"ITIPS_PTZ_{cam_id}_CHANNEL")
+        try:
+            channel = int(ch_raw) if ch_raw else 1
+        except ValueError:
+            logger.warning(
+                "PTZ cam %d: bad ITIPS_PTZ_%d_CHANNEL=%r, falling back to 1",
+                cam_id, cam_id, ch_raw,
+            )
+            channel = 1
+        out[cam_id] = DahuaPTZ(endpoint, camera_id=cam_id, channel=channel)
     return out
 
 

@@ -133,7 +133,18 @@ class DahuaCameraEndpoint:
                 self.host, r.status_code, len(r.content),
             )
             return None
-        buf = np.frombuffer(r.content, dtype=np.uint8)
+        # Trim anything after the JPEG end-of-image marker (FF D9).
+        # Dahua snapshots routinely carry vendor metadata appended
+        # after EOI; libjpeg-turbo logs noisy
+        # `Corrupt JPEG data: N extraneous bytes before marker 0xfe`
+        # warnings to stderr when it sees them. Truncating at EOI
+        # eliminates the warning at the source without changing the
+        # decoded image.
+        content = r.content
+        eoi = content.rfind(b"\xff\xd9")
+        if eoi != -1:
+            content = content[: eoi + 2]
+        buf = np.frombuffer(content, dtype=np.uint8)
         frame = cv2.imdecode(buf, cv2.IMREAD_COLOR)
         if frame is None:
             logger.warning("snapshot %s: cv2.imdecode returned None", self.host)

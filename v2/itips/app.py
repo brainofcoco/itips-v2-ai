@@ -41,10 +41,12 @@ def _build_deps():
     from itips.api.personnel_store import PersonnelStore
     from itips.api.public import PublicApiServer
     from itips.camera.dahua_manager import DahuaManager
+    from itips.camera.rtsp_grabber import build_grabbers
     from itips.evidence.packager import EvidencePackager
     from itips.evidence.recorder import IncidentRecorder
     from itips.runtime.event_worker import WorkerDeps
     from itips.sync.intake import IntakeWriter
+    from itips.webhooks import SubscriberStore, WebhookDispatcher
 
     intake = IntakeWriter(db_path=settings.intake.db_path)
 
@@ -69,6 +71,19 @@ def _build_deps():
         for cam_id in dahua_manager.camera_ids()
     }
 
+    # Continuous RTSP grabbers feed each recorder so the ring buffer
+    # actually contains the pre-event window when an incident opens.
+    # Without this the Dahua-native pipeline only sees event JPEGs and
+    # the saved MP4s are blank.
+    rtsp_grabbers = build_grabbers(
+        settings.cameras.active(),
+        target_fps=settings.evidence.grabber_fps,
+    )
+    for cam_id, grabber in rtsp_grabbers.items():
+        recorder = recorders.get(cam_id)
+        if recorder is not None:
+            grabber.add_consumer(recorder.feed)
+
     alert_engine = AlertEngine(
         intake=intake,
         evidence_packager=evidence_packager,
@@ -90,6 +105,17 @@ def _build_deps():
     )
     openai_validator = _build_openai_validator()
 
+    # Multi-frame decision engine — collapses every primary trigger
+    # (camera line/face/region + sensor activation) into one 15s window
+    # that samples multiple snapshots before deciding INTRUDER vs
+    # AUTHORIZED vs UNCERTAIN. Disabled when no face engine is loaded so
+    # the legacy direct-to-incident path keeps working in barebones dev.
+    threat_evaluator = _build_threat_evaluator(
+        alert_engine=alert_engine,
+        dahua_manager=dahua_manager,
+        face_engine=ml_state.face_engine,
+    )
+
     # Sensor pipeline. Dispatcher works without face_engine — just
     # pans + snapshots without the auto-validate step.
     from itips.runtime.sensor_dispatcher import SensorDispatcher
@@ -104,10 +130,65 @@ def _build_deps():
         event_tap=sensor_event_tap,
         face_engine=ml_state.face_engine,
         openai_validator=openai_validator,
+        threat_evaluator=threat_evaluator,
     )
 
     # AX PRO hub listener — None unless ITIPS_AXPRO_* env are set.
+    # Polls zone_status for slow-signal edges (door magnetOpenStatus).
     axpro_listener = _build_axpro_listener(sensor_dispatcher)
+    # Bind the AX PRO arming state into the evaluator's disarm gate.
+    # Done after listener construction because the listener needs the
+    # dispatcher and the dispatcher needs the evaluator; without a
+    # listener the evaluator stays in default-armed mode (fail-safe).
+    if threat_evaluator is not None and axpro_listener is not None:
+        threat_evaluator.set_is_armed_fn(lambda: axpro_listener.is_armed)
+
+    # AX PRO real-time event stream — multipart long-poll on
+    # /ISAPI/Event/notification/alertStream. Carries cidEvent /
+    # zoneEvent payloads that zone_status polling misses (PIR pulses,
+    # tamper, low-battery, etc.). Shares the listener's authenticated
+    # session.
+    axpro_alertstream = _build_axpro_alertstream(axpro_listener, sensor_dispatcher)
+    # Hub-control helper for the dashboard's hub-admin routes.
+    axpro_admin = _build_axpro_admin(axpro_listener)
+    # Auto-sound the hub siren on every confirmed incident (PRD §3.3
+    # Stage 3). Gated behind ITIPS_AXPRO_AUTO_SIREN=true so a dev
+    # environment doesn't blast a live site on every test alert.
+    _wire_auto_siren(alert_engine, axpro_admin)
+
+    # Outbound webhooks — fan AlertEngine + validator + sensor events
+    # out to registered subscriber URLs. Always built (so the dashboard
+    # CRUD works); the worker threads simply sit idle when no
+    # subscribers exist.
+    webhook_store = SubscriberStore(db_path=settings.webhooks.db_path)
+    webhook_dispatcher = WebhookDispatcher(
+        store=webhook_store,
+        timeout_s=settings.webhooks.timeout_s,
+        workers=settings.webhooks.workers,
+        max_queue=settings.webhooks.max_queue,
+    ) if settings.webhooks.enabled else None
+    if webhook_dispatcher is not None:
+        webhook_dispatcher.bind_alert_engine(alert_engine)
+        webhook_dispatcher.bind_openai_validator(openai_validator)
+        webhook_dispatcher.bind_sensor_dispatcher(sensor_dispatcher)
+        # Final decision-window verdict — what alarm panels and the hub
+        # should subscribe to for the clean "this is what we decided".
+        webhook_dispatcher.bind_threat_evaluator(
+            threat_evaluator, tenant=settings.tenant,
+        )
+        # AX PRO raw-stream firehose — sensor.event already covers
+        # dispatched activations; this lets a subscriber consume
+        # cidEvents (low-battery, tamper, arm/disarm) that don't enter
+        # the dispatcher.
+        if axpro_alertstream is not None:
+            from itips.webhooks.events import WebhookEvent
+            def _raw_axpro(data):
+                webhook_dispatcher.dispatch(WebhookEvent(
+                    kind="sensor.event",
+                    data={"axpro_raw": data},
+                    site_id=settings.tenant.site_id or None,
+                ))
+            axpro_alertstream.add_raw_listener(_raw_axpro)
 
     deps = WorkerDeps(
         alert_engine=alert_engine,
@@ -119,6 +200,7 @@ def _build_deps():
         plate_engine=ml_state.plate_engine,
         behavior_engine=ml_state.behavior_engine,
         openai_validator=openai_validator,
+        threat_evaluator=threat_evaluator,
     )
 
     public_api = PublicApiServer(
@@ -136,7 +218,11 @@ def _build_deps():
         sensor_dispatcher=sensor_dispatcher,
         sensor_event_tap=sensor_event_tap,
         axpro_listener=axpro_listener,
+        axpro_alertstream=axpro_alertstream,
+        axpro_admin=axpro_admin,
         openai_validator=openai_validator,
+        webhook_store=webhook_store,
+        webhook_dispatcher=webhook_dispatcher,
     )
     inbound_api = InboundApiServer(
         dahua_manager=dahua_manager,
@@ -152,12 +238,48 @@ def _build_deps():
         public_api,
         inbound_api,
     ]
+    # RTSP grabbers must outlive the orchestrator's worker loop — added
+    # to services so they get the same start()/stop() lifecycle.
+    services.extend(rtsp_grabbers.values())
+    if threat_evaluator is not None:
+        services.append(threat_evaluator)
     if ml_state.embedding_store is not None:
         services.append(ml_state.embedding_store)
     services.append(sensor_dispatcher)
     if axpro_listener is not None:
         services.append(axpro_listener)
+    if axpro_alertstream is not None:
+        services.append(axpro_alertstream)
+    services.append(webhook_store)
+    if webhook_dispatcher is not None:
+        services.append(webhook_dispatcher)
     return deps, services
+
+
+def _build_threat_evaluator(*, alert_engine, dahua_manager, face_engine):
+    """Return a started ThreatEvaluator, or None when prerequisites are
+    missing. Settings-disabled or no face engine ⇒ None ⇒ event_worker
+    and sensor_dispatcher fall back to their legacy direct paths."""
+    logger = logging.getLogger("itips.app.threat")
+    if not settings.threat_evaluator.enabled:
+        logger.info("ThreatEvaluator disabled by settings — direct alert path active")
+        return None
+    if face_engine is None:
+        logger.info("ThreatEvaluator disabled — no face engine loaded "
+                    "(install ml extras to enable)")
+        return None
+    try:
+        from itips.runtime.threat_evaluator import ThreatEvaluator
+    except Exception:
+        logger.exception("ThreatEvaluator import failed")
+        return None
+    return ThreatEvaluator(
+        alert_engine=alert_engine,
+        dahua_manager=dahua_manager,
+        face_engine=face_engine,
+        window_seconds=settings.threat_evaluator.window_seconds,
+        sample_interval_s=settings.threat_evaluator.sample_interval_s,
+    )
 
 
 def _build_openai_validator():
@@ -186,6 +308,65 @@ def _build_openai_validator():
         default_model=model, enabled=True,
         max_tokens_per_hour=max_tokens,
         timeout_s=timeout_s,
+    )
+
+
+def _build_axpro_alertstream(listener, dispatcher):
+    """Returns None unless the zone-status listener is wired. The
+    alertStream shares the listener's authenticated hikaxpro session so
+    we don't open a second login on the hub."""
+    if listener is None:
+        return None
+    logger = logging.getLogger("itips.app.axpro")
+    try:
+        from itips.sensors.axpro_alertstream import AxProAlertStream
+    except Exception:
+        logger.exception("AxProAlertStream import failed")
+        return None
+    return AxProAlertStream(
+        host=listener.host,
+        client_supplier=listener.get_client,
+        dispatcher=dispatcher,
+    )
+
+
+def _build_axpro_admin(listener):
+    """Returns None unless the zone-status listener is wired."""
+    if listener is None:
+        return None
+    from itips.sensors.axpro_admin import AxProAdmin
+    return AxProAdmin(host=listener.host, client_supplier=listener.get_client)
+
+
+def _wire_auto_siren(alert_engine, axpro_admin) -> None:
+    """Hook AlertEngine's lifecycle so a confirmed incident auto-sounds
+    the hub siren. Opt-in via ITIPS_AXPRO_AUTO_SIREN=true; default off
+    so a dev environment doesn't blast a live site every time you fire
+    a synthetic event."""
+    import os
+    if axpro_admin is None or alert_engine is None:
+        return
+    if (os.environ.get("ITIPS_AXPRO_AUTO_SIREN") or "").lower() not in {"1", "true", "yes"}:
+        return
+    sub_id = int(os.environ.get("ITIPS_AXPRO_AUTO_SIREN_SUBSYS") or "1")
+    logger = logging.getLogger("itips.app.axpro")
+
+    def _on_lifecycle(stage: str, info: dict) -> None:
+        if stage != "confirmed":
+            return
+        try:
+            axpro_admin.start_siren(sub_id)
+            logger.warning(
+                "auto-siren: started on subsys %d (incident %s, signal=%s)",
+                sub_id, info.get("incident_id"), info.get("signal"),
+            )
+        except Exception:
+            logger.exception("auto-siren: start_siren failed")
+
+    alert_engine.add_lifecycle_listener(_on_lifecycle)
+    logger.info(
+        "Auto-siren wired — will sound subsys %d on every confirmed incident",
+        sub_id,
     )
 
 

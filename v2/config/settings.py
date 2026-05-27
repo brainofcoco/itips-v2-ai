@@ -88,6 +88,10 @@ class EvidenceConfig:
     # PRD §2.3: 15-min pre, 30-min post. Operator can shrink for dev.
     pre_event_seconds: int = field(default_factory=lambda: _env_int("ITIPS_PRE_EVENT_BUFFER_SECONDS", 900))
     post_event_seconds: int = field(default_factory=lambda: _env_int("ITIPS_POST_EVENT_BUFFER_SECONDS", 1800))
+    # Continuous RTSP grabber that fills the IncidentRecorder ring buffer.
+    # Without this the Jetson has no live frames in the Dahua-native
+    # architecture and saved pre/post MP4s come out blank.
+    grabber_fps: float = field(default_factory=lambda: _env_float("ITIPS_EVIDENCE_GRABBER_FPS", 8.0))
 
     @property
     def hmac_key_hex(self) -> str:
@@ -99,6 +103,32 @@ class IncidentConfig:
     confirmation_dwell_seconds: float = field(default_factory=lambda: _env_float("ITIPS_INCIDENT_CONFIRMATION_DWELL_SECONDS", 5.0))
     confirmation_window_seconds: float = field(default_factory=lambda: _env_float("ITIPS_INCIDENT_CONFIRMATION_WINDOW_SECONDS", 30.0))
     idle_timeout_seconds: float = field(default_factory=lambda: _env_float("ITIPS_INCIDENT_IDLE_TIMEOUT_SECONDS", 15.0))
+
+
+@dataclass(frozen=True)
+class ThreatEvaluatorConfig:
+    """Multi-frame decision window that gates incidents on face recognition.
+
+    Disabled when no face engine is loaded — every camera/sensor trigger
+    then falls back to the legacy direct-to-incident path.
+    """
+
+    enabled: bool = field(default_factory=lambda: _env_bool("ITIPS_THREAT_EVALUATOR_ENABLED", True))
+    window_seconds: float = field(default_factory=lambda: _env_float("ITIPS_THREAT_EVALUATOR_WINDOW_S", 15.0))
+    sample_interval_s: float = field(default_factory=lambda: _env_float("ITIPS_THREAT_EVALUATOR_SAMPLE_S", 1.0))
+
+
+@dataclass(frozen=True)
+class WebhookConfig:
+    """Outbound webhook delivery (see itips/webhooks/)."""
+
+    enabled: bool = field(default_factory=lambda: _env_bool("ITIPS_WEBHOOKS_ENABLED", True))
+    db_path: Path = field(default_factory=lambda: Path(_env(
+        "ITIPS_WEBHOOKS_DB_PATH", "/opt/itips/var/webhooks.sqlite",
+    )))
+    timeout_s: float = field(default_factory=lambda: _env_float("ITIPS_WEBHOOKS_TIMEOUT_S", 10.0))
+    workers: int = field(default_factory=lambda: _env_int("ITIPS_WEBHOOKS_WORKERS", 2))
+    max_queue: int = field(default_factory=lambda: _env_int("ITIPS_WEBHOOKS_MAX_QUEUE", 1000))
 
 
 @dataclass(frozen=True)
@@ -126,6 +156,8 @@ class Settings:
     evidence: EvidenceConfig = field(default_factory=EvidenceConfig)
     incident: IncidentConfig = field(default_factory=IncidentConfig)
     api: ApiConfig = field(default_factory=ApiConfig)
+    webhooks: WebhookConfig = field(default_factory=WebhookConfig)
+    threat_evaluator: ThreatEvaluatorConfig = field(default_factory=ThreatEvaluatorConfig)
 
 
 # Singleton — components import this, never re-instantiate.

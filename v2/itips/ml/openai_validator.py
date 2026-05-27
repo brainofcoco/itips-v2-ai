@@ -20,7 +20,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional
 
 if TYPE_CHECKING:
     import numpy as np
@@ -102,6 +102,19 @@ class OpenAIValidator:
         self._token_lock = threading.Lock()
         # Audit ring buffer for the dashboard.
         self._recent: collections.deque = collections.deque(maxlen=100)
+        # Out-of-band listeners (webhooks, automation). Invoked
+        # synchronously after a result is parsed; must not block.
+        self._validation_listeners: list[
+            Callable[[ValidationResult, dict[str, Any]], None]
+        ] = []
+
+    def add_validation_listener(
+        self, listener: Callable[["ValidationResult", dict[str, Any]], None],
+    ) -> None:
+        """Subscribe to every parsed validator verdict. Listener is
+        called with (result, context) — the same context the caller
+        passed to validate()."""
+        self._validation_listeners.append(listener)
 
     # ─── state ────────────────────────────────────────────────────────
 
@@ -179,6 +192,7 @@ class OpenAIValidator:
             if cached is not None:
                 cached.cached = True
                 self._record(cached)
+                self._notify_validation(cached, context)
                 return cached
 
         # Quota check after cooldown (so cached hits don't count against quota).
@@ -239,7 +253,17 @@ class OpenAIValidator:
         logger.info("OpenAIValidator scenario=%s verdict=%s category=%s conf=%.2f tokens=%d",
                     scenario, result.verdict, result.category,
                     result.confidence, result.tokens_used)
+        self._notify_validation(result, context)
         return result
+
+    def _notify_validation(
+        self, result: "ValidationResult", context: dict[str, Any],
+    ) -> None:
+        for listener in self._validation_listeners:
+            try:
+                listener(result, context)
+            except Exception:
+                logger.exception("openai validation listener failed")
 
     # ─── internals ────────────────────────────────────────────────────
 

@@ -10,7 +10,7 @@ import logging
 import queue
 import threading
 import time
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from itips.sensors.sensor_event import SensorEvent, SensorEventTap
 from itips.sensors.sensor_map import SensorMap
@@ -30,6 +30,7 @@ class SensorDispatcher(threading.Thread):
         event_tap: SensorEventTap,
         face_engine=None,
         openai_validator=None,
+        threat_evaluator=None,
         pan_settle_s: float = 2.0,
         snapshot_timeout_s: float = 4.0,
         per_zone_cooldown_s: float = 10.0,
@@ -42,12 +43,24 @@ class SensorDispatcher(threading.Thread):
         self._event_tap = event_tap
         self._face_engine = face_engine
         self._openai_validator = openai_validator
+        # When wired, sensor activations route the captured snapshot into
+        # the multi-frame ThreatEvaluator instead of a one-shot face check.
+        self._threat_evaluator = threat_evaluator
         self._pan_settle_s = float(pan_settle_s)
         self._snapshot_timeout_s = float(snapshot_timeout_s)
         self._per_zone_cooldown_s = float(per_zone_cooldown_s)
         self._queue: queue.Queue[SensorEvent] = queue.Queue(maxsize=queue_size)
         self._stop_event = threading.Event()
         self._last_dispatch: dict[int, float] = {}
+        self._event_listeners: list[Callable[[dict[str, Any]], None]] = []
+
+    def add_event_listener(
+        self, listener: Callable[[dict[str, Any]], None],
+    ) -> None:
+        """Subscribe to raw sensor activations. Fires once per accepted
+        event before the per-zone cooldown skips the PTZ slew, so
+        downstream alarm panels still hear every trigger."""
+        self._event_listeners.append(listener)
 
     def start(self) -> None:
         # Idempotent — orchestrator's start-all loop may call twice.
@@ -85,6 +98,10 @@ class SensorDispatcher(threading.Thread):
         logger.info("SensorDispatcher stopped")
 
     def _process(self, event: SensorEvent) -> None:
+        # Fan out the raw activation to any webhook / automation
+        # listeners before the cooldown gate, so a chatty zone still
+        # surfaces every trigger downstream.
+        self._notify_listeners(event)
         # Always log the raw alarm — audit trail even when the rest fails.
         self._alert_engine.handle_behaviour_alert_simple(
             camera_id=0,
@@ -153,7 +170,28 @@ class SensorDispatcher(threading.Thread):
             })
             return
 
-        outcome = self._validate_face(event=event, mapping=mapping, frame=frame)
+        if self._threat_evaluator is not None:
+            # Hand the captured frame to the multi-frame evaluator and
+            # return immediately — the final verdict is produced later by
+            # the evaluator's worker thread.
+            self._threat_evaluator.trigger(
+                camera_id=mapping.camera_id,
+                trigger_kind=f"sensor:zone-{event.zone_id}",
+                initial_frame=frame,
+                details={
+                    "zone_id": event.zone_id,
+                    "zone_name": event.zone_name,
+                    "sensor_type": event.event_type,
+                    "preset_name": mapping.preset_name,
+                },
+            )
+            outcome = {
+                "verdict": "evaluating",
+                "camera_id": mapping.camera_id,
+                "preset_name": mapping.preset_name,
+            }
+        else:
+            outcome = self._validate_face(event=event, mapping=mapping, frame=frame)
         self._event_tap.publish(event, outcome=outcome)
 
     def _validate_via_llm(self, scenario, frame, context, *,
@@ -321,6 +359,18 @@ class SensorDispatcher(threading.Thread):
             "camera_id": mapping.camera_id,
             "ai_summary": v.summary if v else None,
         }
+
+
+    def _notify_listeners(self, event: SensorEvent) -> None:
+        if not self._event_listeners:
+            return
+        payload = event.to_dict()
+        for listener in self._event_listeners:
+            try:
+                listener(payload)
+            except Exception:
+                logger.exception("sensor event listener failed (zone=%d)",
+                                 event.zone_id)
 
 
 def _encode_frame_jpeg(frame) -> Optional[bytes]:

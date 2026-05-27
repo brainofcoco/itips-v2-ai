@@ -24,7 +24,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from itips.sync.intake import IntakeWriter
 from itips.sync.schema import Priority
@@ -75,6 +75,11 @@ class AlertEngine:
         self._lock = threading.Lock()
         self._janitor_stop = threading.Event()
         self._janitor: Optional[threading.Thread] = None
+        # Listener hooks — out-of-band consumers (webhook dispatcher,
+        # local automation) subscribe here. Callbacks run synchronously
+        # on the producer's thread, so they must not block.
+        self._event_listeners: list[Callable[[dict[str, Any]], None]] = []
+        self._lifecycle_listeners: list[Callable[[str, dict[str, Any]], None]] = []
 
     # ─── lifecycle ────────────────────────────────────────────────
 
@@ -89,6 +94,28 @@ class AlertEngine:
 
     def register_recorder(self, camera_id: int, recorder: object) -> None:
         self._recorders[camera_id] = recorder
+
+    def add_event_listener(
+        self, listener: Callable[[dict[str, Any]], None],
+    ) -> None:
+        """Subscribe to every record this engine publishes.
+
+        The listener receives the same dict appended to history — so
+        downstream consumers (webhooks, on-prem automation) see exactly
+        what the SSE feed shows. Must not block.
+        """
+        self._event_listeners.append(listener)
+
+    def add_lifecycle_listener(
+        self, listener: Callable[[str, dict[str, Any]], None],
+    ) -> None:
+        """Subscribe to incident open / promote / finalize transitions.
+
+        Stage strings: 'preliminary', 'confirmed', 'finalized'. The info
+        dict carries incident_id, camera_id, signal (where applicable),
+        and tenant identifiers.
+        """
+        self._lifecycle_listeners.append(listener)
 
     def feed_frame(self, camera_id: int, frame) -> None:
         rec = self._recorders.get(camera_id)
@@ -320,6 +347,15 @@ class AlertEngine:
             "timestamp_utc": now_iso(),
         })
         logger.info("cam%d: incident %s opened (preliminary)", camera_id, incident_id)
+        self._notify_lifecycle("preliminary", {
+            "incident_id": incident_id,
+            "camera_id": camera_id,
+            "site_id": self._tenant.site_id or None,
+            "operator_id": self._tenant.operator_id or None,
+            "device_id": self._tenant.device_id or None,
+            "stage": STAGE_PRELIMINARY,
+            "timestamp_utc": now_iso(),
+        })
         return state
 
     def _promote(self, state: _IncidentState, *, signal: str) -> None:
@@ -354,6 +390,16 @@ class AlertEngine:
         })
         logger.info("cam%d: incident %s CONFIRMED via %s",
                     state.camera_id, state.incident_id, signal)
+        self._notify_lifecycle("confirmed", {
+            "incident_id": state.incident_id,
+            "camera_id": state.camera_id,
+            "site_id": self._tenant.site_id or None,
+            "operator_id": self._tenant.operator_id or None,
+            "device_id": self._tenant.device_id or None,
+            "stage": STAGE_CONFIRMED,
+            "signal": signal,
+            "timestamp_utc": now_iso(),
+        })
 
     def _packager_dir(self, incident_id: str):
         store_root = getattr(self._packager, "store_root", None)
@@ -387,6 +433,22 @@ class AlertEngine:
                           payload=record, incident_id=incident_id)
         if incident_id:
             self._packager.attach_event(incident_id, record)
+        self._notify_event(record)
+
+    def _notify_event(self, record: dict[str, Any]) -> None:
+        for listener in self._event_listeners:
+            try:
+                listener(record)
+            except Exception:
+                logger.exception("alert event listener failed (kind=%s)",
+                                 record.get("kind"))
+
+    def _notify_lifecycle(self, stage: str, info: dict[str, Any]) -> None:
+        for listener in self._lifecycle_listeners:
+            try:
+                listener(stage, info)
+            except Exception:
+                logger.exception("alert lifecycle listener failed (stage=%s)", stage)
 
     # ─── janitor ──────────────────────────────────────────────────
 
@@ -435,3 +497,13 @@ class AlertEngine:
         )
         logger.info("cam%d: incident %s finalised (%s)",
                     state.camera_id, state.incident_id, state.stage)
+        self._notify_lifecycle("finalized", {
+            "incident_id": state.incident_id,
+            "camera_id": state.camera_id,
+            "site_id": self._tenant.site_id or None,
+            "operator_id": self._tenant.operator_id or None,
+            "device_id": self._tenant.device_id or None,
+            "stage": state.stage,
+            "confirmation_signals": sorted(state.confirmation_signals),
+            "timestamp_utc": now_iso(),
+        })

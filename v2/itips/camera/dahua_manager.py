@@ -63,13 +63,19 @@ class DahuaManager:
                                  cam_id, endpoint.safe_label())
 
     def _build_one(self, cam_id: int, endpoint: DahuaCameraEndpoint) -> CameraClients:
+        import os
+        ch_raw = os.getenv(f"ITIPS_PTZ_{cam_id}_CHANNEL")
+        try:
+            ptz_channel = int(ch_raw) if ch_raw else 1
+        except ValueError:
+            ptz_channel = 1
         clients = CameraClients(
             camera_id=cam_id,
             endpoint=endpoint,
             face_db=DahuaFaceDB(endpoint),
             plate_db=DahuaPlateDB(endpoint),
             deterrence=DahuaDeterrence(endpoint),
-            ptz=DahuaPTZ(endpoint, camera_id=cam_id),
+            ptz=DahuaPTZ(endpoint, camera_id=cam_id, channel=ptz_channel),
         )
         try:
             group_id = clients.face_db.ensure_workers_group(self._workers_group_name)

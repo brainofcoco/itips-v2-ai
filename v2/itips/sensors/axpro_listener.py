@@ -67,6 +67,10 @@ class AxProListener(threading.Thread):
         self._is_armed = False
         self._connected = False
         self._last_error: Optional[str] = None
+        # First successful poll is logged at INFO so operators can see
+        # at a glance which zones the hub exposes (and whether their
+        # initial alarm flag is what they expect).
+        self._first_poll_logged = False
 
     # ─── lifecycle ────────────────────────────────────────────────────
 
@@ -108,6 +112,33 @@ class AxProListener(threading.Thread):
     @property
     def last_error(self) -> Optional[str]:
         return self._last_error
+
+    def get_client(self):
+        """Return the authenticated hikaxpro client (or None if not yet
+        connected). Sibling services — `AxProAlertStream`,
+        `AxProAdmin` — share this session rather than opening their own."""
+        return self._client
+
+    def alarm_state_snapshot(self) -> dict[int, bool]:
+        """Last-seen alarm flag per zone — what the edge detector uses
+        to decide if an event is a fresh false→true transition."""
+        return dict(self._alarm_state)
+
+    def fetch_raw_zone_status(self) -> dict:
+        """Pull the hub's raw zone payload for diagnostic display.
+
+        Operators use this when a real sensor activation isn't showing
+        up in the events feed — comparing raw hub state against
+        `alarm_state_snapshot()` shows whether the issue is field-name
+        drift in the hub response, an arming-mode block, or a true
+        signal-path break.
+        """
+        if self._client is None:
+            return {"error": "not connected", "last_error": self._last_error}
+        try:
+            return self._client.zone_status() or {}
+        except Exception as exc:  # noqa: BLE001
+            return {"error": f"{exc.__class__.__name__}: {exc}"}
 
     # ─── polling loop ─────────────────────────────────────────────────
 
@@ -155,7 +186,21 @@ class AxProListener(threading.Thread):
             self._last_error = f"hikaxpro not installed: {exc}"
             return False
         try:
-            self._client = HikAxPro(self._host, self._username, self._password)
+            client = HikAxPro(self._host, self._username, self._password)
+            # HikAxPro.__init__ only stores credentials; the session-id
+            # capabilities aren't fetched until connect() runs. Without
+            # this call the first zone_status() trips on
+            # `NoneType.session_id_version` inside the library.
+            if not client.connect():
+                self._client = None
+                self._connected = False
+                self._last_error = "login rejected (connect() returned False)"
+                logger.warning(
+                    "AxProListener: login rejected by %s — check ITIPS_AXPRO_USERNAME/PASSWORD",
+                    self._host,
+                )
+                return False
+            self._client = client
             self._connected = True
             self._last_error = None
             logger.info("AxProListener: connected to %s", self._host)
@@ -198,13 +243,15 @@ class AxProListener(threading.Thread):
     def _poll_zones(self) -> None:
         assert self._client is not None
         data = self._client.zone_status() or {}
+        zones_seen: list[tuple[int, str, bool]] = []
         for entry in (data.get("ZoneList") or []):
             zone = entry.get("Zone", {}) if isinstance(entry, dict) else {}
             try:
                 zone_id = int(zone.get("id"))
             except (TypeError, ValueError):
                 continue
-            alarm = bool(zone.get("alarm", False))
+            alarm = _zone_in_alarm(zone)
+            zones_seen.append((zone_id, str(zone.get("name") or ""), alarm))
             prev = self._alarm_state.get(zone_id)
             # First sighting: just record. Don't replay alarms that
             # were already firing when the listener booted.
@@ -216,6 +263,17 @@ class AxProListener(threading.Thread):
                 self._fire_alarm(zone_id, zone)
             elif prev and not alarm:
                 logger.debug("AxProListener: zone %d cleared", zone_id)
+
+        if not self._first_poll_logged and zones_seen:
+            self._first_poll_logged = True
+            summary = ", ".join(
+                f"z{zid}={'ALARM' if al else 'idle'}({name})"
+                for zid, name, al in zones_seen
+            )
+            logger.info(
+                "AxProListener: first poll OK — %d zone(s): %s",
+                len(zones_seen), summary,
+            )
 
     def _fire_alarm(self, zone_id: int, zone: dict) -> None:
         detector_type = str(zone.get("detectorType") or "")
@@ -235,3 +293,27 @@ class AxProListener(threading.Thread):
             self._dispatcher.dispatch(event)
         except Exception:
             logger.exception("AxProListener: dispatch crashed for zone=%d", zone_id)
+
+
+def _zone_in_alarm(zone: dict) -> bool:
+    """Detect 'this zone is currently triggered' across AX PRO firmwares.
+
+    Older firmwares expose a boolean `alarm` field; newer ones moved to
+    a `status` string with values like `trigger`, `intrusionTrigger`,
+    `tamper`, `restored` (where `restored` means 'back to idle'). We
+    accept either path so a firmware update on the hub doesn't silently
+    stop sensor events from firing.
+    """
+    if "alarm" in zone:
+        try:
+            return bool(zone.get("alarm"))
+        except Exception:
+            pass
+    raw_status = str(zone.get("status") or "").lower()
+    if not raw_status:
+        return False
+    if raw_status in {"trigger", "intrusiontrigger", "alarm", "alarming"}:
+        return True
+    if "trigger" in raw_status or "alarm" in raw_status:
+        return True
+    return False

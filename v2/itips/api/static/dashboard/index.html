@@ -170,6 +170,20 @@
       <span class="muted" id="sensor-hub-host"></span>
       <span class="spacer"></span>
     </div>
+
+    <!-- AX PRO siren control. The big red SOUND ALARM button is the
+         manual panic surface; Silence clears it; Test fires a 2s burst
+         that auto-stops via try/finally on the server. -->
+    <div class="toolbar" id="siren-toolbar">
+      <strong>Siren:</strong>
+      <button id="siren-sound" class="danger">🔔 Sound alarm</button>
+      <button id="siren-silence">Silence</button>
+      <button id="siren-test">Test (2 s)</button>
+      <span class="muted" style="margin-left:8px">Sub-system</span>
+      <input id="siren-subid" type="number" min="1" max="16" value="1" style="width:60px" />
+      <span class="spacer"></span>
+      <span id="siren-status" class="pill pill-idle">siren: —</span>
+    </div>
     <div class="toolbar">
       <span class="muted">Add a sensor → PTZ binding</span>
       <input id="sensor-zone-id" type="number" min="1" placeholder="zone_id (from AX PRO hub)" />
@@ -211,6 +225,80 @@
           intruder, unverified, cooldown, unmapped, pan_failed, …
         </p>
         <ul id="sensor-events" class="alerts"></ul>
+      </div>
+    </div>
+
+    <!-- ── Calibration wizard ─────────────────────────────────── -->
+    <!-- Per-zone "aim a camera at the sensor location" flow.       -->
+    <!-- See sensors.js → bindCalibrationWizard for the runtime.    -->
+    <h3 style="margin-top:24px">Calibration wizard</h3>
+    <p class="muted">
+      Map each AX PRO sensor zone to a camera + position so the
+      dispatcher pans to where the sensor physically is. Pick a zone,
+      drive the camera with the jog pad until the sensor's location
+      is in frame, then Save &amp; bind in one click. Test pan
+      verifies the binding by panning away then back.
+    </p>
+    <div class="toolbar">
+      <label>Zone <select id="calib-zone"></select></label>
+      <label>Camera <select id="calib-camera"></select></label>
+      <button id="calib-refresh-zones">Refresh zones</button>
+      <span class="spacer"></span>
+      <span id="calib-status" class="pill pill-idle">pick a zone</span>
+    </div>
+    <div class="calib-layout">
+      <div class="calib-feed">
+        <img id="calib-feed-img" alt="live feed" src="" />
+        <div class="calib-feed-overlay muted" id="calib-feed-hint">
+          select a camera to preview
+        </div>
+      </div>
+      <div class="calib-controls">
+        <h4>Jog pad</h4>
+        <div class="toolbar">
+          <label>Speed
+            <input id="calib-speed" type="number" min="1" max="8" value="4" />
+          </label>
+        </div>
+        <div class="jog-pad">
+          <button data-calib-dir="left_up">↖</button>
+          <button data-calib-dir="up">↑</button>
+          <button data-calib-dir="right_up">↗</button>
+          <button data-calib-dir="left">←</button>
+          <button data-calib-dir="zoom_wide" class="wide">−</button>
+          <button data-calib-dir="right">→</button>
+          <button data-calib-dir="left_down">↙</button>
+          <button data-calib-dir="down">↓</button>
+          <button data-calib-dir="right_down">↘</button>
+        </div>
+        <div class="toolbar">
+          <button data-calib-dir="zoom_tele" class="primary">Zoom in</button>
+          <button data-calib-dir="zoom_wide">Zoom out</button>
+        </div>
+
+        <h4 style="margin-top:14px">Save</h4>
+        <div class="toolbar">
+          <input id="calib-name" placeholder="preset name (defaults to zone_<id>)" />
+        </div>
+        <div class="toolbar">
+          <input id="calib-description" placeholder="description (optional)" />
+          <select id="calib-sensor-type">
+            <option value="">— sensor type —</option>
+            <option value="doorContact">doorContact</option>
+            <option value="PIR">PIR</option>
+            <option value="vibration">vibration</option>
+            <option value="pircam">pircam</option>
+            <option value="smoke">smoke</option>
+          </select>
+        </div>
+        <div class="toolbar">
+          <button id="calib-save" class="primary">💾 Save &amp; bind</button>
+          <button id="calib-test">🔁 Test pan</button>
+          <button id="calib-unbind">Unbind</button>
+        </div>
+        <div class="toolbar">
+          <span id="calib-binding" class="muted">no binding</span>
+        </div>
       </div>
     </div>
   </section>
@@ -365,6 +453,7 @@
         <div class="toolbar">
           <button data-dir="zoom_tele" id="jog-zoom-in" class="primary">Zoom in</button>
           <button data-dir="zoom_wide" id="jog-zoom-out">Zoom out</button>
+          <span id="jog-status" class="pill pill-idle">idle</span>
         </div>
 
         <h3>Event simulator</h3>

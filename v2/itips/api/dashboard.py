@@ -52,7 +52,11 @@ def register_dashboard(
     sensor_dispatcher=None,
     sensor_event_tap=None,
     axpro_listener=None,
+    axpro_alertstream=None,
+    axpro_admin=None,
     openai_validator=None,
+    webhook_store=None,
+    webhook_dispatcher=None,
 ) -> None:
     """Wire all dashboard routes onto the given Flask app.
 
@@ -882,6 +886,155 @@ def register_dashboard(
             "should_escalate": result.should_escalate,
         })
 
+    # ─── outbound webhooks ─────────────────────────────────────────
+    # Subscriber CRUD for the push-event system. Consumers register a
+    # URL + secret + event filter and receive HMAC-signed POSTs as
+    # alerts/validator-verdicts/sensor events happen, instead of polling
+    # /api/alerts/latest. See docs/WEBHOOKS.md for the payload schema.
+
+    @app.get("/api/webhooks/event-kinds")
+    def webhooks_event_kinds():  # noqa: ANN202
+        from itips.webhooks.events import EVENT_KINDS
+        return jsonify({
+            "ok": True,
+            "kinds": [{"name": k, "description": v}
+                      for k, v in EVENT_KINDS.items()],
+        })
+
+    @app.get("/api/webhooks/subscribers")
+    def webhooks_list():  # noqa: ANN202
+        if webhook_store is None:
+            return jsonify({"ok": False, "error": "webhooks not wired"}), 503
+        return jsonify({
+            "ok": True,
+            "subscribers": [s.to_public() for s in webhook_store.list()],
+        })
+
+    @app.post("/api/webhooks/subscribers")
+    def webhooks_create():  # noqa: ANN202
+        from itips.webhooks.events import EVENT_KINDS
+        from itips.webhooks.signing import generate_secret
+
+        if webhook_store is None:
+            return jsonify({"ok": False, "error": "webhooks not wired"}), 503
+        body = request.get_json(silent=True) or {}
+        url = str(body.get("url") or "").strip()
+        if not url.startswith(("http://", "https://")):
+            return jsonify({"ok": False,
+                            "error": "url must start with http:// or https://"}), 400
+        raw_filter = body.get("event_filter") or ["*"]
+        if not isinstance(raw_filter, list) or not raw_filter:
+            return jsonify({"ok": False,
+                            "error": "event_filter must be a non-empty list"}), 400
+        # Validate each requested kind so subscribers can't register
+        # for a kind that will never fire (silent misconfiguration).
+        unknown = [k for k in raw_filter
+                   if k != "*" and k not in EVENT_KINDS]
+        if unknown:
+            return jsonify({
+                "ok": False,
+                "error": "unknown event kind(s)",
+                "unknown": unknown,
+                "known": sorted(EVENT_KINDS.keys()),
+            }), 400
+        secret = (str(body.get("secret") or "").strip()
+                  or generate_secret())
+        description = str(body.get("description") or "").strip()
+        enabled = bool(body.get("enabled", True))
+        sub = webhook_store.create(
+            url=url, secret=secret, event_filter=raw_filter,
+            description=description, enabled=enabled,
+        )
+        # The secret is returned ONCE here so the operator can copy it
+        # into the consumer service. Subsequent GETs omit it.
+        return jsonify({"ok": True, "subscriber": sub.to_public(include_secret=True)}), 201
+
+    @app.get("/api/webhooks/subscribers/<sub_id>")
+    def webhooks_get(sub_id: str):  # noqa: ANN202
+        if webhook_store is None:
+            return jsonify({"ok": False, "error": "webhooks not wired"}), 503
+        sub = webhook_store.get(sub_id)
+        if sub is None:
+            return jsonify({"ok": False, "error": "not found"}), 404
+        return jsonify({"ok": True, "subscriber": sub.to_public()})
+
+    @app.patch("/api/webhooks/subscribers/<sub_id>")
+    def webhooks_patch(sub_id: str):  # noqa: ANN202
+        from itips.webhooks.events import EVENT_KINDS
+
+        if webhook_store is None:
+            return jsonify({"ok": False, "error": "webhooks not wired"}), 503
+        body = request.get_json(silent=True) or {}
+        patch = {}
+        if "url" in body:
+            url = str(body["url"] or "").strip()
+            if not url.startswith(("http://", "https://")):
+                return jsonify({"ok": False,
+                                "error": "url must start with http:// or https://"}), 400
+            patch["url"] = url
+        if "event_filter" in body:
+            filt = body["event_filter"]
+            if not isinstance(filt, list) or not filt:
+                return jsonify({"ok": False,
+                                "error": "event_filter must be a non-empty list"}), 400
+            unknown = [k for k in filt if k != "*" and k not in EVENT_KINDS]
+            if unknown:
+                return jsonify({"ok": False, "error": "unknown event kind(s)",
+                                "unknown": unknown}), 400
+            patch["event_filter"] = filt
+        if "secret" in body and body["secret"]:
+            patch["secret"] = str(body["secret"]).strip()
+        if "description" in body:
+            patch["description"] = str(body["description"] or "")
+        if "enabled" in body:
+            patch["enabled"] = bool(body["enabled"])
+        sub = webhook_store.update(sub_id, **patch)
+        if sub is None:
+            return jsonify({"ok": False, "error": "not found"}), 404
+        return jsonify({"ok": True, "subscriber": sub.to_public()})
+
+    @app.delete("/api/webhooks/subscribers/<sub_id>")
+    def webhooks_delete(sub_id: str):  # noqa: ANN202
+        if webhook_store is None:
+            return jsonify({"ok": False, "error": "webhooks not wired"}), 503
+        removed = webhook_store.delete(sub_id)
+        return jsonify({"ok": True, "removed": removed})
+
+    @app.post("/api/webhooks/subscribers/<sub_id>/test")
+    def webhooks_test(sub_id: str):  # noqa: ANN202
+        if webhook_dispatcher is None:
+            return jsonify({"ok": False, "error": "webhooks dispatcher not running"}), 503
+        sent = webhook_dispatcher.dispatch_test(sub_id, tenant=settings.tenant)
+        if sent == 0:
+            return jsonify({"ok": False,
+                            "error": "subscriber not found or disabled"}), 404
+        return jsonify({"ok": True, "queued": sent})
+
+    @app.post("/api/webhooks/subscribers/<sub_id>/rotate-secret")
+    def webhooks_rotate(sub_id: str):  # noqa: ANN202
+        from itips.webhooks.signing import generate_secret
+        if webhook_store is None:
+            return jsonify({"ok": False, "error": "webhooks not wired"}), 503
+        new_secret = generate_secret()
+        sub = webhook_store.update(sub_id, secret=new_secret)
+        if sub is None:
+            return jsonify({"ok": False, "error": "not found"}), 404
+        return jsonify({"ok": True,
+                        "subscriber": sub.to_public(include_secret=True)})
+
+    @app.get("/api/webhooks/deliveries")
+    def webhooks_deliveries():  # noqa: ANN202
+        if webhook_store is None:
+            return jsonify({"ok": False, "error": "webhooks not wired"}), 503
+        sub_id = request.args.get("subscriber_id") or None
+        limit = request.args.get("limit", default=50, type=int)
+        return jsonify({
+            "ok": True,
+            "deliveries": webhook_store.list_deliveries(
+                subscriber_id=sub_id, limit=limit,
+            ),
+        })
+
     @app.post("/api/ml/behavior/<int:camera_id>/analyse")
     def ml_behavior_analyse(camera_id: int):  # noqa: ANN202
         if behavior_engine is None:
@@ -1035,14 +1188,245 @@ def register_dashboard(
                 "wired": False,
                 "reason": "ITIPS_AXPRO_HOST not set — use Simulate to test",
             })
-        return jsonify({
+        out = {
             "wired": True,
             "host": axpro_listener.host,
             "connected": bool(axpro_listener.is_connected),
             "armed": bool(axpro_listener.is_armed),
             "last_error": axpro_listener.last_error,
             "thread_alive": axpro_listener.is_alive(),
+        }
+        # Include alertStream subscription state alongside the poller's
+        # so the dashboard can show both channels at a glance.
+        if axpro_alertstream is not None:
+            out["alertstream"] = {
+                "connected": bool(axpro_alertstream.is_connected),
+                "events_received": axpro_alertstream.events_received,
+                "last_error": axpro_alertstream.last_error,
+                "thread_alive": axpro_alertstream.is_alive(),
+            }
+        return jsonify(out)
+
+    @app.get("/api/sensors/listener/zones")
+    def axpro_listener_zones():  # noqa: ANN202
+        """Diagnostic dump — raw hub zone payload plus the listener's
+        cached edge state. Use this when a real sensor activates and
+        nothing reaches the events feed: compare `raw.ZoneList[...]`
+        against `edge_state` to see whether the field name we read
+        matches what the hub is actually publishing on this firmware."""
+        if axpro_listener is None:
+            return jsonify({"wired": False,
+                            "reason": "ITIPS_AXPRO_HOST not set"})
+        return jsonify({
+            "wired": True,
+            "connected": bool(axpro_listener.is_connected),
+            "edge_state": axpro_listener.alarm_state_snapshot(),
+            "raw": axpro_listener.fetch_raw_zone_status(),
         })
+
+    # ─── AX PRO hub control ───────────────────────────────────────
+    # These routes let an operator drive arming and bypass state from
+    # the dashboard without climbing into the Hik-Connect mobile app.
+    # The hub has three firmware quirks we paper over here:
+    #   * `arm_away` fails with `armedStatus` if the subsystem is
+    #     already armed — we always disarm first.
+    #   * `bypassRecover` is the live ISAPI path; the older
+    #     `Recoverbypass/` returns 404 on current firmware. The admin
+    #     helper uses the working path.
+    #   * Bypass changes are rejected while the parent subsystem is
+    #     armed. The arm-away route accepts ?clear_bypass=<zone_id>
+    #     and clears those during the disarmed window.
+
+    def _admin_or_503():
+        if axpro_admin is None:
+            return jsonify({"ok": False,
+                            "error": "axpro admin not wired — ITIPS_AXPRO_HOST not set"}), 503
+        return None
+
+    @app.get("/api/sensors/hub/state")
+    def hub_state():  # noqa: ANN202
+        """Full subsystem + zone snapshot from the hub. Backs the
+        dashboard's hub-admin panel — exposes arming mode per
+        subsystem, bypass state per zone, and the per-zone
+        armNoBypassEnabled flag so operators can see at a glance why
+        a sensor isn't firing."""
+        err = _admin_or_503()
+        if err is not None:
+            return err
+        client = axpro_admin._require_client()  # noqa: SLF001
+        try:
+            subs = (client.subsystem_status() or {}).get("SubSysList", [])
+            zones = (client.zone_status() or {}).get("ZoneList", [])
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"ok": False, "error": str(exc)}), 502
+        return jsonify({
+            "ok": True,
+            "subsystems": [s.get("SubSys", {}) for s in subs],
+            "zones": [z.get("Zone", {}) for z in zones],
+        })
+
+    @app.post("/api/sensors/hub/disarm")
+    def hub_disarm():  # noqa: ANN202
+        """Disarm one or more subsystems. POST {"sub_ids": [1, 2, 3]}."""
+        err = _admin_or_503()
+        if err is not None:
+            return err
+        body = request.get_json(silent=True) or {}
+        sub_ids = [int(x) for x in (body.get("sub_ids") or [1, 2, 3])]
+        return jsonify({"ok": True, "results": axpro_admin.disarm_all(sub_ids)})
+
+    @app.post("/api/sensors/hub/arm-away")
+    def hub_arm_away():  # noqa: ANN202
+        """Arm subsystems Away. Always disarm-first to dodge the
+        `armedStatus` rejection. POST body:
+            {"sub_ids": [1,2,3], "clear_bypass": [1]}
+        The optional `clear_bypass` list is processed during the
+        disarmed window — useful when a zone needs an un-bypass *and*
+        an arm in one operator action."""
+        err = _admin_or_503()
+        if err is not None:
+            return err
+        body = request.get_json(silent=True) or {}
+        sub_ids = [int(x) for x in (body.get("sub_ids") or [1, 2, 3])]
+        clear_bypass = [int(z) for z in (body.get("clear_bypass") or [])]
+
+        disarm_results = axpro_admin.disarm_all(sub_ids)
+        bypass_results = []
+        for zid in clear_bypass:
+            try:
+                bypass_results.append({"zone_id": zid, "ok": True,
+                                       "payload": axpro_admin.unbypass_zone(zid)})
+            except Exception as exc:  # noqa: BLE001
+                bypass_results.append({"zone_id": zid, "ok": False, "error": str(exc)})
+        arm_results = axpro_admin.arm_away_all(sub_ids, disarm_first=False)
+        return jsonify({
+            "ok": all(r.get("ok", True) for r in arm_results),
+            "disarm": disarm_results,
+            "bypass_recover": bypass_results,
+            "arm_away": arm_results,
+        })
+
+    @app.post("/api/sensors/zones/<int:zone_id>/unbypass")
+    def hub_unbypass(zone_id: int):  # noqa: ANN202
+        """Clear an operational bypass on `zone_id`. May 502 with
+        `armedStatus` if the parent subsystem is currently armed; the
+        dashboard should fall back to /hub/arm-away with
+        clear_bypass=[zone_id] in that case."""
+        err = _admin_or_503()
+        if err is not None:
+            return err
+        try:
+            payload = axpro_admin.unbypass_zone(zone_id)
+            return jsonify({"ok": True, "payload": payload})
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"ok": False, "error": str(exc),
+                            "payload": getattr(exc, "payload", None)}), 502
+
+    @app.post("/api/sensors/zones/<int:zone_id>/bypass")
+    def hub_bypass(zone_id: int):  # noqa: ANN202
+        err = _admin_or_503()
+        if err is not None:
+            return err
+        try:
+            payload = axpro_admin.bypass_zone(zone_id)
+            return jsonify({"ok": True, "payload": payload})
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"ok": False, "error": str(exc),
+                            "payload": getattr(exc, "payload", None)}), 502
+
+    # ─── siren (panic alarm) ──────────────────────────────────────
+    # Manual control of the hub's siren (Hikvision "One-Key Alarm").
+    # PUT to `oneKeyAlarm/{sub_id}` triggers every siren bound to that
+    # subsystem; `clearAlarm/{sub_id}` silences them. We surface this
+    # at /api/sensors/hub/siren/{action} so the dashboard button can
+    # call it without knowing the ISAPI shape.
+
+    @app.get("/api/sensors/hub/siren/status")
+    def hub_siren_status():  # noqa: ANN202
+        """Per-siren status (online/offline, signal, battery, tamper)."""
+        err = _admin_or_503()
+        if err is not None:
+            return err
+        try:
+            return jsonify({"ok": True, "sirens": axpro_admin.siren_status()})
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"ok": False, "error": str(exc)}), 502
+
+    @app.post("/api/sensors/hub/siren/start")
+    def hub_siren_start():  # noqa: ANN202
+        """Sound the siren. POST {"sub_id": 1} (defaults to 1).
+
+        WARNING: this triggers a real 100+ dB siren if one is paired
+        and online. Use /test for a self-clearing 2-second burst.
+        """
+        err = _admin_or_503()
+        if err is not None:
+            return err
+        body = request.get_json(silent=True) or {}
+        sub_id = int(body.get("sub_id", 1))
+        try:
+            return jsonify({"ok": True,
+                            "payload": axpro_admin.start_siren(sub_id)})
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"ok": False, "error": str(exc),
+                            "payload": getattr(exc, "payload", None)}), 502
+
+    @app.post("/api/sensors/hub/siren/stop")
+    def hub_siren_stop():  # noqa: ANN202
+        """Silence the siren. POST {"sub_id": 1}."""
+        err = _admin_or_503()
+        if err is not None:
+            return err
+        body = request.get_json(silent=True) or {}
+        sub_id = int(body.get("sub_id", 1))
+        try:
+            return jsonify({"ok": True,
+                            "payload": axpro_admin.stop_siren(sub_id)})
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"ok": False, "error": str(exc),
+                            "payload": getattr(exc, "payload", None)}), 502
+
+    @app.post("/api/sensors/hub/siren/test")
+    def hub_siren_test():  # noqa: ANN202
+        """Short burst — start, wait `duration_s` (default 2, max 10),
+        then stop. The stop fires from a try/finally so an interrupted
+        test can't leave the siren ringing."""
+        err = _admin_or_503()
+        if err is not None:
+            return err
+        body = request.get_json(silent=True) or {}
+        sub_id = int(body.get("sub_id", 1))
+        duration = float(body.get("duration_s", 2.0))
+        try:
+            return jsonify({"ok": True,
+                            "payload": axpro_admin.test_siren(sub_id, duration_s=duration)})
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"ok": False, "error": str(exc),
+                            "payload": getattr(exc, "payload", None)}), 502
+
+    @app.patch("/api/sensors/zones/<int:zone_id>/config")
+    def hub_zone_config_patch(zone_id: int):  # noqa: ANN202
+        """Set a single key on the zone config — used for the
+        `armNoBypassEnabled` flag in particular, which decides whether
+        the hub auto-bypasses a faulty zone on arm. POST body:
+            {"key": "armNoBypassEnabled", "value": true}"""
+        err = _admin_or_503()
+        if err is not None:
+            return err
+        body = request.get_json(silent=True) or {}
+        key = str(body.get("key") or "")
+        if not key:
+            return jsonify({"ok": False, "error": "missing 'key'"}), 400
+        if "value" not in body:
+            return jsonify({"ok": False, "error": "missing 'value'"}), 400
+        try:
+            payload = axpro_admin.set_zone_config_flag(
+                zone_id, key=key, value=body["value"],
+            )
+            return jsonify({"ok": True, "payload": payload})
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"ok": False, "error": str(exc),
+                            "payload": getattr(exc, "payload", None)}), 502
 
     @app.get("/api/cameras/<int:camera_id>/presets")
     def list_camera_presets(camera_id: int):  # noqa: ANN202
@@ -1062,6 +1446,187 @@ def register_dashboard(
                  "pan": p.pan, "tilt": p.tilt, "zoom": p.zoom}
                 for p in presets
             ],
+        })
+
+    @app.post("/api/cameras/<int:camera_id>/presets")
+    def save_camera_preset(camera_id: int):  # noqa: ANN202
+        """Save the camera's *current* PTZ position as a named preset.
+
+        Backs the calibration wizard's "Save position" button. Body:
+            {"name": "zone_1_gate", "index": 12}   # both optional
+
+        If `index` is omitted we pick the next free slot in [1..255].
+        If `name` is omitted we use `preset_<index>`. Returns the
+        preset record the camera actually persisted (which may differ
+        from the requested name on firmwares that reject naming via
+        configManager — the index is always authoritative).
+        """
+        client = dahua_manager.get(camera_id)
+        if client is None:
+            return jsonify({"ok": False, "error": "unknown camera"}), 404
+        body = request.get_json(silent=True) or {}
+        name = str(body.get("name") or "").strip()
+        idx_raw = body.get("index")
+        try:
+            idx = int(idx_raw) if idx_raw is not None else None
+        except (TypeError, ValueError):
+            return jsonify({"ok": False, "error": "index must be an int"}), 400
+        try:
+            preset = client.ptz.save_current_as_preset(name, index=idx)
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"ok": False, "error": str(exc)}), 502
+        return jsonify({
+            "ok": True,
+            "camera_id": camera_id,
+            "preset": {"index": preset.index, "name": preset.name,
+                       "pan": preset.pan, "tilt": preset.tilt, "zoom": preset.zoom},
+        }), 201
+
+    @app.delete("/api/cameras/<int:camera_id>/presets/<int:index>")
+    def delete_camera_preset(camera_id: int, index: int):  # noqa: ANN202
+        client = dahua_manager.get(camera_id)
+        if client is None:
+            return jsonify({"ok": False, "error": "unknown camera"}), 404
+        try:
+            client.ptz.delete_preset(index)
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"ok": False, "error": str(exc)}), 502
+        return jsonify({"ok": True})
+
+    @app.post("/api/cameras/<int:camera_id>/presets/<int:index>/goto")
+    def goto_camera_preset(camera_id: int, index: int):  # noqa: ANN202
+        """Jump the PTZ to a preset by index. Used by the wizard's
+        Test Pan flow — pan away, then back."""
+        client = dahua_manager.get(camera_id)
+        if client is None:
+            return jsonify({"ok": False, "error": "unknown camera"}), 404
+        try:
+            client.ptz.go_to_preset(index)
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"ok": False, "error": str(exc)}), 502
+        return jsonify({"ok": True})
+
+    @app.post("/api/sensors/zones/<int:zone_id>/calibrate")
+    def calibrate_sensor_zone(zone_id: int):  # noqa: ANN202
+        """Atomic save-preset + bind-sensor in one operator action.
+
+        Body:
+            {"camera_id": 4, "name": "zone_1_gate",
+             "sensor_type": "doorContact",
+             "description": "front gate magnetic contact"}
+
+        Steps:
+          1. Save the camera's current position as a named preset.
+          2. Upsert SensorMap(zone_id) → (camera, preset_name).
+          3. Return both so the wizard can render the result and
+             chain a Test Pan immediately.
+
+        Doing this atomically is the whole point — "I saved a preset
+        and forgot to bind it" is the single most common install
+        failure mode for camera-to-sensor systems.
+        """
+        if sensor_map is None:
+            return jsonify({"ok": False, "error": "sensor map not wired"}), 503
+        body = request.get_json(silent=True) or {}
+        try:
+            camera_id = int(body["camera_id"])
+        except (KeyError, ValueError, TypeError):
+            return jsonify({"ok": False, "error": "camera_id is required (int)"}), 400
+        client = dahua_manager.get(camera_id)
+        if client is None:
+            return jsonify({"ok": False, "error": f"unknown camera {camera_id}"}), 404
+        # Default to a deterministic name so duplicate Calibrate clicks
+        # on the same zone reuse the same camera-side preset slot
+        # instead of leaking new ones forever.
+        name = str(body.get("name") or f"zone_{zone_id}").strip()
+        # If a previous binding exists with a preset of the same name,
+        # reuse its index so the camera's preset table stays clean.
+        reuse_index = None
+        previous = sensor_map.get(zone_id)
+        if previous and previous.camera_id == camera_id:
+            for p in client.ptz.list_presets():
+                if p.name == previous.preset_name:
+                    reuse_index = p.index
+                    break
+        try:
+            preset = client.ptz.save_current_as_preset(name, index=reuse_index)
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"ok": False,
+                            "error": f"saving preset failed: {exc}"}), 502
+        try:
+            from itips.sensors.sensor_map import SensorMapping
+            mapping = SensorMapping(
+                zone_id=zone_id,
+                camera_id=camera_id,
+                preset_name=preset.name,
+                sensor_type=str(body.get("sensor_type", "")),
+                description=str(body.get("description", "")),
+                metadata={"preset_index": preset.index,
+                          **(dict(body.get("metadata") or {}))},
+            )
+        except (ValueError, TypeError) as exc:
+            return jsonify({"ok": False,
+                            "error": f"invalid mapping: {exc}"}), 400
+        sensor_map.upsert(mapping)
+        return jsonify({
+            "ok": True,
+            "mapping": _sensor_mapping_to_dict(mapping),
+            "preset": {"index": preset.index, "name": preset.name,
+                       "pan": preset.pan, "tilt": preset.tilt, "zoom": preset.zoom},
+        }), 201
+
+    @app.post("/api/sensors/zones/<int:zone_id>/test-pan")
+    def test_pan_sensor_zone(zone_id: int):  # noqa: ANN202
+        """Verify a sensor's binding by panning the bound camera
+        through home → bound preset and returning a snapshot URL.
+
+        The two-step pan (away then back) makes the motion *visible*
+        — without it, the camera may already be sitting on the
+        preset, in which case nothing happens and the operator can't
+        tell whether the command worked at all."""
+        if sensor_map is None:
+            return jsonify({"ok": False, "error": "sensor map not wired"}), 503
+        mapping = sensor_map.get(zone_id)
+        if mapping is None:
+            return jsonify({"ok": False,
+                            "error": f"zone {zone_id} has no binding"}), 404
+        client = dahua_manager.get(mapping.camera_id)
+        if client is None:
+            return jsonify({"ok": False,
+                            "error": f"camera {mapping.camera_id} not connected"}), 502
+        # Pan away first so the motion is obvious. Falls back to a
+        # no-op if go_home isn't supported on this PTZ.
+        try:
+            client.ptz.go_home()
+        except Exception:
+            logger.info("test-pan: go_home() unsupported, skipping")
+        # Brief pause so the operator can see the camera leave the
+        # preset before it returns — pure UX, not a correctness need.
+        time.sleep(0.8)
+        try:
+            ok = client.ptz.goto_preset_by_name(mapping.preset_name)
+            if not ok:
+                # Fallback to the cached index if name lookup failed
+                # (some firmwares mangle the name on save).
+                preset_index = (mapping.metadata or {}).get("preset_index")
+                if preset_index is not None:
+                    client.ptz.go_to_preset(int(preset_index))
+                    ok = True
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"ok": False,
+                            "error": f"goto failed: {exc}"}), 502
+        if not ok:
+            return jsonify({
+                "ok": False,
+                "error": f"preset '{mapping.preset_name}' not found on camera",
+            }), 502
+        # Snapshot URL with a cache-buster so the wizard refreshes
+        # rather than serving an old frame.
+        ts = int(time.time() * 1000)
+        return jsonify({
+            "ok": True,
+            "mapping": _sensor_mapping_to_dict(mapping),
+            "snapshot_url": f"/api/snapshot/{mapping.camera_id}?t={ts}",
         })
 
     # ─── test console ──────────────────────────────────────────────
@@ -1126,7 +1691,17 @@ def register_dashboard(
         except ValueError as exc:
             return jsonify({"ok": False, "error": str(exc)}), 400
         except Exception as exc:  # noqa: BLE001
-            return jsonify({"ok": False, "error": str(exc)}), 502
+            # Camera-side rejection (channel mismatch, unsupported code,
+            # bad permissions) lands here. Return the camera's own
+            # message so operators don't have to grep logs.
+            return jsonify({
+                "ok": False,
+                "error": str(exc),
+                "hint": "camera returned the request but rejected the PTZ command "
+                        "— common causes: PTZ on a different channel "
+                        "(set ITIPS_PTZ_<N>_CHANNEL), insufficient ONVIF "
+                        "permissions, or the camera doesn't support this code.",
+            }), 502
         return jsonify({"ok": True})
 
     @app.post("/api/test/simulate/<event_type>")

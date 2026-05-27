@@ -111,33 +111,71 @@
   function bindJogPad() {
     const speedInput = document.getElementById("jog-speed");
     const camSelect = document.getElementById("jog-camera");
+    const statusEl = document.getElementById("jog-status");
+
+    // Bound at most once per element so a re-init doesn't stack listeners
+    // and produce N requests per click.
     document.querySelectorAll(".jog-pad button, [data-dir]").forEach((btn) => {
+      if (btn.dataset.jogBound === "1") return;
       const dir = btn.getAttribute("data-dir");
       if (!dir) return;
-      // Press → start; release/leave → stop. Tap = quick start+stop.
-      const start = async () => {
+      btn.dataset.jogBound = "1";
+
+      const showStatus = (msg, cls) => {
+        if (!statusEl) return;
+        statusEl.textContent = msg;
+        statusEl.className = "pill " + (cls || "pill-idle");
+      };
+      const callPtz = async (action) => {
         const camId = camSelect.value;
         if (!camId) return;
-        await fetch(`/api/test/ptz/${camId}/${dir}`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ action: "start", speed: parseInt(speedInput.value, 10) || 4 }),
-        });
+        const payload = action === "stop"
+          ? { action: "stop" }
+          : { action: "start", speed: parseInt(speedInput.value, 10) || 4 };
+        try {
+          const res = await fetch(`/api/test/ptz/${camId}/${dir}`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+          });
+          const body = await res.json().catch(() => ({}));
+          if (!body.ok) {
+            const reason = body.error || `HTTP ${res.status}`;
+            showStatus(`PTZ ${dir} ${action} rejected: ${reason}`, "pill-err");
+            // Stash the hint somewhere visible for diagnosis.
+            if (body.hint) console.warn("PTZ hint:", body.hint);
+          } else {
+            showStatus(`PTZ ${dir} ${action} OK`, "pill-ok");
+          }
+        } catch (e) {
+          showStatus(`PTZ ${dir} ${action} failed: ${e}`, "pill-err");
+        }
       };
-      const stop = async () => {
-        const camId = camSelect.value;
-        if (!camId) return;
-        await fetch(`/api/test/ptz/${camId}/${dir}`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ action: "stop" }),
-        });
+
+      // Track which buttons currently have a press in-flight so we
+      // don't issue spurious "stop" frames on synthesised mouse events
+      // (touch devices fire both touch* AND mouse* — without this guard
+      // a single tap was sending start/stop ~9 times).
+      let pressed = false;
+      const start = (e) => {
+        if (e && e.cancelable) e.preventDefault();
+        if (pressed) return;
+        pressed = true;
+        callPtz("start");
       };
+      const stop = (e) => {
+        if (e && e.cancelable) e.preventDefault();
+        if (!pressed) return;
+        pressed = false;
+        callPtz("stop");
+      };
+
       btn.addEventListener("mousedown", start);
       btn.addEventListener("mouseup", stop);
       btn.addEventListener("mouseleave", stop);
-      btn.addEventListener("touchstart", (e) => { e.preventDefault(); start(); });
-      btn.addEventListener("touchend", (e) => { e.preventDefault(); stop(); });
+      btn.addEventListener("touchstart", start, { passive: false });
+      btn.addEventListener("touchend", stop, { passive: false });
+      btn.addEventListener("touchcancel", stop, { passive: false });
     });
   }
 
