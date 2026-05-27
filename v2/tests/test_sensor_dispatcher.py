@@ -1,18 +1,16 @@
-"""SensorDispatcher — the pan → snapshot → face-validate pipeline.
+"""SensorDispatcher — the pan → snapshot → evaluator pipeline.
 
 We exercise `_process()` synchronously (no thread start) with mocked
-PTZ, snapshot, FaceEngine, and AlertEngine. That isolates the routing
-logic from real cameras and from the worker thread's queue.
+PTZ, snapshot, ThreatEvaluator, and AlertEngine. That isolates the
+routing logic from real cameras and from the worker thread's queue.
 """
 
 from __future__ import annotations
 
-from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import numpy as np
 
-from itips.ml.face_engine import RecognitionResult
 from itips.runtime.sensor_dispatcher import SensorDispatcher
 from itips.sensors.sensor_event import SensorEvent, SensorEventTap
 from itips.sensors.sensor_map import SensorMap, SensorMapping
@@ -25,7 +23,7 @@ def _frame():
 def _make_dispatcher(tmp_path,
                      *,
                      mapping=None,
-                     face_engine=None,
+                     evaluator=None,
                      pan_ok=True,
                      snapshot=_frame()):
     sensor_map = SensorMap(path=tmp_path / "sensors.json")
@@ -44,7 +42,7 @@ def _make_dispatcher(tmp_path,
         dahua_manager=manager,
         sensor_map=sensor_map,
         event_tap=event_tap,
-        face_engine=face_engine,
+        threat_evaluator=evaluator,
         pan_settle_s=0.0,           # don't block tests
         snapshot_timeout_s=0.5,
         per_zone_cooldown_s=0.0,    # opt-out for clarity
@@ -69,126 +67,97 @@ def test_sensor_alarm_logs_even_when_unmapped(tmp_path):
     assert "sensor_alarm" in kinds
 
 
-def test_unmapped_zone_skips_pan_and_recognise(tmp_path):
-    d, alert, manager, client, tap = _make_dispatcher(tmp_path)
+def test_unmapped_zone_skips_pan_and_evaluator(tmp_path):
+    evaluator = MagicMock()
+    d, alert, manager, client, tap = _make_dispatcher(
+        tmp_path, evaluator=evaluator,
+    )
     d._process(_evt(zone_id=99))
     client.ptz.goto_preset_by_name.assert_not_called()
     client.endpoint.snapshot.assert_not_called()
+    evaluator.trigger.assert_not_called()
     assert tap.recent()[0]["outcome"]["verdict"] == "unmapped"
 
 
-# ─── happy paths ────────────────────────────────────────────────────
+# ─── happy path — hand frame to evaluator ────────────────────────────
 
 
-def test_matched_person_fires_personnel_seen(tmp_path):
-    mapping = SensorMapping(zone_id=1, camera_id=4, preset_name="Gate")
-    face = MagicMock()
-    face.recognize.return_value = RecognitionResult(
-        matched=True, person_id="p-42", full_name="Sam",
-        similarity=0.81, embedding=np.zeros(512, dtype="float32"),
-    )
+def test_successful_pipeline_triggers_evaluator(tmp_path):
+    mapping = SensorMapping(zone_id=3, camera_id=4, preset_name="Gate")
+    evaluator = MagicMock()
     d, alert, manager, client, tap = _make_dispatcher(
-        tmp_path, mapping=mapping, face_engine=face,
+        tmp_path, mapping=mapping, evaluator=evaluator,
     )
-    d._process(_evt(zone_id=1))
+    d._process(_evt(zone_id=3))
     client.ptz.goto_preset_by_name.assert_called_once_with("Gate")
     client.endpoint.snapshot.assert_called_once()
-    face.recognize.assert_called_once()
-    alert.handle_personnel_seen.assert_called_once()
-    kw = alert.handle_personnel_seen.call_args.kwargs
-    assert kw["person_uid"] == "p-42"
-    assert kw["name"] == "Sam"
-    assert kw["group_id"] == "jetson-sensor-validated"
+    evaluator.trigger.assert_called_once()
+    kw = evaluator.trigger.call_args.kwargs
     assert kw["camera_id"] == 4
-    assert tap.recent()[0]["outcome"]["verdict"] == "authorised"
-
-
-def test_no_match_fires_face_intruder(tmp_path):
-    mapping = SensorMapping(zone_id=1, camera_id=4, preset_name="Gate")
-    face = MagicMock()
-    face.recognize.return_value = RecognitionResult(
-        matched=False, person_id=None, full_name=None,
-        similarity=0.12,
-        embedding=np.zeros(512, dtype="float32"),   # face present but no match
-    )
-    d, alert, *_, tap = _make_dispatcher(
-        tmp_path, mapping=mapping, face_engine=face,
-    )
-    d._process(_evt(zone_id=1))
-    alert.handle_face_intruder.assert_called_once()
-    alert.handle_personnel_seen.assert_not_called()
-    assert tap.recent()[0]["outcome"]["verdict"] == "intruder"
-
-
-def test_no_face_in_frame_fires_unverified(tmp_path):
-    mapping = SensorMapping(zone_id=1, camera_id=4, preset_name="Gate")
-    face = MagicMock()
-    face.recognize.return_value = RecognitionResult(
-        matched=False, person_id=None, full_name=None,
-        similarity=0.0, embedding=None,    # no embedding ⇒ no face found
-    )
-    d, alert, *_, tap = _make_dispatcher(
-        tmp_path, mapping=mapping, face_engine=face,
-    )
-    d._process(_evt(zone_id=1))
-    # sensor_alarm + sensor_unverified, no personnel_seen, no intruder.
-    kinds = [c.kwargs["alert_type"]
-             for c in alert.handle_behaviour_alert_simple.call_args_list]
-    assert kinds == ["sensor_alarm", "sensor_unverified"]
-    alert.handle_personnel_seen.assert_not_called()
-    alert.handle_face_intruder.assert_not_called()
-    assert tap.recent()[0]["outcome"]["verdict"] == "unverified_no_face"
+    assert kw["trigger_kind"] == "sensor:zone-3"
+    assert kw["initial_frame"] is not None
+    assert kw["details"]["zone_id"] == 3
+    assert kw["details"]["preset_name"] == "Gate"
+    assert tap.recent()[0]["outcome"]["verdict"] == "evaluating"
 
 
 # ─── failure modes ──────────────────────────────────────────────────
 
 
-def test_pan_failure_skips_snapshot_and_validation(tmp_path):
+def test_pan_failure_skips_snapshot_and_evaluator(tmp_path):
     mapping = SensorMapping(zone_id=1, camera_id=4, preset_name="Gate")
-    face = MagicMock()
+    evaluator = MagicMock()
     d, alert, manager, client, tap = _make_dispatcher(
-        tmp_path, mapping=mapping, face_engine=face, pan_ok=False,
+        tmp_path, mapping=mapping, evaluator=evaluator, pan_ok=False,
     )
     d._process(_evt(zone_id=1))
     client.endpoint.snapshot.assert_not_called()
-    face.recognize.assert_not_called()
+    evaluator.trigger.assert_not_called()
     assert tap.recent()[0]["outcome"]["verdict"] == "pan_failed"
 
 
-def test_snapshot_failure_skips_validation(tmp_path):
+def test_snapshot_failure_skips_evaluator(tmp_path):
     mapping = SensorMapping(zone_id=1, camera_id=4, preset_name="Gate")
-    face = MagicMock()
+    evaluator = MagicMock()
     d, alert, manager, client, tap = _make_dispatcher(
-        tmp_path, mapping=mapping, face_engine=face, snapshot=None,
+        tmp_path, mapping=mapping, evaluator=evaluator, snapshot=None,
     )
     d._process(_evt(zone_id=1))
-    face.recognize.assert_not_called()
+    evaluator.trigger.assert_not_called()
     assert tap.recent()[0]["outcome"]["verdict"] == "snapshot_failed"
-
-
-def test_engine_unwired_still_logs_unverified_and_keeps_pan_evidence(tmp_path):
-    mapping = SensorMapping(zone_id=1, camera_id=4, preset_name="Gate")
-    d, alert, manager, client, tap = _make_dispatcher(
-        tmp_path, mapping=mapping, face_engine=None,
-    )
-    d._process(_evt(zone_id=1))
-    # Pan + snapshot still ran (operator has evidence to review).
-    client.ptz.goto_preset_by_name.assert_called_once()
-    client.endpoint.snapshot.assert_called_once()
-    # But no validation outcome — sensor_unverified fires.
-    kinds = [c.kwargs["alert_type"]
-             for c in alert.handle_behaviour_alert_simple.call_args_list]
-    assert "sensor_unverified" in kinds
-    assert tap.recent()[0]["outcome"]["verdict"] == "unverified_no_engine"
 
 
 def test_unknown_camera_skips_pan(tmp_path):
     mapping = SensorMapping(zone_id=1, camera_id=99, preset_name="Gate")
-    d, alert, manager, client, tap = _make_dispatcher(tmp_path, mapping=mapping)
+    evaluator = MagicMock()
+    d, alert, manager, client, tap = _make_dispatcher(
+        tmp_path, mapping=mapping, evaluator=evaluator,
+    )
     manager.get.return_value = None   # camera not registered
     d._process(_evt(zone_id=1))
     client.ptz.goto_preset_by_name.assert_not_called()
+    evaluator.trigger.assert_not_called()
     assert tap.recent()[0]["outcome"]["verdict"] == "no_camera"
+
+
+# ─── evaluator missing (degraded mode) ──────────────────────────────
+
+
+def test_no_evaluator_logs_unverified_after_capturing_evidence(tmp_path):
+    """Evaluator absent (face engine not loaded). Pan + snapshot still
+    run so operators have a frame to review, and sensor_unverified fires
+    in the audit log so they know why no verdict arrived."""
+    mapping = SensorMapping(zone_id=1, camera_id=4, preset_name="Gate")
+    d, alert, manager, client, tap = _make_dispatcher(
+        tmp_path, mapping=mapping, evaluator=None,
+    )
+    d._process(_evt(zone_id=1))
+    client.ptz.goto_preset_by_name.assert_called_once()
+    client.endpoint.snapshot.assert_called_once()
+    kinds = [c.kwargs["alert_type"]
+             for c in alert.handle_behaviour_alert_simple.call_args_list]
+    assert "sensor_unverified" in kinds
+    assert tap.recent()[0]["outcome"]["verdict"] == "unverified_no_engine"
 
 
 # ─── cooldown ───────────────────────────────────────────────────────
@@ -196,19 +165,15 @@ def test_unknown_camera_skips_pan(tmp_path):
 
 def test_per_zone_cooldown_drops_rapid_retriggers(tmp_path):
     mapping = SensorMapping(zone_id=1, camera_id=4, preset_name="Gate")
-    face = MagicMock()
-    face.recognize.return_value = RecognitionResult(
-        matched=True, person_id="p", full_name="X",
-        similarity=0.9, embedding=np.zeros(512, dtype="float32"),
-    )
+    evaluator = MagicMock()
     d, alert, manager, client, tap = _make_dispatcher(
-        tmp_path, mapping=mapping, face_engine=face,
+        tmp_path, mapping=mapping, evaluator=evaluator,
     )
     d._per_zone_cooldown_s = 30.0   # long enough to bite
     d._process(_evt(zone_id=1))     # first one — runs end-to-end
     d._process(_evt(zone_id=1))     # second — should be blocked
     # Pan called exactly once.
     assert client.ptz.goto_preset_by_name.call_count == 1
-    # Sensor_alarm fired both times (audit trail), but the second
-    # event_tap entry is the cooldown one (newest first).
+    assert evaluator.trigger.call_count == 1
+    # Newest entry on the tap is the cooldown one.
     assert tap.recent()[0]["outcome"]["verdict"] == "cooldown"

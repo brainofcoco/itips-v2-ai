@@ -1,7 +1,11 @@
-"""Sensor → PTZ pan → snapshot → face-validate pipeline.
+"""Sensor → PTZ pan → snapshot → ThreatEvaluator pipeline.
 
 Single worker thread so a chatty sensor can't saturate the GPU.
 Per-zone cooldown debounces; any exception is logged and skipped.
+
+The dispatcher's job is mechanical — pan the dome, grab a frame, hand it
+off to the ThreatEvaluator. The evaluator runs the multi-frame decision
+window that produces the AUTHORIZED / INTRUDER / UNCERTAIN verdict.
 """
 
 from __future__ import annotations
@@ -10,7 +14,7 @@ import logging
 import queue
 import threading
 import time
-from typing import Any, Callable, Optional
+from typing import Any, Callable
 
 from itips.sensors.sensor_event import SensorEvent, SensorEventTap
 from itips.sensors.sensor_map import SensorMap
@@ -19,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 
 class SensorDispatcher(threading.Thread):
-    """Turns SensorEvents into PTZ + snapshot + face-validate alerts."""
+    """Turns SensorEvents into PTZ + snapshot + evaluator triggers."""
 
     def __init__(
         self,
@@ -28,8 +32,6 @@ class SensorDispatcher(threading.Thread):
         dahua_manager,
         sensor_map: SensorMap,
         event_tap: SensorEventTap,
-        face_engine=None,
-        openai_validator=None,
         threat_evaluator=None,
         pan_settle_s: float = 2.0,
         snapshot_timeout_s: float = 4.0,
@@ -41,10 +43,9 @@ class SensorDispatcher(threading.Thread):
         self._dahua_manager = dahua_manager
         self._sensor_map = sensor_map
         self._event_tap = event_tap
-        self._face_engine = face_engine
-        self._openai_validator = openai_validator
-        # When wired, sensor activations route the captured snapshot into
-        # the multi-frame ThreatEvaluator instead of a one-shot face check.
+        # When None, the dispatcher still pans + snapshots (operator has
+        # evidence to review) but cannot produce a verdict. Production
+        # boots the evaluator in app.py whenever the face engine loads.
         self._threat_evaluator = threat_evaluator
         self._pan_settle_s = float(pan_settle_s)
         self._snapshot_timeout_s = float(snapshot_timeout_s)
@@ -170,196 +171,47 @@ class SensorDispatcher(threading.Thread):
             })
             return
 
-        if self._threat_evaluator is not None:
-            # Hand the captured frame to the multi-frame evaluator and
-            # return immediately — the final verdict is produced later by
-            # the evaluator's worker thread.
-            self._threat_evaluator.trigger(
+        if self._threat_evaluator is None:
+            # No evaluator wired (face engine missing). Log so operators
+            # know why no verdict will arrive.
+            self._alert_engine.handle_behaviour_alert_simple(
                 camera_id=mapping.camera_id,
-                trigger_kind=f"sensor:zone-{event.zone_id}",
-                initial_frame=frame,
+                alert_type="sensor_unverified",
                 details={
+                    "trigger": "sensor",
                     "zone_id": event.zone_id,
                     "zone_name": event.zone_name,
                     "sensor_type": event.event_type,
                     "preset_name": mapping.preset_name,
+                    "reason": "threat evaluator not wired",
                 },
             )
-            outcome = {
-                "verdict": "evaluating",
+            self._event_tap.publish(event, outcome={
+                "verdict": "unverified_no_engine",
                 "camera_id": mapping.camera_id,
                 "preset_name": mapping.preset_name,
-            }
-        else:
-            outcome = self._validate_face(event=event, mapping=mapping, frame=frame)
-        self._event_tap.publish(event, outcome=outcome)
+            })
+            return
 
-    def _validate_via_llm(self, scenario, frame, context, *,
-                          local_confidence, cooldown_key):
-        v = self._openai_validator
-        if v is None or frame is None:
-            return None
-        try:
-            if not v.should_validate(scenario, local_confidence=local_confidence,
-                                     cooldown_key=cooldown_key):
-                return None
-            return v.validate(scenario, frame, context, cooldown_key=cooldown_key)
-        except Exception:
-            logger.exception("openai validator crashed for %s", scenario)
-            return None
-
-    def _dispatch_escalation(self, validation, mapping) -> None:
-        """Auto-route fire / smoke / weapon — bypasses normal sensor flow."""
-        common = {"source": "ai_validator",
-                  "ai_summary": validation.summary,
-                  "ai_confidence": validation.confidence,
-                  "camera_id": mapping.camera_id,
-                  "preset_name": mapping.preset_name}
-        if validation.category == "fire":
-            self._alert_engine.handle_fire(camera_id=mapping.camera_id, details=common)
-        elif validation.category == "smoke":
-            self._alert_engine.handle_smoke(camera_id=mapping.camera_id, details=common)
-        elif validation.category == "weapon":
-            self._alert_engine.handle_face_intruder(
-                camera_id=mapping.camera_id, face_bbox=(0, 0, 0, 0),
-                name="WEAPON_INTRUDER",
-                details={**common, "severity": "high"},
-            )
-
-    def _validate_face(
-        self,
-        *,
-        event: SensorEvent,
-        mapping,
-        frame,
-    ) -> dict[str, Any]:
-        """Routes through the same handlers a camera-triggered face match uses."""
-        details_common = {
-            "trigger": "sensor",
-            "zone_id": event.zone_id,
-            "zone_name": event.zone_name,
-            "sensor_type": event.event_type,
+        # Hand the captured frame to the multi-frame evaluator and return
+        # immediately — the final verdict is produced later by the
+        # evaluator's worker thread and published as incident.verdict.
+        self._threat_evaluator.trigger(
+            camera_id=mapping.camera_id,
+            trigger_kind=f"sensor:zone-{event.zone_id}",
+            initial_frame=frame,
+            details={
+                "zone_id": event.zone_id,
+                "zone_name": event.zone_name,
+                "sensor_type": event.event_type,
+                "preset_name": mapping.preset_name,
+            },
+        )
+        self._event_tap.publish(event, outcome={
+            "verdict": "evaluating",
             "camera_id": mapping.camera_id,
             "preset_name": mapping.preset_name,
-        }
-
-        if self._face_engine is None:
-            # No face engine — still ask the LLM what's in the snapshot.
-            v = self._validate_via_llm("sensor_unverified", frame, details_common,
-                                       local_confidence=0.0,
-                                       cooldown_key=("sensor_unverified", event.zone_id))
-            if v and v.should_escalate:
-                self._dispatch_escalation(v, mapping)
-                return {"verdict": f"escalated_{v.category}",
-                        "camera_id": mapping.camera_id,
-                        "ai_summary": v.summary}
-            if v and v.should_suppress:
-                return {"verdict": "suppressed_by_ai",
-                        "camera_id": mapping.camera_id,
-                        "ai_summary": v.summary}
-            self._alert_engine.handle_behaviour_alert_simple(
-                camera_id=mapping.camera_id,
-                alert_type="sensor_unverified",
-                details={**details_common, "reason": "face engine not wired",
-                         **_ai_details_local(v)},
-            )
-            return {"verdict": "unverified_no_engine",
-                    "camera_id": mapping.camera_id,
-                    "ai_summary": v.summary if v else None}
-
-        try:
-            result = self._face_engine.recognize(frame, bbox=None)
-        except Exception:
-            logger.exception("sensor zone=%d: face engine crashed", event.zone_id)
-            self._alert_engine.handle_behaviour_alert_simple(
-                camera_id=mapping.camera_id,
-                alert_type="sensor_unverified",
-                details={**details_common, "reason": "face engine error"},
-            )
-            return {"verdict": "engine_error",
-                    "camera_id": mapping.camera_id}
-
-        if result.embedding is None:
-            # No face in frame — let the LLM identify what tripped the sensor.
-            v = self._validate_via_llm("sensor_unverified", frame, details_common,
-                                       local_confidence=0.0,
-                                       cooldown_key=("sensor_unverified", event.zone_id))
-            if v and v.should_escalate:
-                self._dispatch_escalation(v, mapping)
-                return {"verdict": f"escalated_{v.category}",
-                        "camera_id": mapping.camera_id,
-                        "ai_summary": v.summary}
-            if v and v.should_suppress:
-                return {"verdict": "suppressed_by_ai",
-                        "camera_id": mapping.camera_id,
-                        "ai_summary": v.summary}
-            self._alert_engine.handle_behaviour_alert_simple(
-                camera_id=mapping.camera_id,
-                alert_type="sensor_unverified",
-                details={**details_common, "reason": "no face detected",
-                         **_ai_details_local(v)},
-            )
-            return {"verdict": "unverified_no_face",
-                    "camera_id": mapping.camera_id,
-                    "ai_summary": v.summary if v else None}
-
-        if result.matched and result.person_id:
-            self._alert_engine.handle_personnel_seen(
-                camera_id=mapping.camera_id,
-                person_uid=result.person_id,
-                group_id="jetson-sensor-validated",
-                name=result.full_name or "",
-                similarity=int(round(result.similarity * 100)),
-                jpeg=_encode_frame_jpeg(frame),
-            )
-            logger.info(
-                "sensor zone=%d AUTHORISED — %s (sim=%.2f) on cam %d",
-                event.zone_id, result.full_name, result.similarity,
-                mapping.camera_id,
-            )
-            return {
-                "verdict": "authorised",
-                "person_id": result.person_id,
-                "full_name": result.full_name,
-                "similarity": round(float(result.similarity), 4),
-                "camera_id": mapping.camera_id,
-            }
-
-        # Face present but no enrolled match → INTRUDER (LLM may downgrade).
-        v = self._validate_via_llm("sensor_intruder", frame,
-                                   {**details_common,
-                                    "confidence": result.similarity},
-                                   local_confidence=result.similarity,
-                                   cooldown_key=("sensor_intruder", event.zone_id))
-        if v and v.should_suppress:
-            return {"verdict": "suppressed_by_ai",
-                    "camera_id": mapping.camera_id,
-                    "ai_summary": v.summary,
-                    "similarity": round(float(result.similarity), 4)}
-        if v and v.should_escalate:
-            self._dispatch_escalation(v, mapping)
-            return {"verdict": f"escalated_{v.category}",
-                    "camera_id": mapping.camera_id,
-                    "ai_summary": v.summary}
-        self._alert_engine.handle_face_intruder(
-            camera_id=mapping.camera_id,
-            face_bbox=(0, 0, 0, 0),
-            name="INTRUDER",
-            details=_ai_details_local(v),
-            jpeg=_encode_frame_jpeg(frame),
-        )
-        logger.info(
-            "sensor zone=%d INTRUDER (best_sim=%.2f) on cam %d%s",
-            event.zone_id, result.similarity, mapping.camera_id,
-            f" ai={v.category}/{v.verdict}" if v else "",
-        )
-        return {
-            "verdict": "intruder",
-            "similarity": round(float(result.similarity), 4),
-            "camera_id": mapping.camera_id,
-            "ai_summary": v.summary if v else None,
-        }
-
+        })
 
     def _notify_listeners(self, event: SensorEvent) -> None:
         if not self._event_listeners:
@@ -371,28 +223,3 @@ class SensorDispatcher(threading.Thread):
             except Exception:
                 logger.exception("sensor event listener failed (zone=%d)",
                                  event.zone_id)
-
-
-def _encode_frame_jpeg(frame) -> Optional[bytes]:
-    """JPEG-encode the snapshot for the evidence package."""
-    if frame is None:
-        return None
-    try:
-        import cv2
-        ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
-        return buf.tobytes() if ok else None
-    except Exception:
-        logger.exception("sensor frame jpeg encode failed")
-        return None
-
-
-def _ai_details_local(validation) -> dict:
-    if validation is None:
-        return {}
-    return {
-        "ai_summary": validation.summary,
-        "ai_category": validation.category,
-        "ai_verdict": validation.verdict,
-        "ai_confidence": round(float(validation.confidence), 3),
-        "ai_model": validation.model,
-    }

@@ -6,13 +6,14 @@ loitering, plate read, fire, smoke). The Jetson's job here is just to
 turn those classified events into incidents:
 
   * one PRELIMINARY incident per (camera, recent window),
-  * promote to CONFIRMED on a corroborating signal,
+  * promote to CONFIRMED on a verdict signal,
   * finalize idle incidents and ship the signed package via the intake.
 
 Confirmation signals:
-  - dwell:     same camera keeps emitting events past `confirmation_dwell_seconds`
-  - face:      a FaceRecognition with empty Candidates labelled the track INTRUDER
-  - fire/smoke: forced fast promotion (life safety)
+  - face_intruder: ThreatEvaluator's decision-window verdict, or a
+                   FaceRecognition with empty Candidates from a camera
+                   that bypasses the evaluator.
+  - fire/smoke:    forced fast promotion (life safety).
 
 Everything goes through the intake queue. We never call the cloud here.
 """
@@ -46,7 +47,6 @@ class _IncidentState:
     first_event_at: float
     last_event_at: float
     package_dir: Optional[object] = None
-    dwell_required_s: float = 5.0
     confirmation_signals: set[str] = field(default_factory=set)
 
 
@@ -58,16 +58,12 @@ class AlertEngine:
         evidence_packager,
         tenant,
         recorders: Optional[dict[int, object]] = None,
-        confirmation_dwell_seconds: float = 5.0,
-        confirmation_window_seconds: float = 30.0,
         idle_timeout_seconds: float = 15.0,
     ) -> None:
         self._intake = intake
         self._packager = evidence_packager
         self._tenant = tenant
         self._recorders: dict[int, object] = recorders or {}
-        self._dwell_s = confirmation_dwell_seconds
-        self._window_s = confirmation_window_seconds
         self._idle_s = idle_timeout_seconds
         self._history: deque[dict[str, Any]] = deque(maxlen=_MAX_HISTORY)
         self._history_lock = threading.Lock()
@@ -139,9 +135,10 @@ class AlertEngine:
     ) -> None:
         """Single-frame behaviour event from a camera-side rule.
 
-        Used for line crossing, region intrusion, loitering, motion, work
-        clothes — anything where the camera classified the event and we
-        just need to log + open an incident.
+        Logs the event and opens (or updates) a preliminary incident.
+        Promotion to CONFIRMED comes from explicit verdict signals
+        (face_intruder, fire, smoke) — not from dwell accumulation, which
+        used to silently confirm any preliminary that saw two events.
         """
         state = self._touch_incident(camera_id)
         record = self._record("behaviour", {
@@ -151,10 +148,6 @@ class AlertEngine:
         }, incident_id=state.incident_id)
         self._publish(record, priority=Priority.INCIDENT_EVENT, endpoint="A4",
                       incident_id=state.incident_id)
-        if state.stage == STAGE_PRELIMINARY:
-            elapsed = state.last_event_at - state.first_event_at
-            if elapsed >= state.dwell_required_s or alert_type == "loitering":
-                self._promote(state, signal=f"dwell:{alert_type}")
 
     def handle_face_intruder(
         self,
@@ -270,10 +263,6 @@ class AlertEngine:
         if state.stage == STAGE_PRELIMINARY:
             self._promote(state, signal="smoke")
 
-    def handle_heartbeat(self, payload: dict[str, Any]) -> None:
-        record = self._record("heartbeat", payload)
-        self._publish(record, priority=Priority.HEARTBEAT, endpoint="A1", incident_id=None)
-
     # ─── inspection ───────────────────────────────────────────────
 
     def history(self) -> list[dict[str, Any]]:
@@ -314,7 +303,6 @@ class AlertEngine:
             stage=STAGE_PRELIMINARY,
             first_event_at=now,
             last_event_at=now,
-            dwell_required_s=self._dwell_s,
         )
         package_dir = self._packager_dir(incident_id)
         with self._lock:

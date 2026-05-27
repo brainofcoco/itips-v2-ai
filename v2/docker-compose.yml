@@ -70,6 +70,24 @@ services:
     #           count: all
     #           capabilities: [gpu]
 
+  # ─── Vite/React dashboard — opt-in via the `dev` compose profile ───
+  # Mac + lab use:  COMPOSE_PROFILES=dev make up  (or `docker compose --profile dev up`)
+  # Jetson prod:    plain `make up` — this service never starts and its
+  #                 image is never built, so no frontend bytes ship to
+  #                 the edge.
+  dashboard:
+    profiles: ["dev"]
+    build:
+      context: ./dashboard
+      dockerfile: Dockerfile
+    image: itips/dashboard:0.1.0
+    container_name: itips-dashboard
+    restart: unless-stopped
+    ports:
+      - "3000:80"
+    depends_on:
+      - itips
+
 volumes:
   # Named volume — Docker manages perms so the container user (uid 1000)
   # can write to it. Inspect contents from the host via:

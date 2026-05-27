@@ -71,10 +71,23 @@ def _build_deps():
         for cam_id in dahua_manager.camera_ids()
     }
 
-    # Continuous RTSP grabbers feed each recorder so the ring buffer
-    # actually contains the pre-event window when an incident opens.
-    # Without this the Dahua-native pipeline only sees event JPEGs and
-    # the saved MP4s are blank.
+    alert_engine = AlertEngine(
+        intake=intake,
+        evidence_packager=evidence_packager,
+        tenant=settings.tenant,
+        recorders=recorders,
+        idle_timeout_seconds=settings.incident.idle_timeout_seconds,
+    )
+
+    frame_bus = FrameBus()
+    event_tap = EventTap()
+
+    # Continuous RTSP grabbers feed:
+    #   1. IncidentRecorder — so pre/post MP4s contain actual footage.
+    #   2. FrameBus         — so /api/snapshot/{cam} always has a recent
+    #                         frame to return without hammering the
+    #                         camera's HTTP /cgi-bin/snapshot.cgi per
+    #                         dashboard tile per tick.
     rtsp_grabbers = build_grabbers(
         settings.cameras.active(),
         target_fps=settings.evidence.grabber_fps,
@@ -83,19 +96,7 @@ def _build_deps():
         recorder = recorders.get(cam_id)
         if recorder is not None:
             grabber.add_consumer(recorder.feed)
-
-    alert_engine = AlertEngine(
-        intake=intake,
-        evidence_packager=evidence_packager,
-        tenant=settings.tenant,
-        recorders=recorders,
-        confirmation_dwell_seconds=settings.incident.confirmation_dwell_seconds,
-        confirmation_window_seconds=settings.incident.confirmation_window_seconds,
-        idle_timeout_seconds=settings.incident.idle_timeout_seconds,
-    )
-
-    frame_bus = FrameBus()
-    event_tap = EventTap()
+        grabber.add_consumer(_frame_bus_publisher(frame_bus, cam_id))
 
     # ML fallback — all optional; engines only init if ml extras installed.
     ml_state = _build_ml_layer(
@@ -128,8 +129,6 @@ def _build_deps():
         dahua_manager=dahua_manager,
         sensor_map=sensor_map,
         event_tap=sensor_event_tap,
-        face_engine=ml_state.face_engine,
-        openai_validator=openai_validator,
         threat_evaluator=threat_evaluator,
     )
 
@@ -254,6 +253,28 @@ def _build_deps():
     if webhook_dispatcher is not None:
         services.append(webhook_dispatcher)
     return deps, services
+
+
+def _frame_bus_publisher(frame_bus, camera_id):
+    """Adapter so RtspFrameGrabber consumers can push into FrameBus.
+
+    The grabber's contract is `Callable[[np.ndarray], None]`; FrameBus
+    wants a `FrameSnapshot`. Wrap the frame in the snapshot each tick.
+    Returns a closure to avoid one allocation of the publisher per call.
+    """
+    from itips.runtime.frame_bus import FrameSnapshot
+    from itips.utils.clock import monotonic_ns
+
+    def publish(frame) -> None:
+        frame_bus.publish(FrameSnapshot(
+            camera_id=camera_id,
+            raw=frame,
+            annotated=frame,
+            monotonic_ns=monotonic_ns(),
+            preset_id="grabber",
+        ))
+
+    return publish
 
 
 def _build_threat_evaluator(*, alert_engine, dahua_manager, face_engine):

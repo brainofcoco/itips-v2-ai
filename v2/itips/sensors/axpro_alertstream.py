@@ -149,14 +149,37 @@ class AxProAlertStream(threading.Thread):
                 break
         logger.info("AxProAlertStream stopped")
 
+    def _wait_for_logged_in_client(self, timeout_s: float = 30.0):
+        """Poll the listener's client until it's authenticated.
+
+        The alertStream thread starts in parallel with `AxProListener`,
+        which performs the SHA-256 challenge handshake against the hub
+        on its first poll. Until that lands, `get_client()` returns
+        `None` or a client with no session cookie. Waiting here turns
+        the previous "stream broke (client not yet logged in)" reconnect
+        warning into a silent startup pause.
+        """
+        deadline = time.monotonic() + timeout_s
+        while not self._stop_event.is_set():
+            client = self._client_supplier()
+            cookie = (
+                getattr(client, "_cookie", None) or getattr(client, "cookie", None)
+                if client is not None else None
+            )
+            if client is not None and cookie:
+                return cookie
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    "timed out waiting for hikaxpro client to log in "
+                    f"(after {timeout_s:.0f}s)"
+                )
+            if self._stop_event.wait(0.25):
+                raise RuntimeError("stopped while waiting for hikaxpro login")
+        raise RuntimeError("stopped while waiting for hikaxpro login")
+
     def _subscribe_once(self) -> None:
         import requests
-        client = self._client_supplier()
-        if client is None:
-            raise RuntimeError("hikaxpro client not yet logged in")
-        cookie = getattr(client, "_cookie", None) or getattr(client, "cookie", None)
-        if not cookie:
-            raise RuntimeError("hikaxpro session cookie missing — client.connect() not run?")
+        cookie = self._wait_for_logged_in_client()
         url = f"http://{self._host}/ISAPI/Event/notification/alertStream"
         resp = requests.get(
             url, cookies={"WebSession": cookie},

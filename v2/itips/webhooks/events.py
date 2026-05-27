@@ -28,7 +28,6 @@ EVENT_KINDS: dict[str, str] = {
     "alert.plate_capture":  "Plate read from camera TrafficCar / TrafficVehicle events.",
     "alert.fire":           "Camera-side fire classification.",
     "alert.smoke":           "Camera-side smoke classification.",
-    "heartbeat":            "Periodic health beat — typically high-volume, opt-in only.",
 
     # Sensor events — published by SensorDispatcher when an AX PRO
     # zone fires (independent of any incident promotion).
@@ -108,5 +107,4 @@ _ALERT_KIND_MAP: dict[str, str] = {
     "plate_capture":   "alert.plate_capture",
     "fire":            "alert.fire",
     "smoke":           "alert.smoke",
-    "heartbeat":       "heartbeat",
 }

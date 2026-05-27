@@ -8,7 +8,8 @@ DOCKER ?= docker
 COMPOSE ?= docker compose
 PYTHON ?= python3
 
-.PHONY: help install build up down logs restart shell ps test lint fmt typecheck check clean fresh
+.PHONY: help install build up down logs restart shell ps test lint fmt typecheck check clean fresh \
+        dash-up dash-down dash-logs dash-dev
 
 help:  ## Show available targets
 	@awk 'BEGIN {FS = ":.*##"; printf "Usage: make \033[36m<target>\033[0m\n\nTargets:\n"} \
@@ -63,3 +64,21 @@ clean:  ## Remove pycache + test artefacts
 
 fresh: clean down  ## Hard reset — clean + down (does NOT touch evidence_store/ or var/)
 	@echo "Cleaned. Evidence and intake DB preserved on host."
+
+# ─── Vite/React dashboard (opt-in `dev` profile) ────────────────────
+dash-up:  ## Start itips + dashboard (Mac/lab — bundles a frontend)
+	@mkdir -p ./var ./evidence_store
+	COMPOSE_PROFILES=dev $(COMPOSE) up -d --build
+	@echo ""
+	@echo "  Vite dashboard: http://localhost:3000"
+	@echo "  Legacy console: http://localhost:5050/dashboard"
+	@echo ""
+
+dash-down:  ## Stop both services (itips + dashboard)
+	COMPOSE_PROFILES=dev $(COMPOSE) down
+
+dash-logs:  ## Tail dashboard container logs
+	$(COMPOSE) logs -f --tail=200 dashboard
+
+dash-dev:  ## Run the Vite dev server on the host (HMR) against running itips
+	cd dashboard && npm install && npm run dev

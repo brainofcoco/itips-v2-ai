@@ -139,7 +139,6 @@ filter. Useful for end-to-end smoke tests during integration.
 | `alert.smoke`          | Camera-side smoke classification. |
 | `sensor.event`         | Raw wireless sensor activation (door, contact, PIR, vibration). Fires once per accepted event, **before** the per-zone cooldown gate. |
 | `ai.validation`        | OpenAI vision validator returned a verdict for an alert. |
-| `heartbeat`            | Periodic health beat. High-volume — opt in only when you need it. |
 | `test.ping`            | Manual ping from the dashboard `/test` endpoint. |
 
 Always-current list:  `GET /api/webhooks/event-kinds`.

@@ -100,8 +100,6 @@ class EvidenceConfig:
 
 @dataclass(frozen=True)
 class IncidentConfig:
-    confirmation_dwell_seconds: float = field(default_factory=lambda: _env_float("ITIPS_INCIDENT_CONFIRMATION_DWELL_SECONDS", 5.0))
-    confirmation_window_seconds: float = field(default_factory=lambda: _env_float("ITIPS_INCIDENT_CONFIRMATION_WINDOW_SECONDS", 30.0))
     idle_timeout_seconds: float = field(default_factory=lambda: _env_float("ITIPS_INCIDENT_IDLE_TIMEOUT_SECONDS", 15.0))
 
 

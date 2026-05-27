@@ -1,8 +1,9 @@
 """Two-stage AlertEngine: PRELIMINARY → CONFIRMED transitions + finalize.
 
-Driven by Dahua-native handlers — no sensor hub, no per-track behaviour
-alerts. The test fakes are deliberately tiny so we exercise the engine,
-not the wiring.
+Promotion happens on explicit verdict signals only — face_intruder, fire,
+smoke. Dwell-based promotion was removed once the ThreatEvaluator started
+producing definitive verdicts; behaviour events open and update the
+preliminary but never auto-promote it.
 """
 
 from __future__ import annotations
@@ -71,15 +72,13 @@ class _FakePackager:
         return self.store_root / "incidents" / incident_id
 
 
-def _engine(tmp_path, *, dwell=0.5, idle=0.5):
+def _engine(tmp_path, *, idle=0.5):
     intake = _FakeIntake()
     recorder = _FakeRecorder()
     packager = _FakePackager(tmp_path)
     engine = AlertEngine(
         intake=intake, evidence_packager=packager, tenant=_Tenant(),
         recorders={1: recorder, 2: recorder},
-        confirmation_dwell_seconds=dwell,
-        confirmation_window_seconds=30.0,
         idle_timeout_seconds=idle,
     )
     return engine, intake, recorder, packager
@@ -104,22 +103,40 @@ def test_camera_event_opens_preliminary_and_starts_recording(tmp_path):
 
 
 def test_face_intruder_promotes(tmp_path):
-    engine, _, _, _ = _engine(tmp_path, dwell=999)
+    engine, _, _, _ = _engine(tmp_path)
     engine.handle_face_intruder(camera_id=2, face_bbox=(10, 10, 20, 20), name="INTRUDER")
     assert _stage_for(engine, 2) == STAGE_CONFIRMED
 
 
-def test_loitering_promotes_immediately(tmp_path):
-    engine, _, _, _ = _engine(tmp_path, dwell=999)
+def test_behaviour_events_stay_preliminary_without_verdict_signal(tmp_path):
+    """Without dwell-promotion, repeated behaviour alerts no longer
+    auto-confirm. Promotion now requires an explicit verdict signal
+    (face_intruder, fire, smoke) from the threat evaluator."""
+    engine, _, _, _ = _engine(tmp_path)
+    engine.handle_behaviour_alert_simple(
+        camera_id=1, alert_type="intrusion", details={},
+    )
+    assert _stage_for(engine, 1) == STAGE_PRELIMINARY
+    time.sleep(0.3)
+    engine.handle_behaviour_alert_simple(
+        camera_id=1, alert_type="intrusion", details={},
+    )
+    # Still preliminary — would have been CONFIRMED under the old dwell rule.
+    assert _stage_for(engine, 1) == STAGE_PRELIMINARY
+
+
+def test_loitering_alone_does_not_promote(tmp_path):
+    """Loitering used to special-case auto-promote; now it stays
+    preliminary until the evaluator fires a face_intruder verdict."""
+    engine, _, _, _ = _engine(tmp_path)
     engine.handle_behaviour_alert_simple(
         camera_id=1, alert_type="loitering", details={},
     )
-    # loitering is camera-classified — no Jetson dwell needed.
-    assert _stage_for(engine, 1) == STAGE_CONFIRMED
+    assert _stage_for(engine, 1) == STAGE_PRELIMINARY
 
 
 def test_fire_promotes_immediately(tmp_path):
-    engine, intake, _, _ = _engine(tmp_path, dwell=999)
+    engine, intake, _, _ = _engine(tmp_path)
     engine.handle_fire(camera_id=1, details={"rule": "FireDetection"})
     assert _stage_for(engine, 1) == STAGE_CONFIRMED
     confirmed = [e for e in intake.emitted if e["endpoint"] == "A3"
@@ -137,21 +154,8 @@ def test_personnel_seen_does_not_open_incident(tmp_path):
     assert engine.active_incidents() == []
 
 
-def test_dwell_promotes_after_repeated_events(tmp_path):
-    engine, _, _, _ = _engine(tmp_path, dwell=0.2)
-    engine.handle_behaviour_alert_simple(
-        camera_id=1, alert_type="intrusion", details={},
-    )
-    assert _stage_for(engine, 1) == STAGE_PRELIMINARY
-    time.sleep(0.3)
-    engine.handle_behaviour_alert_simple(
-        camera_id=1, alert_type="intrusion", details={},
-    )
-    assert _stage_for(engine, 1) == STAGE_CONFIRMED
-
-
 def test_idle_timeout_finalizes_incident(tmp_path):
-    engine, intake, recorder, packager = _engine(tmp_path, dwell=999, idle=0.3)
+    engine, intake, recorder, packager = _engine(tmp_path, idle=0.3)
     engine.start()
     try:
         engine.handle_behaviour_alert_simple(
