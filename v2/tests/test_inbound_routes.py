@@ -19,18 +19,18 @@ from itips.api.personnel_store import PersonnelStore
 
 
 @dataclass
-class _FakeFaceDB:
-    next_uid: str = "0001"
-    added: list = field(default_factory=list)
-    deleted: list = field(default_factory=list)
+class _FakeFaceEngine:
+    """Mimics itips.ml.face_engine.FaceEngine's enrol/remove surface."""
+    enrolled: dict = field(default_factory=dict)  # person_id -> full_name
+    no_face: bool = False
 
-    def add_person(self, *, group_id, name, jpeg, sex=None, birthday=None, **_):
-        self.added.append({"group_id": group_id, "name": name, "bytes": len(jpeg)})
-        uid, self.next_uid = self.next_uid, str(int(self.next_uid) + 1).zfill(4)
-        return uid
+    def enroll(self, *, person_id, full_name, image_bytes):
+        if self.no_face:
+            raise ValueError("no face found in enrolment image")
+        self.enrolled[person_id] = full_name
 
-    def delete_person(self, *, group_id, uid):
-        self.deleted.append((group_id, uid))
+    def remove(self, person_id):
+        return self.enrolled.pop(person_id, None) is not None
 
 
 @dataclass
@@ -58,8 +58,6 @@ class _FakeDeterrence:
 @dataclass
 class _FakeClient:
     camera_id: int
-    workers_group_id: str = "10000"
-    face_db: _FakeFaceDB = field(default_factory=_FakeFaceDB)
     ptz: _FakePTZ = field(default_factory=_FakePTZ)
     deterrence: _FakeDeterrence = field(default_factory=_FakeDeterrence)
 
@@ -82,44 +80,62 @@ def _jpeg_b64() -> str:
     return base64.b64encode(b"\xff\xd8\xff\xe0not really a jpeg but it's bytes").decode("ascii")
 
 
-def test_personnel_sync_adds_to_every_camera(tmp_path):
-    dahua = _FakeDahua({1: _FakeClient(1), 2: _FakeClient(2)})
+def test_personnel_sync_enrolls_into_face_engine(tmp_path):
+    engine = _FakeFaceEngine()
     store = PersonnelStore(db_path=tmp_path / "p.sqlite")
     result = _apply_personnel_sync(
         {"action": "add", "person_id": "p1", "full_name": "Worker A",
          "image_b64": _jpeg_b64()},
-        dahua, store,
+        store, engine,
     )
     assert result["synced"] is True
-    assert set(result["cameras"].keys()) == {1, 2}
+    assert engine.enrolled == {"p1": "Worker A"}
     record = store.get("p1")
     assert record is not None
     assert record.full_name == "Worker A"
-    assert set(record.per_camera.keys()) == {1, 2}
 
 
-def test_personnel_sync_deactivate_clears_every_camera(tmp_path):
-    cam1 = _FakeClient(1)
-    cam2 = _FakeClient(2)
-    dahua = _FakeDahua({1: cam1, 2: cam2})
+def test_personnel_sync_deactivate_removes_embedding(tmp_path):
+    engine = _FakeFaceEngine()
     store = PersonnelStore(db_path=tmp_path / "p.sqlite")
     _apply_personnel_sync(
         {"action": "add", "person_id": "p1", "full_name": "X",
-         "image_b64": _jpeg_b64()}, dahua, store,
+         "image_b64": _jpeg_b64()}, store, engine,
     )
     result = _apply_personnel_sync(
-        {"action": "deactivate", "person_id": "p1"}, dahua, store,
+        {"action": "deactivate", "person_id": "p1"}, store, engine,
     )
     assert result["synced"] is True
-    assert sorted(result["cameras_cleared"]) == [1, 2]
     assert store.get("p1") is None
-    assert cam1.face_db.deleted and cam2.face_db.deleted
+    assert "p1" not in engine.enrolled
+
+
+def test_personnel_sync_no_face_engine_does_not_sync(tmp_path):
+    store = PersonnelStore(db_path=tmp_path / "p.sqlite")
+    result = _apply_personnel_sync(
+        {"action": "add", "person_id": "p1", "full_name": "Worker A",
+         "image_b64": _jpeg_b64()},
+        store, None,
+    )
+    assert result["synced"] is False
+    assert store.get("p1") is None
+
+
+def test_personnel_sync_no_detectable_face_does_not_sync(tmp_path):
+    engine = _FakeFaceEngine(no_face=True)
+    store = PersonnelStore(db_path=tmp_path / "p.sqlite")
+    result = _apply_personnel_sync(
+        {"action": "add", "person_id": "p1", "full_name": "Worker A",
+         "image_b64": _jpeg_b64()},
+        store, engine,
+    )
+    assert result["synced"] is False
+    assert store.get("p1") is None
 
 
 def test_personnel_sync_rejects_missing_fields(tmp_path):
-    dahua = _FakeDahua({})
     store = PersonnelStore(db_path=tmp_path / "p.sqlite")
-    result = _apply_personnel_sync({"action": "add"}, dahua, store)
+    result = _apply_personnel_sync({"action": "add"}, store, _FakeFaceEngine())
     assert result["synced"] is False
 
 

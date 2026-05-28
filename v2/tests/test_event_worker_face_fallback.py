@@ -1,9 +1,9 @@
-"""Event-worker face fallback wiring.
+"""Event-worker face routing — ML-only.
 
-Drives `_handle_face_detection` with a stub FaceEngine + CapabilityRouter
-to confirm the dispatcher promotes bare FaceDetection events to either
-`handle_personnel_seen` or `handle_face_intruder` when the camera lacks
-native FaceRecognition.
+Identity is decided solely by the local face engine; the Dahua cameras'
+onboard FaceRecognition result (`Candidates`) is ignored. When a threat
+evaluator is wired it owns the decision (multi-frame window); otherwise the
+dispatcher runs the engine directly on the event frame.
 
 No InsightFace, no Dahua. Pure routing test.
 """
@@ -20,7 +20,7 @@ from itips.runtime.event_worker import DahuaEventDispatcher, WorkerDeps
 from itips.sensors.dahua_events import DahuaEvent
 
 
-def _make_event(bbox=(100, 100, 200, 200)) -> DahuaEvent:
+def _detection_event(bbox=(100, 100, 200, 200)) -> DahuaEvent:
     return DahuaEvent(
         camera_id=1,
         code="FaceDetection",
@@ -31,7 +31,18 @@ def _make_event(bbox=(100, 100, 200, 200)) -> DahuaEvent:
     )
 
 
-def _make_dispatcher(face_engine, capability_router, alert_engine):
+def _recognition_event(*, candidates=None) -> DahuaEvent:
+    """Camera-native FaceRecognition event — its Candidates must be ignored."""
+    return DahuaEvent(
+        camera_id=1, code="FaceRecognition", action="Pulse", index=0,
+        data={"Candidates": candidates or [],
+              "Face": {"BoundingBox": [100, 100, 200, 200]}},
+        jpeg=None,
+    )
+
+
+def _make_dispatcher(face_engine, alert_engine, *,
+                     capability_router=None, threat_evaluator=None):
     deps = WorkerDeps(
         alert_engine=alert_engine,
         frame_bus=MagicMock(),
@@ -39,9 +50,10 @@ def _make_dispatcher(face_engine, capability_router, alert_engine):
         event_tap=None,
         capability_router=capability_router,
         face_engine=face_engine,
+        threat_evaluator=threat_evaluator,
     )
-    # Stub out network init by handing it an unparseable rtsp_url —
-    # dispatcher will set _listener=None and never run the network loop.
+    # Stub out network init — dispatcher is constructed without __init__ so it
+    # never opens the RTSP event stream.
     d = DahuaEventDispatcher.__new__(DahuaEventDispatcher)
     d.camera_id = 1
     d.deps = deps
@@ -52,41 +64,30 @@ def _frame() -> np.ndarray:
     return np.zeros((480, 640, 3), dtype="uint8")
 
 
-# ─── routing decisions ──────────────────────────────────────────────
-
-
-def test_native_fr_path_just_logs_bbox(monkeypatch):
-    """Capability router says FR is native → engine MUST NOT be called."""
-    alert = MagicMock()
-    router = CapabilityRouter()
-    router.set_camera(CapabilitySnapshot(
-        camera_id=1, native={Capability.FACE_RECOGNITION: True},
-    ))
-    engine = MagicMock()  # would explode if called
-    d = _make_dispatcher(engine, router, alert)
-
-    d._handle_face_detection(_make_event(), _frame())
-
-    engine.recognize.assert_not_called()
-    alert.handle_behaviour_alert_simple.assert_called_once()
-    call = alert.handle_behaviour_alert_simple.call_args.kwargs
-    assert call["alert_type"] == "face_detected"
-
-
-def test_fallback_match_promotes_to_personnel_seen():
-    alert = MagicMock()
-    router = CapabilityRouter()
-    router.set_camera(CapabilitySnapshot(
-        camera_id=1, native={Capability.FACE_RECOGNITION: False},
-    ))
-    engine = MagicMock()
-    engine.recognize.return_value = RecognitionResult(
-        matched=True, person_id="p-42", full_name="Sam",
-        similarity=0.78, embedding=None,
+def _match(person_id="p-42", name="Sam", sim=0.78) -> RecognitionResult:
+    return RecognitionResult(
+        matched=True, person_id=person_id, full_name=name,
+        similarity=sim, embedding=None,
     )
-    d = _make_dispatcher(engine, router, alert)
 
-    d._handle_face_detection(_make_event(), _frame())
+
+def _no_match(sim=0.10) -> RecognitionResult:
+    return RecognitionResult(
+        matched=False, person_id=None, full_name=None,
+        similarity=sim, embedding=None,
+    )
+
+
+# ─── FaceDetection routing ───────────────────────────────────────────
+
+
+def test_face_detection_match_promotes_to_personnel_seen():
+    alert = MagicMock()
+    engine = MagicMock()
+    engine.recognize.return_value = _match(person_id="p-42", name="Sam", sim=0.78)
+    d = _make_dispatcher(engine, alert)
+
+    d._handle_face_detection(_detection_event(), _frame())
 
     engine.recognize.assert_called_once()
     alert.handle_personnel_seen.assert_called_once()
@@ -97,40 +98,45 @@ def test_fallback_match_promotes_to_personnel_seen():
     alert.handle_behaviour_alert_simple.assert_not_called()
 
 
-def test_fallback_no_match_promotes_to_face_intruder():
+def test_face_detection_no_match_promotes_to_face_intruder():
     alert = MagicMock()
-    router = CapabilityRouter()
-    router.set_camera(CapabilitySnapshot(
-        camera_id=1, native={Capability.FACE_RECOGNITION: False},
-    ))
     engine = MagicMock()
-    engine.recognize.return_value = RecognitionResult(
-        matched=False, person_id=None, full_name=None,
-        similarity=0.10, embedding=None,
-    )
-    d = _make_dispatcher(engine, router, alert)
+    engine.recognize.return_value = _no_match()
+    d = _make_dispatcher(engine, alert)
 
-    d._handle_face_detection(_make_event(), _frame())
+    d._handle_face_detection(_detection_event(), _frame())
 
     alert.handle_face_intruder.assert_called_once()
-    kw = alert.handle_face_intruder.call_args.kwargs
-    assert kw["name"] == "INTRUDER"
+    assert alert.handle_face_intruder.call_args.kwargs["name"] == "INTRUDER"
     alert.handle_personnel_seen.assert_not_called()
     alert.handle_behaviour_alert_simple.assert_not_called()
 
 
-def test_engine_crash_degrades_to_bare_bbox():
-    """A broken face engine must not block the rest of the lifecycle."""
+def test_face_detection_uses_engine_even_when_router_says_native():
+    """Capability router no longer gates face — engine runs regardless."""
     alert = MagicMock()
     router = CapabilityRouter()
     router.set_camera(CapabilitySnapshot(
-        camera_id=1, native={Capability.FACE_RECOGNITION: False},
+        camera_id=1, native={Capability.FACE_RECOGNITION: True},
     ))
     engine = MagicMock()
-    engine.recognize.side_effect = RuntimeError("model OOM")
-    d = _make_dispatcher(engine, router, alert)
+    engine.recognize.return_value = _match()
+    d = _make_dispatcher(engine, alert, capability_router=router)
 
-    d._handle_face_detection(_make_event(), _frame())
+    d._handle_face_detection(_detection_event(), _frame())
+
+    engine.recognize.assert_called_once()
+    alert.handle_personnel_seen.assert_called_once()
+
+
+def test_face_detection_engine_crash_degrades_to_bare_bbox():
+    """A broken face engine must not block the rest of the lifecycle."""
+    alert = MagicMock()
+    engine = MagicMock()
+    engine.recognize.side_effect = RuntimeError("model OOM")
+    d = _make_dispatcher(engine, alert)
+
+    d._handle_face_detection(_detection_event(), _frame())
 
     alert.handle_personnel_seen.assert_not_called()
     alert.handle_face_intruder.assert_not_called()
@@ -138,118 +144,106 @@ def test_engine_crash_degrades_to_bare_bbox():
     assert alert.handle_behaviour_alert_simple.call_args.kwargs["alert_type"] == "face_detected"
 
 
-def test_no_frame_means_no_fallback_even_if_capability_says_so():
+def test_face_detection_no_frame_logs_bbox():
     """Without a frame we can't run inference — bare bbox is right."""
     alert = MagicMock()
-    router = CapabilityRouter()
-    router.set_camera(CapabilitySnapshot(
-        camera_id=1, native={Capability.FACE_RECOGNITION: False},
-    ))
     engine = MagicMock()
-    d = _make_dispatcher(engine, router, alert)
+    d = _make_dispatcher(engine, alert)
 
-    d._handle_face_detection(_make_event(), None)
+    d._handle_face_detection(_detection_event(), None)
 
     engine.recognize.assert_not_called()
     alert.handle_behaviour_alert_simple.assert_called_once()
 
 
-def test_no_router_and_no_engine_keeps_baseline_behavior():
-    """Vanilla v2 deploy with no ML wired → existing behavior."""
+def test_face_detection_no_engine_keeps_baseline_behavior():
+    """Vanilla deploy with no ML wired → bare behaviour alert."""
     alert = MagicMock()
-    d = _make_dispatcher(face_engine=None, capability_router=None, alert_engine=alert)
-    d._handle_face_detection(_make_event(), _frame())
+    d = _make_dispatcher(face_engine=None, alert_engine=alert)
+
+    d._handle_face_detection(_detection_event(), _frame())
+
     alert.handle_behaviour_alert_simple.assert_called_once()
 
 
-# ─── FaceRecognition override path ────────────────────────────────────
+# ─── FaceRecognition routing ─────────────────────────────────────────
 
 
-def _fr_event(*, candidates) -> DahuaEvent:
-    """Camera-native FaceRecognition event with a Candidates list."""
-    return DahuaEvent(
-        camera_id=1, code="FaceRecognition", action="Pulse", index=0,
-        data={"Candidates": candidates,
-              "Face": {"BoundingBox": [100, 100, 200, 200]}},
-        jpeg=None,
-    )
-
-
-def test_face_recognition_trusts_camera_candidates_by_default():
-    """No override → camera's Candidates win, Jetson FR not called."""
+def test_face_recognition_ignores_camera_candidates():
+    """Camera says 'Alice'; the engine says 'Sam' → the engine wins."""
     alert = MagicMock()
-    router = CapabilityRouter()
-    router.set_camera(CapabilitySnapshot(
-        camera_id=1, native={Capability.FACE_RECOGNITION: True},
-    ))
     engine = MagicMock()
-    d = _make_dispatcher(engine, router, alert)
+    engine.recognize.return_value = _match(person_id="p-99", name="Sam", sim=0.82)
+    d = _make_dispatcher(engine, alert)
+
     d._handle_face_recognition(
-        _fr_event(candidates=[{
+        _recognition_event(candidates=[{
             "Person": {"UID": "cam-uid-7", "GroupID": "g1", "Name": "Alice"},
             "Similarity": 92,
         }]),
         _frame(),
     )
-    engine.recognize.assert_not_called()
-    alert.handle_personnel_seen.assert_called_once()
-    kw = alert.handle_personnel_seen.call_args.kwargs
-    assert kw["person_uid"] == "cam-uid-7"
-    assert kw["name"] == "Alice"
-    assert kw["group_id"] == "g1"   # camera's group, not "jetson-fallback"
-    assert kw["similarity"] == 92
 
-
-def test_face_recognition_routes_through_jetson_when_override_forces_fallback():
-    """Operator-forced fallback → ignore camera Candidates, run Jetson FR."""
-    alert = MagicMock()
-    router = CapabilityRouter()
-    router.set_camera(CapabilitySnapshot(
-        camera_id=1, native={Capability.FACE_RECOGNITION: True},
-    ))
-    router.set_override(1, Capability.FACE_RECOGNITION, True)
-    engine = MagicMock()
-    engine.recognize.return_value = RecognitionResult(
-        matched=True, person_id="p-99", full_name="Sam",
-        similarity=0.82, embedding=None,
-    )
-    d = _make_dispatcher(engine, router, alert)
-    d._handle_face_recognition(
-        _fr_event(candidates=[{
-            "Person": {"UID": "stale-cam-uid", "GroupID": "g1", "Name": "WrongPerson"},
-            "Similarity": 51,
-        }]),
-        _frame(),
-    )
-    # Jetson decided identity, not the camera.
     engine.recognize.assert_called_once()
     alert.handle_personnel_seen.assert_called_once()
     kw = alert.handle_personnel_seen.call_args.kwargs
-    assert kw["person_uid"] == "p-99"
+    assert kw["person_uid"] == "p-99"      # engine's identity, not the camera's
     assert kw["name"] == "Sam"
     assert kw["group_id"] == "jetson-fallback"
 
 
-def test_face_recognition_override_with_no_jetson_match_fires_intruder():
-    """Forced Jetson FR + Jetson says no match → INTRUDER (not the camera's)."""
+def test_face_recognition_no_engine_match_fires_intruder():
+    """Camera 'matched' someone, but the engine disagrees → INTRUDER."""
     alert = MagicMock()
-    router = CapabilityRouter()
-    router.set_camera(CapabilitySnapshot(
-        camera_id=1, native={Capability.FACE_RECOGNITION: True},
-    ))
-    router.set_override(1, Capability.FACE_RECOGNITION, True)
     engine = MagicMock()
-    engine.recognize.return_value = RecognitionResult(
-        matched=False, person_id=None, full_name=None,
-        similarity=0.18, embedding=None,
-    )
-    d = _make_dispatcher(engine, router, alert)
+    engine.recognize.return_value = _no_match(sim=0.18)
+    d = _make_dispatcher(engine, alert)
+
     d._handle_face_recognition(
-        _fr_event(candidates=[{
+        _recognition_event(candidates=[{
             "Person": {"UID": "cam-thinks-known", "GroupID": "g1", "Name": "GhostMatch"},
             "Similarity": 70,
         }]),
         _frame(),
     )
+
     alert.handle_face_intruder.assert_called_once()
     alert.handle_personnel_seen.assert_not_called()
+
+
+def test_face_recognition_no_engine_skips_recognition():
+    """No engine and no evaluator → log only, never blindly alarm."""
+    alert = MagicMock()
+    d = _make_dispatcher(face_engine=None, alert_engine=alert)
+
+    d._handle_face_recognition(
+        _recognition_event(candidates=[{
+            "Person": {"UID": "cam-uid", "GroupID": "g1", "Name": "Alice"},
+            "Similarity": 92,
+        }]),
+        _frame(),
+    )
+
+    alert.handle_personnel_seen.assert_not_called()
+    alert.handle_face_intruder.assert_not_called()
+    alert.handle_behaviour_alert_simple.assert_not_called()
+
+
+# ─── threat evaluator owns the decision when wired ───────────────────
+
+
+def test_evaluator_takes_over_both_face_events():
+    """With an evaluator wired, both face events route to it and the engine
+    is never called directly on the single event frame."""
+    alert = MagicMock()
+    engine = MagicMock()
+    evaluator = MagicMock()
+    d = _make_dispatcher(engine, alert, threat_evaluator=evaluator)
+
+    d._handle_face_detection(_detection_event(), _frame())
+    d._handle_face_recognition(_recognition_event(), _frame())
+
+    assert evaluator.trigger.call_count == 2
+    engine.recognize.assert_not_called()
+    alert.handle_personnel_seen.assert_not_called()
+    alert.handle_face_intruder.assert_not_called()

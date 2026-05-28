@@ -156,7 +156,7 @@ paths:
   /api/workers:
     get:
       tags: [Workers]
-      summary: Local person_id → per-camera UID map
+      summary: List enrolled workers
       responses:
         "200":
           description: OK
@@ -165,12 +165,11 @@ paths:
               schema: { $ref: "#/components/schemas/WorkerList" }
     post:
       tags: [Workers]
-      summary: Enroll a worker on every camera
+      summary: Enroll a worker into the local face engine
       description: |
-        Sends the JPEG to each camera's
-        `/cgi-bin/faceRecognitionServer.cgi?action=addPerson`. The Jetson stores
-        the resulting camera UIDs alongside the operator-supplied `person_id` so
-        a later DELETE can find them again.
+        Computes an InsightFace embedding from the JPEG and stores it keyed by
+        `person_id`. Recognition runs entirely on this embedding store — the
+        cameras' onboard face DB is not used.
       requestBody:
         required: true
         content:
@@ -181,7 +180,6 @@ paths:
               properties:
                 full_name: { type: string }
                 person_id: { type: string, description: "Optional. Auto-generated if omitted." }
-                sex: { type: string, enum: [Male, Female, Unknown] }
                 image:
                   type: string
                   format: binary
@@ -192,32 +190,13 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/WorkerEnrollResult" }
-
-  /api/workers/{camera_id}:
-    get:
-      tags: [Workers]
-      summary: Reality-check the workers group as the camera sees it
-      parameters:
-        - { name: camera_id, in: path, required: true, schema: { type: integer } }
-      responses:
-        "200":
-          description: OK
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  camera_id: { type: integer }
-                  group_id: { type: string }
-                  people:
-                    type: array
-                    items: { $ref: "#/components/schemas/CameraPerson" }
-        "404": { description: camera not registered }
+        "422": { description: no detectable face in the image }
+        "503": { description: face engine unavailable }
 
   /api/workers/{person_id}:
     delete:
       tags: [Workers]
-      summary: Remove a worker from every camera that has them enrolled
+      summary: Remove a worker's enrolled embedding
       parameters:
         - { name: person_id, in: path, required: true, schema: { type: string } }
       responses:
@@ -229,12 +208,6 @@ paths:
                 type: object
                 properties:
                   ok: { type: boolean }
-                  cameras_cleared:
-                    type: array
-                    items: { type: integer }
-                  failures:
-                    type: array
-                    items: { type: string }
         "404": { description: unknown person_id }
 
   /api/plates:
@@ -468,7 +441,7 @@ paths:
   /local/api/v1/personnel/sync:
     post:
       tags: [Inbound]
-      summary: B1 — sync a worker face into every camera
+      summary: B1 — sync a worker face into the local face engine
       security: [{ bearerAuth: [] }]
       requestBody:
         required: true
@@ -1007,35 +980,20 @@ components:
             properties:
               person_id: { type: string }
               full_name: { type: string }
-              cameras:
-                type: object
-                additionalProperties: { type: string }
-        available_cameras:
-          type: array
-          items: { type: integer }
+              jetson_enrolled:
+                type: boolean
+                description: true when an embedding exists in the face engine store
+        jetson_available:
+          type: boolean
+          description: whether the local face engine is wired up
 
     WorkerEnrollResult:
       type: object
       properties:
         ok: { type: boolean }
         person_id: { type: string }
-        cameras:
-          type: object
-          additionalProperties:
-            type: string
-            description: per-camera UID assigned by the camera
-        failures:
-          type: array
-          items: { type: string }
-
-    CameraPerson:
-      type: object
-      properties:
-        uid: { type: string }
-        group_id: { type: string }
-        name: { type: string }
-        sex: { type: string, nullable: true }
-        has_image: { type: boolean }
+        full_name: { type: string }
+        error: { type: string, description: present only when ok is false }
 
     PlateRecord:
       type: object
@@ -1100,25 +1058,15 @@ components:
           type: string
           description: |
             Base64-encoded JPEG. Required for `add` / `update`. The Jetson
-            forwards the bytes to each camera's
-            `faceRecognitionServer.cgi?action=addPerson`.
-        sex: { type: string, enum: [Male, Female, Unknown] }
-        birthday: { type: string, example: "1990-01-15" }
+            computes an InsightFace embedding from the bytes and stores it
+            keyed by `person_id`.
 
     B1Result:
       type: object
       properties:
         synced: { type: boolean }
         person_id: { type: string }
-        cameras:
-          type: object
-          additionalProperties: { type: string }
-        cameras_cleared:
-          type: array
-          items: { type: integer }
-        failures:
-          type: array
-          items: { type: string }
+        reason: { type: string, description: present only when synced is false }
 
     B3Payload:
       type: object

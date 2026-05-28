@@ -61,8 +61,9 @@ class WorkerDeps:
         self.frame_bus = frame_bus
         self.recorders = recorders or {}
         self.event_tap = event_tap
-        # ML fallbacks — None in baseline. Engine fires only when the
-        # capability_router says the camera lacks the native path.
+        # ML engines — None in baseline. Face recognition always runs on
+        # face_engine (the camera's onboard FR is no longer used); ANPR and
+        # IVS still fall back only when capability_router says so.
         self.capability_router = capability_router
         self.face_engine = face_engine
         self.plate_engine = plate_engine
@@ -242,64 +243,40 @@ class DahuaEventDispatcher(threading.Thread):
     # ─── per-event handlers ───────────────────────────────────────────
 
     def _handle_face_recognition(self, event: DahuaEvent, frame: Optional["np.ndarray"]) -> None:
-        """Camera's onboard FR result.
+        """Camera fired a FaceRecognition event.
 
-        Order of operations matters:
+        The camera's onboard match (`Candidates`) is deliberately ignored —
+        identity is decided solely by the local face engine. The event only
+        tells us a face was seen, so we route it into the same ML decision
+        path as a bare FaceDetection:
 
-        1. **Operator-forced Jetson FR**: the camera's match is ignored
-           and the Jetson re-decides identity. Must run BEFORE we trust
-           the camera's `Candidates` list, otherwise a stale enrollment
-           on the camera can mask a true intruder.
-        2. **Camera matched (Candidates non-empty)**: log personnel_seen
-           directly. No multi-frame gate needed — the camera made the
-           call, end of story.
-        3. **Camera unmatched (Candidates empty)**: route into the
-           evaluator's decision window so a single back-to-camera frame
-           doesn't fire INTRUDER on its own.
+        1. **Threat evaluator** (preferred): multi-frame decision window so a
+           single back-to-camera frame can't fire INTRUDER on its own.
+        2. **Direct face engine**: single-frame recognise → personnel_seen on
+           match, INTRUDER only on a confident no-match.
+        3. **Neither available**: we have no way to recognise, so log only
+           rather than blindly alarming on every face.
         """
         face = event.data.get("Face", {}) or {}
         bbox = _face_bbox(face)
 
-        if self._should_fallback_to_face_engine() and frame is not None:
-            if self._dispatch_face_fallback(frame, bbox):
-                return
-
-        candidates = event.data.get("Candidates") or []
-        if candidates:
-            top = candidates[0]
-            person = top.get("Person", {}) if isinstance(top, dict) else {}
-            similarity = int(top.get("Similarity", 0) or 0) if isinstance(top, dict) else 0
-            self.deps.alert_engine.handle_personnel_seen(
-                camera_id=self.camera_id,
-                person_uid=str(person.get("UID", "")),
-                group_id=str(person.get("GroupID", "")),
-                name=str(person.get("Name", "")),
-                similarity=similarity,
-            )
-            logger.info(
-                "cam %d FaceRecognition KNOWN uid=%s name=%s sim=%d",
-                self.camera_id, person.get("UID"), person.get("Name"), similarity,
-            )
-            return
-
         if self.deps.threat_evaluator is not None:
             self.deps.threat_evaluator.trigger(
                 camera_id=self.camera_id,
-                trigger_kind="camera:face_unmatched",
+                trigger_kind="camera:face_event",
                 initial_frame=frame,
                 details={"bbox": list(bbox)},
             )
             return
 
-        # Legacy direct INTRUDER path — runs only when neither the
-        # evaluator nor the Jetson FR fallback is available.
-        self.deps.alert_engine.handle_face_intruder(
-            camera_id=self.camera_id,
-            face_bbox=bbox,
-            name="INTRUDER",
+        if self.deps.face_engine is not None and frame is not None:
+            if self._dispatch_face_fallback(frame, bbox):
+                return
+
+        logger.info(
+            "cam %d FaceRecognition: no face engine/evaluator — recognition skipped",
+            self.camera_id,
         )
-        logger.info("cam %d FaceRecognition INTRUDER (no evaluator, no candidates)",
-                    self.camera_id)
 
     def _handle_face_detection(self, event: DahuaEvent, frame: Optional["np.ndarray"]) -> None:
         """Bare face-detected event from the camera.
@@ -318,24 +295,13 @@ class DahuaEventDispatcher(threading.Thread):
                 details={"bbox": list(bbox)},
             )
             return
-        if self._should_fallback_to_face_engine() and frame is not None:
+        if self.deps.face_engine is not None and frame is not None:
             if self._dispatch_face_fallback(frame, bbox):
                 return
         self.deps.alert_engine.handle_behaviour_alert_simple(
             camera_id=self.camera_id,
             alert_type="face_detected",
             details={"bbox": list(bbox)},
-        )
-
-    def _should_fallback_to_face_engine(self) -> bool:
-        if self.deps.face_engine is None or self.deps.capability_router is None:
-            return False
-        try:
-            from itips.ml.capability_router import Capability
-        except Exception:
-            return False
-        return self.deps.capability_router.needs_fallback(
-            self.camera_id, Capability.FACE_RECOGNITION,
         )
 
     def _maybe_validate(

@@ -123,15 +123,11 @@ export interface HubStateResponse {
 export interface Worker {
   person_id: string;
   full_name: string;
-  cameras?: Record<string, string>;
   jetson_enrolled?: boolean;
 }
 export interface WorkersResponse {
   workers: Worker[];
-  available_cameras?: number[];
-}
-export interface CameraWorkersResponse {
-  people: Array<{ uid: string; name: string; sex?: string }>;
+  jetson_available?: boolean;
 }
 
 // ─── health ──────────────────────────────────────────────────────────

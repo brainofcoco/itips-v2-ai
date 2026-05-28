@@ -15,9 +15,9 @@ work). Payload supports two shapes:
   * `{"action":"add","person_id":"p1","full_name":"...","image_b64":"..."}`
   * `{"action":"deactivate","person_id":"p1"}`
 
-For `add`/`update` we fan out to every active camera's FaceRecognitionServer
-and record the camera-assigned UID alongside our `person_id`. On `deactivate`
-we look up those UIDs and delete on every camera.
+For `add`/`update` we enrol the JPEG into the local face engine (InsightFace
+embeddings) keyed by `person_id`; on `deactivate` we drop that embedding. The
+Dahua cameras' onboard face DB is no longer used.
 
 Commands (B4)
 -------------
@@ -38,7 +38,6 @@ from flask import Flask, jsonify, request
 
 from config.settings import settings
 from itips.api.personnel_store import PersonnelStore
-from itips.camera.dahua_face_db import DahuaFaceDBError
 from itips.camera.dahua_manager import DahuaManager
 
 logger = logging.getLogger(__name__)
@@ -50,10 +49,12 @@ class InboundApiServer(threading.Thread):
         *,
         dahua_manager: DahuaManager,
         personnel_store: PersonnelStore,
+        face_engine: Any = None,
     ) -> None:
         super().__init__(name="api-inbound", daemon=True)
         self._dahua = dahua_manager
         self._personnel = personnel_store
+        self._face_engine = face_engine
         self._app = self._build_app()
         self._server = None
         self._stop = threading.Event()
@@ -83,7 +84,9 @@ class InboundApiServer(threading.Thread):
         @app.post("/local/api/v1/personnel/sync")
         def b1_personnel_sync():
             payload = request.get_json(silent=True) or {}
-            result = _apply_personnel_sync(payload, self._dahua, self._personnel)
+            result = _apply_personnel_sync(
+                payload, self._personnel, self._face_engine,
+            )
             return jsonify(result)
 
         @app.post("/local/api/v1/config")
@@ -141,8 +144,8 @@ class InboundApiServer(threading.Thread):
 
 def _apply_personnel_sync(
     payload: dict[str, Any],
-    dahua: DahuaManager,
     personnel: PersonnelStore,
+    face_engine: Any,
 ) -> dict[str, Any]:
     action = payload.get("action")
     person_id = payload.get("person_id")
@@ -150,7 +153,7 @@ def _apply_personnel_sync(
         return {"synced": False, "reason": "invalid payload"}
 
     if action == "deactivate":
-        return _deactivate_person(str(person_id), dahua, personnel)
+        return _deactivate_person(str(person_id), personnel, face_engine)
 
     image_b64 = payload.get("image_b64") or payload.get("image")
     if not image_b64:
@@ -164,10 +167,8 @@ def _apply_personnel_sync(
         person_id=str(person_id),
         full_name=str(payload.get("full_name") or person_id),
         jpeg=jpeg,
-        sex=payload.get("sex"),
-        birthday=payload.get("birthday"),
-        dahua=dahua,
         personnel=personnel,
+        face_engine=face_engine,
     )
 
 
@@ -176,72 +177,47 @@ def _add_or_update_person(
     person_id: str,
     full_name: str,
     jpeg: bytes,
-    sex: Any,
-    birthday: Any,
-    dahua: DahuaManager,
     personnel: PersonnelStore,
+    face_engine: Any,
 ) -> dict[str, Any]:
-    """Fan out `addPerson` to every camera with a workers group bound."""
-    # Replace existing record (update == delete-then-add for simplicity).
-    if personnel.get(person_id):
-        _deactivate_person(person_id, dahua, personnel)
+    """Enrol the worker JPEG into the local face engine, keyed by person_id."""
+    if face_engine is None:
+        return {"synced": False, "person_id": person_id,
+                "reason": "face engine unavailable"}
+    try:
+        face_engine.enroll(
+            person_id=person_id, full_name=full_name, image_bytes=jpeg,
+        )
+    except ValueError as exc:
+        # No detectable face in the supplied image.
+        return {"synced": False, "person_id": person_id, "reason": str(exc)}
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("face enrol failed for %s: %s", person_id, exc)
+        return {"synced": False, "person_id": person_id,
+                "reason": f"enrol failed: {exc.__class__.__name__}"}
 
-    per_camera: dict[int, str] = {}
-    failures: list[str] = []
-    for client in dahua.all():
-        if not client.workers_group_id:
-            failures.append(f"cam{client.camera_id}:no-group")
-            continue
-        try:
-            uid = client.face_db.add_person(
-                group_id=client.workers_group_id,
-                name=full_name,
-                jpeg=jpeg,
-                sex=sex if isinstance(sex, str) else None,
-                birthday=birthday if isinstance(birthday, str) else None,
-            )
-            per_camera[client.camera_id] = uid
-        except (DahuaFaceDBError, Exception) as exc:  # noqa: BLE001
-            failures.append(f"cam{client.camera_id}:{exc.__class__.__name__}")
-            logger.warning("cam %d: addPerson failed for %s: %s",
-                           client.camera_id, person_id, exc)
-
-    personnel.upsert(person_id=person_id, full_name=full_name, per_camera=per_camera)
-
-    return {
-        "synced": bool(per_camera),
-        "person_id": person_id,
-        "cameras": per_camera,
-        "failures": failures,
-    }
+    personnel.upsert(person_id=person_id, full_name=full_name, per_camera={})
+    return {"synced": True, "person_id": person_id}
 
 
 def _deactivate_person(
     person_id: str,
-    dahua: DahuaManager,
     personnel: PersonnelStore,
+    face_engine: Any,
 ) -> dict[str, Any]:
-    record = personnel.get(person_id)
-    if not record:
-        return {"synced": True, "person_id": person_id, "note": "not found"}
-    removed: list[int] = []
-    failures: list[str] = []
-    for cam_id, uid in record.per_camera.items():
-        client = dahua.get(cam_id)
-        if client is None or not client.workers_group_id:
-            failures.append(f"cam{cam_id}:not-available")
-            continue
+    known = personnel.get(person_id) is not None
+    removed_ml = False
+    if face_engine is not None:
         try:
-            client.face_db.delete_person(group_id=client.workers_group_id, uid=uid)
-            removed.append(cam_id)
+            removed_ml = face_engine.remove(person_id)
         except Exception as exc:  # noqa: BLE001
-            failures.append(f"cam{cam_id}:{exc.__class__.__name__}")
+            logger.warning("face remove failed for %s: %s", person_id, exc)
     personnel.delete(person_id)
+    if not known and not removed_ml:
+        return {"synced": True, "person_id": person_id, "note": "not found"}
     return {
         "synced": True,
         "person_id": person_id,
-        "cameras_cleared": removed,
-        "failures": failures,
     }
 
 

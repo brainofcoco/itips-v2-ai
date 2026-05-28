@@ -47,27 +47,15 @@
       <span class="muted">Add a worker</span>
       <input id="worker-name" placeholder="Full name" />
       <input id="worker-person-id" placeholder="Optional person_id" />
-      <select id="worker-sex">
-        <option value="">Sex (optional)</option>
-        <option value="Male">Male</option>
-        <option value="Female">Female</option>
-      </select>
       <input type="file" id="worker-image" accept="image/jpeg,image/png" />
-      <button id="worker-add" class="primary">Enroll on all cameras</button>
+      <button id="worker-add" class="primary">Enroll worker</button>
       <span class="spacer"></span>
       <button id="worker-refresh">Refresh</button>
     </div>
     <p class="muted" id="worker-status"></p>
-    <div class="workers-layout">
-      <div>
-        <h3>Enrolled (local map)</h3>
-        <ul id="worker-list" class="alerts"></ul>
-      </div>
-      <div>
-        <h3>Camera reality check</h3>
-        <p class="muted">Per-camera group contents straight from FaceRecognitionServer.</p>
-        <div id="worker-cameras"></div>
-      </div>
+    <div>
+      <h3>Enrolled</h3>
+      <ul id="worker-list" class="alerts"></ul>
     </div>
   </section>
 

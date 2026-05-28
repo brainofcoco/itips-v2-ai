@@ -24,7 +24,6 @@ from flask import Flask, Response, abort, jsonify, request, send_file, send_from
 
 from config.settings import settings
 from itips.api.personnel_store import PersonnelStore
-from itips.camera.dahua_face_db import DahuaFaceDBError
 from itips.camera.dahua_health import run_for_all as run_health_for_all
 from itips.camera.dahua_manager import DahuaManager
 from itips.camera.dahua_plate_db import BLACK_LIST, RED_LIST, PlateListUnsupported
@@ -325,7 +324,11 @@ def register_dashboard(
             abort(404)
         return send_file(candidate, mimetype="image/jpeg")
 
-    # ─── workers (face DB) ─────────────────────────────────────────
+    # ─── workers (ML face DB) ──────────────────────────────────────
+    # Enrolment and recognition run entirely on the local face engine
+    # (InsightFace embeddings). The Dahua cameras' onboard face DB is no
+    # longer used — see itips/runtime/threat_evaluator.py for the
+    # recognition side.
 
     @app.get("/api/workers")
     def list_workers():  # noqa: ANN202
@@ -341,28 +344,11 @@ def register_dashboard(
                 {
                     "person_id": rec.person_id,
                     "full_name": rec.full_name,
-                    "cameras": rec.per_camera,
                     "jetson_enrolled": rec.person_id in jetson_ids,
                 }
                 for rec in personnel_store.list_all()
             ],
-            "available_cameras": dahua_manager.camera_ids(),
             "jetson_available": face_engine is not None,
-        })
-
-    @app.get("/api/workers/<int:camera_id>")
-    def list_workers_on_camera(camera_id: int):  # noqa: ANN202
-        client = dahua_manager.get(camera_id)
-        if client is None or not client.workers_group_id:
-            abort(404)
-        try:
-            people = client.face_db.list_persons(group_id=client.workers_group_id)
-        except Exception as exc:  # noqa: BLE001
-            return jsonify({"error": str(exc)}), 502
-        return jsonify({
-            "camera_id": camera_id,
-            "group_id": client.workers_group_id,
-            "people": [asdict(p) for p in people],
         })
 
     @app.post("/api/workers")
@@ -375,82 +361,44 @@ def register_dashboard(
         jpeg = image.read()
         if not jpeg:
             return jsonify({"ok": False, "error": "image is empty"}), 400
+        if face_engine is None:
+            return jsonify({"ok": False, "error": "face engine unavailable"}), 503
         # Derive a local person_id if the operator didn't provide one.
         if not person_id:
             from itips.utils.clock import now_utc
             person_id = f"local-{int(now_utc().timestamp())}"
 
-        per_camera: dict[int, str] = {}
-        failures: list[str] = []
-        for client in dahua_manager.all():
-            if not client.workers_group_id:
-                failures.append(f"cam{client.camera_id}:no-group")
-                continue
-            try:
-                uid = client.face_db.add_person(
-                    group_id=client.workers_group_id,
-                    name=full_name,
-                    jpeg=jpeg,
-                    sex=request.form.get("sex") or None,
-                )
-                per_camera[client.camera_id] = uid
-            except (DahuaFaceDBError, Exception) as exc:  # noqa: BLE001
-                failures.append(f"cam{client.camera_id}:{exc.__class__.__name__}")
-                logger.warning("cam %d addPerson failed: %s", client.camera_id, exc)
+        try:
+            face_engine.enroll(
+                person_id=person_id, full_name=full_name, image_bytes=jpeg,
+            )
+        except ValueError as exc:
+            # No detectable face in the supplied image — operator can retry.
+            return jsonify({"ok": False, "error": str(exc)}), 422
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("face enrol failed for %s: %s", person_id, exc)
+            return jsonify(
+                {"ok": False, "error": f"enrol failed: {exc.__class__.__name__}"}
+            ), 500
 
         personnel_store.upsert(
-            person_id=person_id, full_name=full_name, per_camera=per_camera,
+            person_id=person_id, full_name=full_name, per_camera={},
         )
-
-        # Mirror to Jetson face DB. Soft failure — missing engine /
-        # extras / no-face image must not block the native-camera path.
-        ml_enrolled = False
-        ml_error: str | None = None
-        if face_engine is not None:
-            try:
-                face_engine.enroll(
-                    person_id=person_id,
-                    full_name=full_name,
-                    image_bytes=jpeg,
-                )
-                ml_enrolled = True
-            except Exception as exc:  # noqa: BLE001
-                ml_error = exc.__class__.__name__
-                logger.warning("ml face enrol failed for %s: %s", person_id, exc)
-
-        return jsonify({
-            "ok": bool(per_camera) or ml_enrolled,
-            "person_id": person_id,
-            "cameras": per_camera,
-            "ml_enrolled": ml_enrolled,
-            "ml_error": ml_error,
-            "failures": failures,
-        })
+        return jsonify({"ok": True, "person_id": person_id, "full_name": full_name})
 
     @app.delete("/api/workers/<person_id>")
     def delete_worker(person_id: str):  # noqa: ANN202
-        record = personnel_store.get(person_id)
-        if record is None:
-            return jsonify({"ok": False, "error": "unknown person_id"}), 404
-        cleared: list[int] = []
-        failures: list[str] = []
-        for cam_id, uid in record.per_camera.items():
-            client = dahua_manager.get(cam_id)
-            if client is None or not client.workers_group_id:
-                failures.append(f"cam{cam_id}:not-available")
-                continue
-            try:
-                client.face_db.delete_person(group_id=client.workers_group_id, uid=uid)
-                cleared.append(cam_id)
-            except Exception as exc:  # noqa: BLE001
-                failures.append(f"cam{cam_id}:{exc.__class__.__name__}")
-        personnel_store.delete(person_id)
+        known = personnel_store.get(person_id) is not None
+        removed_ml = False
         if face_engine is not None:
             try:
-                face_engine.remove(person_id)
+                removed_ml = face_engine.remove(person_id)
             except Exception as exc:  # noqa: BLE001
-                logger.warning("ml face remove failed for %s: %s", person_id, exc)
-        return jsonify({"ok": True, "cameras_cleared": cleared, "failures": failures})
+                logger.warning("face remove failed for %s: %s", person_id, exc)
+        personnel_store.delete(person_id)
+        if not known and not removed_ml:
+            return jsonify({"ok": False, "error": "unknown person_id"}), 404
+        return jsonify({"ok": True})
 
     # ─── plate lists ───────────────────────────────────────────────
 

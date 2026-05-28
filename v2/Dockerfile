@@ -82,11 +82,17 @@ RUN pip install --no-cache-dir \
 #     ultralytics declares a hard `opencv-python` requirement so it'll
 #     install full opencv on top of our headless build — that's fine,
 #     the libgl1 apt dep above covers what full opencv loads on import.
+#     `onnx`/`protobuf` are pinned explicitly: insightface pulls onnx
+#     unpinned and the resolver's pick crashes on import ("partially
+#     initialized module 'onnx' has no attribute 'defs'") against the
+#     protobuf paddlepaddle caps us at. 1.16.1 + 3.20.2 is a coherent set.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends build-essential \
     && pip install --no-cache-dir \
         "insightface==0.7.3" \
         "onnxruntime>=1.16,<2" \
+        "onnx==1.16.1" \
+        "protobuf==3.20.2" \
         "paddleocr>=2.10,<3" \
         "paddlepaddle>=2.6,<4" \
         "ultralytics>=8.2,<9" \

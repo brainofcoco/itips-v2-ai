@@ -40,6 +40,14 @@ dev = [
 ml = [
     "insightface==0.7.3",
     "onnxruntime>=1.16,<2",
+    # insightface pulls `onnx` transitively but pins nothing, so the
+    # resolver grabs a release whose compiled extension mismatches the
+    # protobuf paddlepaddle caps us at — `import onnx` then dies with
+    # "partially initialized module 'onnx' has no attribute 'defs'
+    # (circular import)", which crashes the whole face engine. Pin both
+    # to a coherent, known-good pair.
+    "onnx==1.16.1",
+    "protobuf==3.20.2",
     # PaddleOCR + PaddlePaddle for the plate-OCR fallback. Pinned to
     # the 2.x line for a stable `ocr()` API; bump to 3.x only when
     # we've validated the new `predict()` shape downstream.

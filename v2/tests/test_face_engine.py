@@ -12,8 +12,19 @@ from dataclasses import dataclass
 
 import numpy as np
 
+import io
+
+import cv2
+import pytest
+from PIL import Image
+
 from itips.ml.embedding_store import EmbeddingStore
-from itips.ml.face_engine import FaceEngine, FaceEngineUnavailable, RecognitionResult
+from itips.ml.face_engine import (
+    FaceEngine,
+    FaceEngineUnavailable,
+    RecognitionResult,
+    _decode_image,
+)
 
 
 @dataclass
@@ -64,7 +75,7 @@ def test_enrol_stores_embedding_for_largest_face(tmp_path, monkeypatch):
     engine = _make_engine(tmp_path, app)
     # Stub the JPEG decode so we don't have to build a real image.
     import itips.ml.face_engine as fe
-    monkeypatch.setattr(fe, "_decode_jpeg", lambda _b: _make_frame())
+    monkeypatch.setattr(fe, "_decode_image", lambda _b: _make_frame())
 
     rec = engine.enroll(person_id="p1", full_name="Worker", image_bytes=b"x")
     assert rec.person_id == "p1"
@@ -74,7 +85,7 @@ def test_enrol_stores_embedding_for_largest_face(tmp_path, monkeypatch):
 def test_enrol_raises_when_no_face(tmp_path, monkeypatch):
     engine = _make_engine(tmp_path, _FakeApp([]))
     import itips.ml.face_engine as fe
-    monkeypatch.setattr(fe, "_decode_jpeg", lambda _b: _make_frame())
+    monkeypatch.setattr(fe, "_decode_image", lambda _b: _make_frame())
     try:
         engine.enroll(person_id="p1", full_name="X", image_bytes=b"x")
     except ValueError as e:
@@ -166,3 +177,42 @@ def test_face_engine_unavailable_when_insightface_missing(tmp_path, monkeypatch)
         assert "insightface" in str(e).lower()
     else:
         raise AssertionError("expected FaceEngineUnavailable")
+
+
+# ─── image decode ─────────────────────────────────────────────────────
+
+
+def test_decode_image_reads_jpeg():
+    ok, buf = cv2.imencode(".jpg", _make_frame(h=64, w=48))
+    assert ok
+    frame = _decode_image(buf.tobytes())
+    assert frame.shape[:2] == (64, 48)
+
+
+def test_decode_image_reads_png():
+    ok, buf = cv2.imencode(".png", _make_frame(h=32, w=32))
+    assert ok
+    frame = _decode_image(buf.tobytes())
+    assert frame.shape[:2] == (32, 32)
+
+
+def test_decode_image_falls_back_to_pillow_for_bmp():
+    # cv2 reads BMP too, but this proves a Pillow-encoded stream decodes.
+    pil_bytes = io.BytesIO()
+    Image.new("RGB", (40, 24), (10, 20, 30)).save(pil_bytes, format="BMP")
+    frame = _decode_image(pil_bytes.getvalue())
+    assert frame.shape[:2] == (24, 40)
+
+
+def test_decode_image_rejects_garbage_with_clear_error():
+    with pytest.raises(ValueError) as exc:
+        _decode_image(b"this is definitely not an image")
+    assert "could not decode" in str(exc.value)
+
+
+def test_decode_image_names_heic_in_error():
+    # Minimal HEIC-looking header: [size]ftypheic — enough for the sniff.
+    fake_heic = b"\x00\x00\x00\x18ftypheic\x00\x00\x00\x00mif1heic"
+    with pytest.raises(ValueError) as exc:
+        _decode_image(fake_heic)
+    assert "HEIC" in str(exc.value)

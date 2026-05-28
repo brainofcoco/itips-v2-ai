@@ -340,6 +340,7 @@ def _build_deps():
     inbound_api = InboundApiServer(
         dahua_manager=dahua_manager,
         personnel_store=personnel_store,
+        face_engine=ml_state.face_engine,
     )
 
     services = [

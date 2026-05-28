@@ -135,9 +135,9 @@ class FaceEngine:
     def enroll(
         self, *, person_id: str, full_name: str, image_bytes: bytes,
     ) -> EmbeddingRecord:
-        """Raises `ValueError` if no face is found."""
+        """Raises `ValueError` if the image can't be decoded or has no face."""
         app = self._ensure_model()
-        frame = _decode_jpeg(image_bytes)
+        frame = _decode_image(image_bytes)
         faces = app.get(frame)
         if not faces:
             raise ValueError("no face found in enrolment image")
@@ -203,19 +203,50 @@ class FaceEngine:
 # ─── helpers ─────────────────────────────────────────────────────────
 
 
-def _decode_jpeg(image_bytes: bytes):
+def _decode_image(image_bytes: bytes):
+    """Decode an operator-uploaded enrolment image to a BGR ndarray.
+
+    cv2 first; on failure fall back to Pillow, which decodes formats the
+    headless cv2 build chokes on (WebP, CMYK JPEG, BMP, TIFF). Raw bytes
+    only — no Dahua EOI trim here, since that would corrupt a binary
+    format that happens to contain an 0xFFD9 byte pair.
+    """
     import cv2
     import numpy as np
-    from itips.camera.jpeg_utils import trim_to_jpeg_eoi
-    # Dahua snapshots + event JPEGs carry trailing vendor metadata
-    # after the EOI marker; without trimming, libjpeg spams
-    # "Corrupt JPEG data: N extraneous bytes" on every face recog
-    # call coming from the live pipeline.
-    buf = np.frombuffer(trim_to_jpeg_eoi(image_bytes), dtype="uint8")
+    buf = np.frombuffer(image_bytes, dtype="uint8")
     frame = cv2.imdecode(buf, cv2.IMREAD_COLOR)
-    if frame is None:
-        raise ValueError("could not decode image bytes as JPEG/PNG")
-    return frame
+    if frame is not None:
+        return frame
+    try:
+        import io
+
+        from PIL import Image
+        img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        return cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+    except Exception:
+        pass
+    raise ValueError(
+        f"could not decode {_sniff_image_format(image_bytes)} image — "
+        "upload a JPEG or PNG (HEIC/iPhone photos aren't supported; "
+        "export as JPEG first)"
+    )
+
+
+def _sniff_image_format(blob: bytes) -> str:
+    """Best-effort magic-byte sniff so the decode error names the format."""
+    if blob[:3] == b"\xff\xd8\xff":
+        return "a JPEG"
+    if blob[:8] == b"\x89PNG\r\n\x1a\n":
+        return "a PNG"
+    if blob[:4] == b"RIFF" and blob[8:12] == b"WEBP":
+        return "a WebP"
+    if blob[4:8] == b"ftyp" and blob[8:12] in (
+        b"heic", b"heix", b"mif1", b"msf1", b"hevc", b"hevx",
+    ):
+        return "a HEIC"
+    if blob[:2] == b"BM":
+        return "a BMP"
+    return "an unrecognized"
 
 
 def _face_area(face) -> float:

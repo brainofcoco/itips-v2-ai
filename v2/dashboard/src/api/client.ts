@@ -1,7 +1,7 @@
 // Typed fetch wrappers for the Python /api/* endpoints.
 // All paths go through the Vite dev proxy → itips:5050, or nginx in prod.
 import type {
-  CameraWorkersResponse, CamerasResponse, Camera, CapabilitiesResponse,
+  CamerasResponse, Camera, CapabilitiesResponse,
   CurrentPresetsResponse, EnrolledFacesResponse, HealthResponse,
   IncidentDetail, IncidentsResponse, ListenerStatus, MLStatus, OpenAIStatus,
   PresetsResponse, SensorEventsResponse, SensorMappingsResponse, SensorMapping,
@@ -253,19 +253,18 @@ export async function fetchHubState(): Promise<import("./types").HubStateRespons
 export async function fetchWorkers(): Promise<WorkersResponse> {
   return getJson<WorkersResponse>("/api/workers");
 }
-export async function fetchCameraWorkers(cameraId: number): Promise<CameraWorkersResponse> {
-  return getJson<CameraWorkersResponse>(`/api/workers/${cameraId}`);
-}
 export async function enrollWorker(
-  fullName: string, image: File, personId?: string, sex?: string,
-): Promise<{ ok: boolean; ml_enrolled?: boolean; ml_error?: string; cameras?: Record<string,string>; failures?: string[]; error?: string }> {
+  fullName: string, image: File, personId?: string,
+): Promise<{ ok: boolean; person_id?: string; full_name?: string; error?: string }> {
   const form = new FormData();
   form.append("full_name", fullName);
   if (personId) form.append("person_id", personId);
-  if (sex) form.append("sex", sex);
   form.append("image", image);
-  const res = await fetch("/api/workers", { method: "POST", body: form });
-  return res.json();
+  // postForm decodes upstream HTML error pages (413/502/504) into a
+  // readable {error} instead of letting res.json() throw on "<html>…".
+  const body = await postForm("/api/workers", form);
+  if (typeof body.ok === "boolean") return body;
+  return { ok: false, error: body.error || "enroll failed" };
 }
 export async function deleteWorker(personId: string): Promise<{ ok: boolean; error?: string }> {
   return del(`/api/workers/${encodeURIComponent(personId)}`);
