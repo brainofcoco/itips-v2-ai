@@ -60,6 +60,8 @@ def register_dashboard(
     preset_state=None,
     camera_settings=None,
     activity_tap=None,
+    verdict_tap=None,
+    verdict_capture_dir=None,
 ) -> None:
     """Wire all dashboard routes onto the given Flask app.
 
@@ -259,6 +261,69 @@ def register_dashboard(
             "available": True,
             "events": activity_tap.recent(limit=max(1, min(limit, 200))),
         })
+
+    @app.get("/api/verdicts/recent")
+    def recent_verdicts():  # noqa: ANN202
+        """ThreatEvaluator verdict history for the Investigations page —
+        every evaluation with its outcome and the reason it did or
+        didn't escalate to an alarm."""
+        if verdict_tap is None:
+            return jsonify({"available": False, "verdicts": []})
+        try:
+            limit = int(request.args.get("limit", 100))
+        except (TypeError, ValueError):
+            limit = 100
+        return jsonify({
+            "available": True,
+            "verdicts": verdict_tap.recent(limit=max(1, min(limit, 300))),
+        })
+
+    @app.delete("/api/verdicts")
+    def clear_verdicts():  # noqa: ANN202
+        """Wipe the Investigations history — DB rows and the captured
+        JPEGs on disk."""
+        if verdict_tap is None:
+            return jsonify({"ok": False, "error": "verdict tap not wired"}), 503
+        verdict_tap.clear()
+        removed = 0
+        if verdict_capture_dir is not None:
+            import shutil
+            root = Path(verdict_capture_dir)
+            if root.is_dir():
+                for child in root.iterdir():
+                    if child.is_dir():
+                        shutil.rmtree(child, ignore_errors=True)
+                        removed += 1
+        return jsonify({"ok": True, "capture_dirs_removed": removed})
+
+    def _verdict_capture_dir(capture_id: str):
+        """Path-traversal-safe resolution of a capture directory."""
+        if verdict_capture_dir is None:
+            return None
+        root = Path(verdict_capture_dir).resolve()
+        candidate = (root / capture_id).resolve()
+        if root not in candidate.parents and candidate != root:
+            return None
+        return candidate if candidate.is_dir() else None
+
+    @app.get("/api/verdicts/captures/<capture_id>")
+    def list_verdict_captures(capture_id: str):  # noqa: ANN202
+        """List the JPEG filenames captured for a verdict."""
+        d = _verdict_capture_dir(capture_id)
+        if d is None:
+            return jsonify({"ok": True, "images": []})
+        images = sorted(f.name for f in d.iterdir() if f.suffix == ".jpg")
+        return jsonify({"ok": True, "capture_id": capture_id, "images": images})
+
+    @app.get("/api/verdicts/captures/<capture_id>/<filename>")
+    def get_verdict_capture(capture_id: str, filename: str):  # noqa: ANN202
+        d = _verdict_capture_dir(capture_id)
+        if d is None:
+            abort(404)
+        candidate = (d / filename).resolve()
+        if not candidate.is_file() or d not in candidate.parents:
+            abort(404)
+        return send_file(candidate, mimetype="image/jpeg")
 
     # ─── workers (face DB) ─────────────────────────────────────────
 

@@ -65,6 +65,82 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 .page-title { margin: 0; font-size: 1.5rem; }
 .muted { color: var(--muted); }
 .small { font-size: 0.78rem; }
+.nowrap { white-space: nowrap; }
+
+/* ── filter chips (Investigations) ── */
+.filter-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  margin-bottom: 0.9rem;
+}
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 0.3rem 0.7rem;
+  border-radius: 999px;
+  font-size: 0.82rem;
+  cursor: pointer;
+}
+.chip:hover { background: #232c44; }
+.chip-active { background: var(--accent); color: #0b0e13; border-color: var(--accent); }
+.chip-count {
+  background: rgba(0,0,0,0.18);
+  border-radius: 999px;
+  padding: 0 0.4rem;
+  font-size: 0.72rem;
+  font-weight: 600;
+}
+.chip-active .chip-count { background: rgba(0,0,0,0.25); }
+
+/* clickable table rows (Investigations) */
+.clickable-row { cursor: pointer; }
+.clickable-row:hover { background: var(--panel-2); }
+
+/* ── modal (verdict / investigation detail) ── */
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.6);
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 4vh 1rem;
+  z-index: 50;
+  overflow: auto;
+}
+.modal {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 1.1rem 1.25rem;
+  width: min(760px, 100%);
+  box-shadow: 0 12px 40px rgba(0,0,0,0.5);
+}
+.modal-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 0.8rem;
+}
+.modal-head h2 { margin: 0; font-size: 1.1rem; }
+
+.capture-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: 0.6rem;
+}
+.capture-grid img {
+  width: 100%;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  display: block;
+  background: #000;
+}
 
 .page-header {
   display: flex;

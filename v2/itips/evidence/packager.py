@@ -201,10 +201,45 @@ class EvidencePackager(threading.Thread):
     def stop(self) -> None:
         self._stop_event.set()
 
+    def _sweep_orphans(self) -> None:
+        """Delete incident dirs that were opened but never finalized.
+
+        An incident only writes its manifest + signature at finalize. If
+        the process died/restarted while an incident was still in the
+        PRELIMINARY stage, the on-disk directory is left with just the
+        initial metadata — and because its in-memory state is gone it can
+        never be finalized. Those orphans show up on the dashboard as
+        empty incidents (blank manifest/signature, no events) and only
+        accumulate. We run at startup, before any new incident exists in
+        this process, so every manifest-less directory here is a stale
+        orphan from a previous run and safe to remove.
+        """
+        import shutil
+        incidents_root = self.store_root / "incidents"
+        if not incidents_root.is_dir():
+            return
+        removed = 0
+        for d in incidents_root.iterdir():
+            if not d.is_dir():
+                continue
+            if (d / "manifest.json").exists():
+                continue   # finalized — keep
+            try:
+                shutil.rmtree(d)
+                removed += 1
+            except OSError:
+                logger.exception("orphan sweep: failed to remove %s", d.name)
+        if removed:
+            logger.info(
+                "EvidencePackager: swept %d orphaned (never-finalized) "
+                "incident package(s) at startup", removed,
+            )
+
     # ─── thread body ───────────────────────────────────────────────
 
     def run(self) -> None:
         self.store_root.mkdir(parents=True, exist_ok=True)
+        self._sweep_orphans()
         logger.info("EvidencePackager ready at %s", self.store_root)
         while not self._stop_event.is_set() or not self._ops.empty():
             try:

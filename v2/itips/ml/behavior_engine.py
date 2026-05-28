@@ -123,6 +123,11 @@ class BehaviorEngine:
         resolution) or slow (regions/loiter are fine at low fps)."""
         return [z.zone_type for z in self._active_zones(camera_id)]
 
+    def active_zones(self, camera_id: int):
+        """The Zone objects active for the camera's current preset — the
+        watcher uses these to draw the zone outline onto evidence frames."""
+        return self._active_zones(camera_id)
+
     def _active_zones(self, camera_id: int):
         """Filter the camera's zones down to those that should fire
         right now — preset-bound zones only count when the camera is

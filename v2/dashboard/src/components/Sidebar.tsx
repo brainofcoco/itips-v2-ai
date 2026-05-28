@@ -6,9 +6,10 @@ interface NavItem {
 }
 
 const NAV: NavItem[] = [
-  { to: "/live",      label: "Live" },
-  { to: "/incidents", label: "Incidents" },
-  { to: "/sensors",   label: "Sensors" },
+  { to: "/live",          label: "Live" },
+  { to: "/incidents",     label: "Incidents" },
+  { to: "/investigations", label: "Investigations" },
+  { to: "/sensors",       label: "Sensors" },
   { to: "/workers",   label: "Workers" },
   { to: "/zones",     label: "Zones" },
   { to: "/webhooks",  label: "Webhooks" },

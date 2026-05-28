@@ -47,6 +47,8 @@ class PublicApiServer(threading.Thread):
         preset_state=None,
         camera_settings=None,
         activity_tap=None,
+        verdict_tap=None,
+        verdict_capture_dir=None,
     ) -> None:
         super().__init__(name="api-public", daemon=True)
         self._frame_bus = frame_bus
@@ -71,6 +73,8 @@ class PublicApiServer(threading.Thread):
         self._preset_state = preset_state
         self._camera_settings = camera_settings
         self._activity_tap = activity_tap
+        self._verdict_tap = verdict_tap
+        self._verdict_capture_dir = verdict_capture_dir
         self._app = self._build_app()
         self._server = None
 
@@ -104,6 +108,8 @@ class PublicApiServer(threading.Thread):
             preset_state=self._preset_state,
             camera_settings=self._camera_settings,
             activity_tap=self._activity_tap,
+            verdict_tap=self._verdict_tap,
+            verdict_capture_dir=self._verdict_capture_dir,
         )
 
         @app.get("/health")

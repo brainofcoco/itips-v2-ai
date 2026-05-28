@@ -23,9 +23,26 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from typing import Any
+from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
+
+
+def _encode_capture_jpeg(frame, max_width: int = 1280) -> Optional[bytes]:
+    """Downscale a (possibly 4K) BGR frame to `max_width` and JPEG-encode
+    it for human review. Full-res captures are slow to load and needlessly
+    large; 1280px is plenty to eyeball a subject in a zone."""
+    try:
+        import cv2
+        h, w = frame.shape[:2]
+        if w > max_width:
+            scale = max_width / float(w)
+            frame = cv2.resize(frame, (max_width, int(h * scale)),
+                               interpolation=cv2.INTER_AREA)
+        ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+        return buf.tobytes() if ok else None
+    except Exception:
+        return None
 
 
 class BehaviorWatcher(threading.Thread):
@@ -36,6 +53,7 @@ class BehaviorWatcher(threading.Thread):
         behavior_engine,
         dahua_manager,
         activity_tap,
+        threat_evaluator=None,
         target_fps: float = 2.0,
         repeat_cooldown_s: float = 8.0,
     ) -> None:
@@ -44,6 +62,11 @@ class BehaviorWatcher(threading.Thread):
         self._engine = behavior_engine
         self._dahua = dahua_manager
         self._activity = activity_tap
+        # When set, each detection opens a ThreatEvaluator window so the
+        # scene is sampled for an authorised-worker face and a verdict is
+        # produced (which lands in the Investigations feed). Without this
+        # the watcher only paints the Live badge and never escalates.
+        self._threat_evaluator = threat_evaluator
         self._target_fps = max(0.5, float(target_fps))
         self._repeat_cooldown_s = float(repeat_cooldown_s)
         self._stop = threading.Event()
@@ -77,8 +100,15 @@ class BehaviorWatcher(threading.Thread):
         logger.info("BehaviorWatcher stopped")
 
     def _tick(self) -> None:
-        # Engine may still be warming up its model; skip cheaply.
+        # Engine may still be warming up its model. If a transient import
+        # failure killed the initial warmup, kick another attempt rather
+        # than silently skipping forever (which is what left the Live
+        # intrusion warnings dead after a flaky boot).
         if not self._engine.is_ready():
+            try:
+                self._engine.warmup_async()
+            except Exception:
+                pass
             return
         for camera_id in self._dahua.camera_ids():
             snap = self._frame_bus.latest(camera_id)
@@ -92,6 +122,7 @@ class BehaviorWatcher(threading.Thread):
             self._log_detections(camera_id, analysis)
             for alert in analysis.alerts:
                 self._maybe_publish(camera_id, alert)
+                self._trigger_evaluation(camera_id, alert, snap.raw)
 
     def _log_detections(self, camera_id: int, analysis) -> None:
         """Heartbeat showing what YOLO + tracker saw, so a 'crossing
@@ -112,6 +143,80 @@ class BehaviorWatcher(threading.Thread):
             "BehaviorWatcher: cam%d dets=%d (%s) tracks=%d alerts=%d",
             camera_id, len(dets), classes, len(tracks), len(analysis.alerts),
         )
+
+    def _trigger_evaluation(self, camera_id: int, alert: Any, frame: Any) -> None:
+        """Open (or extend) a ThreatEvaluator window for this detection.
+
+        `trigger` is idempotent — calling it every frame while a subject
+        is in the zone rolls into one window and one verdict, not N. We
+        also hand over an *annotated* evidence frame (the actual frame the
+        detection fired on, with the zone outline + detection box drawn)
+        so the Investigations page shows the subject in the zone — the
+        evaluator's own later snapshots often catch an empty scene once a
+        fast subject has moved on."""
+        if self._threat_evaluator is None:
+            return
+        kind = {
+            "intrusion": "behavior:region_intrusion",
+            "line_crossing": "behavior:line_cross",
+            "loitering": "behavior:loiter",
+        }.get(alert.alert_type, f"behavior:{alert.alert_type}")
+        evidence = self._annotate_evidence(camera_id, alert, frame)
+        try:
+            self._threat_evaluator.trigger(
+                camera_id=camera_id,
+                trigger_kind=kind,
+                initial_frame=frame,
+                evidence_jpeg=evidence,
+                details={
+                    "zone_id": getattr(alert, "zone_id", None),
+                    "zone_name": getattr(alert, "zone_name", ""),
+                    "class_name": getattr(alert, "class_name", ""),
+                },
+            )
+        except Exception:
+            logger.exception(
+                "BehaviorWatcher: cam%d threat-eval trigger failed", camera_id,
+            )
+
+    def _annotate_evidence(self, camera_id: int, alert: Any, frame: Any):
+        """Return a downscaled JPEG of `frame` with the active zone
+        outlines and the detection bbox drawn on it, or None on failure."""
+        try:
+            import cv2
+            import numpy as np
+            img = frame.copy()
+            h, w = img.shape[:2]
+            # Active zone outlines (green), with the triggering zone bright.
+            try:
+                zones = self._engine.active_zones(camera_id)
+            except Exception:
+                zones = []
+            trig_zone = str(getattr(alert, "zone_id", "") or "")
+            for z in zones:
+                pts = np.array(
+                    [[int(px * w), int(py * h)] for px, py in z.points],
+                    dtype=np.int32,
+                )
+                if len(pts) < 2:
+                    continue
+                hot = (str(z.zone_id) == trig_zone)
+                color = (0, 0, 255) if hot else (0, 200, 0)  # BGR: red hot, green others
+                closed = z.zone_type == "region"
+                cv2.polylines(img, [pts], closed, color, max(2, w // 640))
+            # Detection box (yellow) + label.
+            bbox = getattr(alert, "bbox", None)
+            if bbox and len(bbox) == 4:
+                x1, y1, x2, y2 = (int(v) for v in bbox)
+                cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 255), max(2, w // 640))
+                label = f"{getattr(alert, 'class_name', '')} {alert.alert_type}".strip()
+                cv2.putText(img, label, (x1, max(20, y1 - 8)),
+                            cv2.FONT_HERSHEY_SIMPLEX, max(0.6, w / 2400),
+                            (0, 255, 255), 2, cv2.LINE_AA)
+            return _encode_capture_jpeg(img)
+        except Exception:
+            logger.exception("BehaviorWatcher: cam%d evidence annotation failed", camera_id)
+            return None
 
     def _maybe_publish(self, camera_id: int, alert: Any) -> None:
         key = (camera_id, str(getattr(alert, "zone_id", "")), alert.alert_type)

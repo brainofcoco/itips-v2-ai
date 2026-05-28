@@ -193,10 +193,12 @@ def _build_deps():
     # that samples multiple snapshots before deciding INTRUDER vs
     # AUTHORIZED vs UNCERTAIN. Disabled when no face engine is loaded so
     # the legacy direct-to-incident path keeps working in barebones dev.
+    verdict_capture_dir = personnel_store_path.parent / "verdict_captures"
     threat_evaluator = _build_threat_evaluator(
         alert_engine=alert_engine,
         dahua_manager=dahua_manager,
         face_engine=ml_state.face_engine,
+        capture_dir=verdict_capture_dir,
     )
 
     # Sensor pipeline. Dispatcher works without face_engine — just
@@ -226,6 +228,7 @@ def _build_deps():
         behavior_engine=ml_state.behavior_engine,
         dahua_manager=dahua_manager,
         activity_tap=activity_tap,
+        threat_evaluator=threat_evaluator,
         target_fps=2.0,
     )
 
@@ -245,6 +248,14 @@ def _build_deps():
     # tamper, low-battery, etc.). Shares the listener's authenticated
     # session.
     axpro_alertstream = _build_axpro_alertstream(axpro_listener, sensor_dispatcher)
+    # Investigations feed — record every ThreatEvaluator verdict so the
+    # dashboard can show which intrusions escalated and, more usefully,
+    # which didn't and why (worker matched / no face / disarmed).
+    from itips.runtime.verdict_tap import VerdictTap
+    verdict_tap = VerdictTap(db_path=personnel_store_path.parent / "verdicts.sqlite")
+    if threat_evaluator is not None:
+        threat_evaluator.add_verdict_listener(verdict_tap.publish)
+
     # Hub-control helper for the dashboard's hub-admin routes.
     axpro_admin = _build_axpro_admin(axpro_listener)
     # Sound the hub siren only on a ThreatEvaluator INTRUDER verdict —
@@ -323,6 +334,8 @@ def _build_deps():
         preset_state=preset_state,
         camera_settings=camera_settings,
         activity_tap=activity_tap,
+        verdict_tap=verdict_tap,
+        verdict_capture_dir=verdict_capture_dir,
     )
     inbound_api = InboundApiServer(
         dahua_manager=dahua_manager,
@@ -380,7 +393,7 @@ def _frame_bus_publisher(frame_bus, camera_id):
     return publish
 
 
-def _build_threat_evaluator(*, alert_engine, dahua_manager, face_engine):
+def _build_threat_evaluator(*, alert_engine, dahua_manager, face_engine, capture_dir=None):
     """Return a started ThreatEvaluator, or None when prerequisites are
     missing. Settings-disabled or no face engine ⇒ None ⇒ event_worker
     and sensor_dispatcher fall back to their legacy direct paths."""
@@ -403,6 +416,7 @@ def _build_threat_evaluator(*, alert_engine, dahua_manager, face_engine):
         face_engine=face_engine,
         window_seconds=settings.threat_evaluator.window_seconds,
         sample_interval_s=settings.threat_evaluator.sample_interval_s,
+        capture_dir=capture_dir,
     )
 
 

@@ -90,7 +90,12 @@ class ObjectDetector:
         except Exception as exc:  # noqa: BLE001
             with self._init_lock:
                 self._init_error = exc
-            logger.exception("ObjectDetector warmup failed")
+                # Allow a later retry. The torch/ultralytics import can
+                # fail transiently at a busy boot; without resetting the
+                # thread handle, warmup_async() would no-op forever and
+                # the engine would stay permanently not-ready.
+                self._warmup_thread = None
+            logger.exception("ObjectDetector warmup failed (will retry on next request)")
 
     def _ensure_model(self):
         if self._model is not None:
@@ -106,8 +111,8 @@ class ObjectDetector:
                     "or disable the behavior fallback in settings."
                 ) from exc
             logger.info(
-                "ObjectDetector: loading %s (device=%s, conf>=%.2f)",
-                self._model_name, self._device or "auto", self._confidence,
+                "ObjectDetector: loading %s (device=%s, conf>=%.2f, imgsz=%d)",
+                self._model_name, self._device or "auto", self._confidence, self._imgsz,
             )
             model = YOLO(self._model_name)
             self._model = model

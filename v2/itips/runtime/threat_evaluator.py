@@ -42,7 +42,10 @@ import enum
 import logging
 import threading
 import time
+import uuid
+from collections import deque
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
 if TYPE_CHECKING:
@@ -70,6 +73,15 @@ class _Window:
     best_no_match_sim: float = 0.0
     best_match_result: Optional[Any] = None  # RecognitionResult — opaque here
     best_match_frame: Optional["np.ndarray"] = None
+    # Recent sampled frames as encoded JPEG bytes (kept small, not the raw
+    # 4K numpy arrays) so the Investigations page can show what the camera
+    # saw during the evaluation — even when no incident was created.
+    sample_jpegs: deque = field(default_factory=lambda: deque(maxlen=4))
+    # Annotated detection frames pushed in by the BehaviorWatcher (zone
+    # outline + detection box drawn). These are the strongest evidence —
+    # they actually contain the subject in the zone — so they lead the
+    # capture set ahead of the evaluator's own (often empty) snapshots.
+    evidence_jpegs: deque = field(default_factory=lambda: deque(maxlen=3))
     closed: bool = False
 
 
@@ -86,10 +98,14 @@ class ThreatEvaluator:
         window_seconds: float = 15.0,
         sample_interval_s: float = 1.0,
         event_tap=None,
+        capture_dir: Optional[Path] = None,
     ) -> None:
         self._alert_engine = alert_engine
         self._dahua_manager = dahua_manager
         self._face_engine = face_engine
+        # Where to persist a few representative JPEGs per verdict so the
+        # Investigations page can show the evidence. None disables capture.
+        self._capture_dir = Path(capture_dir) if capture_dir is not None else None
         # Default to "armed" when no hub is wired — otherwise we'd silently
         # swallow every intruder verdict on dev machines.
         self._is_armed_fn = is_armed_fn or (lambda: True)
@@ -159,9 +175,13 @@ class ThreatEvaluator:
         trigger_kind: str,
         initial_frame: Optional["np.ndarray"] = None,
         details: Optional[dict[str, Any]] = None,
+        evidence_jpeg: Optional[bytes] = None,
     ) -> None:
         """Open or extend the window for this camera. Idempotent — a
-        flurry of triggers rolls into one verdict instead of N incidents."""
+        flurry of triggers rolls into one verdict instead of N incidents.
+
+        `evidence_jpeg` is an already-encoded annotated frame (zone +
+        detection box) the caller wants surfaced on Investigations."""
         if camera_id <= 0:
             logger.debug("threat eval: ignoring trigger with no camera (%s)",
                          trigger_kind)
@@ -189,6 +209,8 @@ class ThreatEvaluator:
             w.triggers.append(trigger_kind)
             if details:
                 w.trigger_details.append({"kind": trigger_kind, **details})
+            if evidence_jpeg:
+                w.evidence_jpegs.append(evidence_jpeg)
         if new_window:
             logger.info(
                 "threat eval cam %d: window OPEN by %s",
@@ -247,6 +269,11 @@ class ThreatEvaluator:
                 w.samples_taken += 1
             if frame is None:
                 continue
+            if self._capture_dir is not None:
+                jpeg = _encode_capture_jpeg(frame)
+                if jpeg:
+                    with self._lock:
+                        w.sample_jpegs.append(jpeg)
             self._evaluate_frame(w, frame)
 
     def _next_sample_frame(
@@ -385,19 +412,11 @@ class ThreatEvaluator:
                 w.camera_id, _trigger_summary(w),
                 w.samples_taken, w.best_no_match_sim,
             )
-            # Still record the observation so the audit trail shows what
-            # the camera saw while the panel was disarmed.
-            try:
-                self._alert_engine.handle_behaviour_alert_simple(
-                    camera_id=w.camera_id,
-                    alert_type="threat_observation_disarmed",
-                    details=details,
-                )
-            except Exception:
-                logger.exception(
-                    "threat eval cam %d: disarmed-observation log failed",
-                    w.camera_id,
-                )
+            # Record the observation as a verdict only (→ Investigations).
+            # We deliberately do NOT open an incident here: a disarmed
+            # panel means the operator expects activity, so this is an
+            # audit record, not an escalation. (Opening an incident here
+            # is what produced the flood of empty preliminary incidents.)
             self._notify_verdict(self._verdict_payload(
                 w, verdict=ThreatVerdict.INTRUDER, armed=False,
             ))
@@ -423,23 +442,11 @@ class ThreatEvaluator:
         ))
 
     def _dispatch_uncertain(self, w: _Window) -> None:
-        details = {
-            "triggers": list(w.triggers),
-            "samples": w.samples_taken,
-            "window_s": round(time.monotonic() - w.opened_at, 1),
-            "verdict": ThreatVerdict.UNCERTAIN.value,
-        }
-        try:
-            self._alert_engine.handle_behaviour_alert_simple(
-                camera_id=w.camera_id,
-                alert_type="threat_uncertain",
-                details=details,
-            )
-        except Exception:
-            logger.exception(
-                "threat eval cam %d: uncertain-observation log failed",
-                w.camera_id,
-            )
+        # UNCERTAIN = the window closed without a usable face, so we
+        # couldn't tell worker from intruder. This is NOT an escalation —
+        # it's recorded as a verdict (→ Investigations) only. Opening an
+        # incident here is what flooded the Incidents list with empty
+        # preliminary packages on busy cameras.
         logger.info(
             "threat eval cam %d: UNCERTAIN — no face visible, triggers=%s "
             "samples=%d",
@@ -478,7 +485,40 @@ class ThreatEvaluator:
         }
         if extra:
             payload.update(extra)
+        capture_id, capture_count = self._save_captures(w)
+        if capture_id:
+            payload["capture_id"] = capture_id
+            payload["capture_count"] = capture_count
         return payload
+
+    def _save_captures(self, w: "_Window") -> tuple[Optional[str], int]:
+        """Write the window's representative JPEGs to a per-verdict dir and
+        return (capture_id, count). The matched frame (if any) leads, then
+        the most recent samples — giving the operator the face the engine
+        keyed on plus surrounding context."""
+        if self._capture_dir is None:
+            return None, 0
+        jpegs: list[bytes] = []
+        # Annotated detection frames first — they contain the subject in
+        # the zone, which is what an operator actually wants to see.
+        jpegs.extend(list(w.evidence_jpegs))
+        if w.best_match_frame is not None:
+            best = _encode_capture_jpeg(w.best_match_frame)
+            if best:
+                jpegs.append(best)
+        jpegs.extend(list(w.sample_jpegs))
+        if not jpegs:
+            return None, 0
+        capture_id = uuid.uuid4().hex
+        try:
+            out_dir = self._capture_dir / capture_id
+            out_dir.mkdir(parents=True, exist_ok=True)
+            for i, blob in enumerate(jpegs, start=1):
+                (out_dir / f"sample_{i:03d}.jpg").write_bytes(blob)
+        except OSError:
+            logger.exception("threat eval: failed to persist verdict captures")
+            return None, 0
+        return capture_id, len(jpegs)
 
     def _notify_verdict(self, payload: dict[str, Any]) -> None:
         for listener in self._verdict_listeners:
@@ -504,6 +544,25 @@ def _encode_jpeg(frame) -> Optional[bytes]:
     try:
         import cv2
         ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+        return buf.tobytes() if ok else None
+    except Exception:
+        return None
+
+
+def _encode_capture_jpeg(frame, max_width: int = 1280) -> Optional[bytes]:
+    """Downscaled JPEG for Investigations captures — 4K full-res is slow
+    to load and oversized for human review. Distinct from `_encode_jpeg`,
+    which stays full-res for face/incident evidence."""
+    if frame is None:
+        return None
+    try:
+        import cv2
+        h, w = frame.shape[:2]
+        if w > max_width:
+            scale = max_width / float(w)
+            frame = cv2.resize(frame, (max_width, int(h * scale)),
+                               interpolation=cv2.INTER_AREA)
+        ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
         return buf.tobytes() if ok else None
     except Exception:
         return None

@@ -97,7 +97,10 @@ class FaceEngine:
         except Exception as exc:  # noqa: BLE001
             with self._init_lock:
                 self._init_error = exc
-            logger.exception("FaceEngine warmup failed")
+                # Reset so warmup can be retried — a transient import
+                # failure at boot must not disable the engine for good.
+                self._warmup_thread = None
+            logger.exception("FaceEngine warmup failed (will retry on next request)")
 
     def _ensure_model(self):
         if self._app is not None:

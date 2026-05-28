@@ -82,7 +82,10 @@ class PlateEngine:
         except Exception as exc:  # noqa: BLE001
             with self._init_lock:
                 self._init_error = exc
-            logger.exception("PlateEngine warmup failed")
+                # Reset so warmup can be retried after a transient import
+                # failure rather than staying not-ready forever.
+                self._warmup_thread = None
+            logger.exception("PlateEngine warmup failed (will retry on next request)")
 
     def _ensure_model(self):
         if self._reader is not None:

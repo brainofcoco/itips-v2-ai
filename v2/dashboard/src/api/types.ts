@@ -228,6 +228,35 @@ export interface ActivityResponse {
   available: boolean;
   events: ActivityEvent[];
 }
+
+// ─── investigations (threat-evaluator verdicts) ──────────────────────
+export type VerdictOutcome =
+  | "authorized" | "uncertain" | "suppressed_disarmed" | "escalated" | string;
+export interface VerdictEvent {
+  seq: number;
+  ts: number;
+  verdict: string;           // authorized | uncertain | intruder
+  camera_id: number | null;
+  armed: boolean;
+  escalated: boolean;
+  outcome: VerdictOutcome;
+  reason: string;
+  person_name?: string;
+  person_uid?: string;
+  similarity?: number | null;
+  samples?: number | null;
+  saw_face?: boolean | null;
+  best_no_match_sim?: number | null;
+  triggers?: string[];
+  trigger_details?: any[];
+  window_s?: number | null;
+  capture_id?: string | null;
+  capture_count?: number;
+}
+export interface VerdictsResponse {
+  available: boolean;
+  verdicts: VerdictEvent[];
+}
 export interface ZonesResponse {
   available: boolean;
   zones: Zone[];

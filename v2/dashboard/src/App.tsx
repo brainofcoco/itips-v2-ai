@@ -2,6 +2,7 @@ import { Navigate, Route, Routes } from "react-router-dom";
 import Sidebar from "./components/Sidebar";
 import Live from "./pages/Live";
 import Incidents from "./pages/Incidents";
+import Investigations from "./pages/Investigations";
 import Sensors from "./pages/Sensors";
 import Workers from "./pages/Workers";
 import Zones from "./pages/Zones";
@@ -19,6 +20,7 @@ export default function App() {
           <Route path="/" element={<Navigate to="/live" replace />} />
           <Route path="/live"      element={<Live />} />
           <Route path="/incidents" element={<Incidents />} />
+          <Route path="/investigations" element={<Investigations />} />
           <Route path="/sensors"   element={<Sensors />} />
           <Route path="/workers"   element={<Workers />} />
           <Route path="/zones"     element={<Zones />} />

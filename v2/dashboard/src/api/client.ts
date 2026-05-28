@@ -98,6 +98,18 @@ export async function fetchCurrentPresets(): Promise<CurrentPresetsResponse> {
 export async function fetchRecentActivity(limit = 50): Promise<import("./types").ActivityResponse> {
   return getJson<import("./types").ActivityResponse>(`/api/activity/recent?limit=${limit}`);
 }
+export async function fetchRecentVerdicts(limit = 100): Promise<import("./types").VerdictsResponse> {
+  return getJson<import("./types").VerdictsResponse>(`/api/verdicts/recent?limit=${limit}`);
+}
+export async function clearVerdicts(): Promise<{ ok: boolean; capture_dirs_removed?: number; error?: string }> {
+  return del("/api/verdicts");
+}
+export async function fetchVerdictCaptures(captureId: string): Promise<{ ok: boolean; images: string[] }> {
+  return getJson(`/api/verdicts/captures/${encodeURIComponent(captureId)}`);
+}
+export function verdictCaptureUrl(captureId: string, filename: string): string {
+  return `/api/verdicts/captures/${encodeURIComponent(captureId)}/${encodeURI(filename)}`;
+}
 export async function fetchBasePreset(
   cameraId: number,
 ): Promise<{ available: boolean; base_preset_name: string | null }> {
