@@ -34,6 +34,7 @@ export interface IncidentDetail {
   signature?: Record<string, any>;
   face_captures: IncidentCapture[];
   plate_captures: IncidentCapture[];
+  sensor_captures?: IncidentCapture[];
   video_files?: string[];
   has_pdf?: boolean;
 }
@@ -208,6 +209,24 @@ export interface Zone {
 export interface CurrentPresetsResponse {
   available: boolean;
   cameras: Record<string, string | null>;
+}
+
+// ─── activity feed (real-time detections) ────────────────────────────
+export interface ActivityEvent {
+  seq: number;
+  camera_id: number;
+  kind: string;            // line_crossing | intrusion | loitering | sensor
+  label: string;
+  zone_id?: string | number | null;
+  zone_name?: string;
+  detail?: Record<string, any>;
+  status: string;          // detected | evaluating
+  source: string;          // behavior | camera | axpro
+  ts: number;              // unix seconds
+}
+export interface ActivityResponse {
+  available: boolean;
+  events: ActivityEvent[];
 }
 export interface ZonesResponse {
   available: boolean;

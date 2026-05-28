@@ -183,6 +183,25 @@ class AxProAdmin:
             json_body=cfg,
         )
 
+    def set_zone_silent(self, zone_id: int, silent: bool = True) -> dict:
+        """Toggle the zone's `silentEnabled` flag.
+
+        When `True`, an alarm on this zone is still *reported* to the
+        panel and pushed over alertStream (so ITIPS receives the
+        zoneEvent and runs its evaluation) — but the hub does **not**
+        sound its own siren. That hands the siren decision entirely to
+        ITIPS, which sounds it only after the ThreatEvaluator confirms an
+        INTRUDER. The flag is persisted on the hub, so it survives panel
+        reboots and only needs setting once per zone.
+        """
+        return self.set_zone_config_flag(
+            zone_id, key="silentEnabled", value=bool(silent),
+        )
+
+    def is_zone_silent(self, zone_id: int) -> bool:
+        cfg = self.get_zone_config(zone_id)
+        return bool((cfg.get("Zone") or {}).get("silentEnabled", False))
+
     # ─── internals ────────────────────────────────────────────────
 
     def _require_client(self):

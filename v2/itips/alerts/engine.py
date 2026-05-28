@@ -40,6 +40,19 @@ STAGE_CONFIRMED = "confirmed"
 
 
 @dataclass
+class _PendingSensorCapture:
+    """JPEG attached by a sensor itself (PIR-cam), waiting to be
+    bound to an incident once one opens for the camera. Has a short
+    TTL so we don't carry stale bytes if the trigger never escalates."""
+    jpeg: bytes
+    source: str
+    zone_id: int
+    zone_name: str
+    ts_iso: str
+    received_monotonic: float
+
+
+@dataclass
 class _IncidentState:
     incident_id: str
     camera_id: int
@@ -76,6 +89,14 @@ class AlertEngine:
         # on the producer's thread, so they must not block.
         self._event_listeners: list[Callable[[dict[str, Any]], None]] = []
         self._lifecycle_listeners: list[Callable[[str, dict[str, Any]], None]] = []
+        # Per-camera buffer of sensor-attached JPEGs (currently AX PRO
+        # pircam) waiting for an incident to attach themselves to.
+        # The PIR fires several seconds before the dispatch chain
+        # produces a confirmed alert, so we hold the bytes briefly and
+        # drain into the incident when _touch_incident creates one.
+        self._pending_sensor_captures: dict[int, list[_PendingSensorCapture]] = {}
+        self._pending_sensor_lock = threading.Lock()
+        self._pending_sensor_ttl_s = 60.0
 
     # ─── lifecycle ────────────────────────────────────────────────
 
@@ -120,6 +141,88 @@ class AlertEngine:
                 rec.feed(frame)
             except Exception:
                 logger.exception("cam%d: recorder.feed failed", camera_id)
+
+    def record_sensor_capture(
+        self,
+        camera_id: int,
+        *,
+        jpeg: bytes,
+        source: str,
+        zone_id: int,
+        zone_name: str = "",
+    ) -> None:
+        """Stash a sensor-attached JPEG (e.g. PIR-cam alarm picture).
+
+        If an incident is already open for `camera_id`, the capture is
+        attached directly. Otherwise we buffer it for a short window
+        and drain on the next incident open for that camera — the
+        dispatch chain typically takes 3–6 s to confirm an event, but
+        the PIR-cam picture arrives almost immediately, so without
+        this buffer the picture would beat the incident and be lost.
+        """
+        if not jpeg:
+            return
+        now_mono = time.monotonic()
+        entry = _PendingSensorCapture(
+            jpeg=jpeg, source=source, zone_id=int(zone_id),
+            zone_name=zone_name, ts_iso=now_iso(),
+            received_monotonic=now_mono,
+        )
+        # If there's already an active incident on this camera, attach now.
+        with self._lock:
+            active = self._incidents.get(camera_id)
+        if active is not None:
+            self._packager.attach_sensor_capture(
+                active.incident_id, jpeg=jpeg, source=source,
+                zone_id=int(zone_id), zone_name=zone_name, ts=entry.ts_iso,
+            )
+            logger.info(
+                "cam%d: %s capture (zone=%d, %dB JPEG) attached to active "
+                "incident %s",
+                camera_id, source, zone_id, len(jpeg), active.incident_id,
+            )
+            return
+        # No incident yet — buffer briefly. GC stale entries to keep
+        # the buffer from leaking memory under a chatty PIR-cam.
+        with self._pending_sensor_lock:
+            queue = self._pending_sensor_captures.setdefault(camera_id, [])
+            queue.append(entry)
+            cutoff = now_mono - self._pending_sensor_ttl_s
+            self._pending_sensor_captures[camera_id] = [
+                e for e in queue if e.received_monotonic >= cutoff
+            ]
+        logger.info(
+            "cam%d: %s capture (zone=%d, %dB JPEG) buffered — "
+            "waiting for incident to open",
+            camera_id, source, zone_id, len(jpeg),
+        )
+
+    def _drain_sensor_buffer(self, camera_id: int, incident_id: str) -> None:
+        with self._pending_sensor_lock:
+            queue = self._pending_sensor_captures.pop(camera_id, [])
+        if not queue:
+            return
+        now_mono = time.monotonic()
+        cutoff = now_mono - self._pending_sensor_ttl_s
+        fresh = [e for e in queue if e.received_monotonic >= cutoff]
+        for entry in fresh:
+            try:
+                self._packager.attach_sensor_capture(
+                    incident_id,
+                    jpeg=entry.jpeg, source=entry.source,
+                    zone_id=entry.zone_id, zone_name=entry.zone_name,
+                    ts=entry.ts_iso,
+                )
+            except Exception:
+                logger.exception(
+                    "cam%d: failed to attach buffered %s capture",
+                    camera_id, entry.source,
+                )
+        if fresh:
+            logger.info(
+                "cam%d: drained %d buffered sensor capture(s) into incident %s",
+                camera_id, len(fresh), incident_id,
+            )
 
     def stop(self) -> None:
         self._janitor_stop.set()
@@ -335,6 +438,9 @@ class AlertEngine:
             "timestamp_utc": now_iso(),
         })
         logger.info("cam%d: incident %s opened (preliminary)", camera_id, incident_id)
+        # Drain any sensor-attached JPEGs (PIR-cam alarm pictures) that
+        # arrived before the dispatch chain confirmed the event.
+        self._drain_sensor_buffer(camera_id, incident_id)
         self._notify_lifecycle("preliminary", {
             "incident_id": incident_id,
             "camera_id": camera_id,

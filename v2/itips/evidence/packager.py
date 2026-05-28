@@ -48,6 +48,7 @@ class _IncidentState:
     alert_stage_log: list[dict[str, Any]] = field(default_factory=list)
     face_seq: int = 0
     plate_seq: int = 0
+    sensor_seq: int = 0
 
 
 @dataclass
@@ -86,6 +87,17 @@ class _AttachPlateCapture:
     jpeg: bytes
     plate_number: str
     confidence: float
+    ts: str
+
+
+@dataclass
+class _AttachSensorCapture:
+    """A still attached by a sensor itself (e.g. AX PRO PIR-cam JPEG)."""
+    incident_id: str
+    jpeg: bytes
+    source: str          # e.g. "axpro_pircam"
+    zone_id: int
+    zone_name: str
     ts: str
 
 
@@ -153,6 +165,18 @@ class EvidencePackager(threading.Thread):
             ts=ts or now_iso(),
         ))
 
+    def attach_sensor_capture(self, incident_id: str, *, jpeg: bytes,
+                              source: str, zone_id: int,
+                              zone_name: str = "",
+                              ts: Optional[str] = None) -> None:
+        """Persist an image attached by the sensor itself (PIR-cam JPEG)
+        to sensor_captures/<source>_zone<N>_<ts>.jpg."""
+        self._ops.put(_AttachSensorCapture(
+            incident_id=incident_id, jpeg=jpeg,
+            source=source, zone_id=int(zone_id),
+            zone_name=zone_name, ts=ts or now_iso(),
+        ))
+
     def update_metadata(self, incident_id: str, patch: dict[str, Any]) -> None:
         """Merge fields into incident_metadata.json at finalize.
 
@@ -204,6 +228,8 @@ class EvidencePackager(threading.Thread):
             self._handle_attach_face(op)
         elif isinstance(op, _AttachPlateCapture):
             self._handle_attach_plate(op)
+        elif isinstance(op, _AttachSensorCapture):
+            self._handle_attach_sensor(op)
         elif isinstance(op, _UpdateMetadata):
             self._handle_update_metadata(op)
         elif isinstance(op, _Finalize):
@@ -213,6 +239,7 @@ class EvidencePackager(threading.Thread):
         package_dir = self.store_root / "incidents" / op.incident_id
         (package_dir / "face_captures").mkdir(parents=True, exist_ok=True)
         (package_dir / "plate_captures").mkdir(parents=True, exist_ok=True)
+        (package_dir / "sensor_captures").mkdir(parents=True, exist_ok=True)
         metadata = {
             "incident_id": op.incident_id,
             "site_id": op.site_id,
@@ -293,6 +320,33 @@ class EvidencePackager(threading.Thread):
             "filename": f"face_captures/{fname}",
             "confidence": op.confidence,
             "name": op.name,
+            "timestamp_utc": op.ts,
+        })
+
+    def _handle_attach_sensor(self, op: _AttachSensorCapture) -> None:
+        state = self._states.get(op.incident_id)
+        if not state:
+            return
+        state.sensor_seq += 1
+        safe_ts = _safe_filename_ts(op.ts)
+        safe_source = "".join(c if c.isalnum() else "_" for c in op.source) or "sensor"
+        fname = f"{safe_source}_zone{op.zone_id:02d}_{state.sensor_seq:03d}_{safe_ts}.jpg"
+        path = state.package_dir / "sensor_captures" / fname
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(op.jpeg)
+        digest = compute_file_hash(path)
+        state.manifest.add(ManifestEntry(
+            filename=f"sensor_captures/{fname}",
+            sha256=digest,
+            bytes=path.stat().st_size,
+            kind="sensor_capture",
+        ))
+        state.event_log.append({
+            "kind": "sensor_capture",
+            "filename": f"sensor_captures/{fname}",
+            "source": op.source,
+            "zone_id": op.zone_id,
+            "zone_name": op.zone_name,
             "timestamp_utc": op.ts,
         })
 

@@ -1,10 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import {
-  fetchCameras, fetchCurrentPresets, fetchZones, fireDeterrence,
-  snapshotUrl, standdownDeterrence,
+  fetchCameras, fetchCurrentPresets, fetchRecentActivity, fetchZones,
+  fireDeterrence, snapshotUrl, standdownDeterrence,
 } from "../api/client";
-import type { Camera, Zone } from "../api/types";
+import type { ActivityEvent, Camera, Zone } from "../api/types";
+
+// How long a detection badge stays on a tile after it was published.
+const ACTIVITY_TTL_MS = 12000;
 import { colorForZone, drawZone } from "../lib/zoneCanvas";
 import PtzPanel from "../components/PtzPanel";
 
@@ -24,6 +27,39 @@ export default function Live() {
   const [showZones, setShowZones] = useState(true);
   const [controlledId, setControlledId] = useState<number | null>(null);
   const [currentPresets, setCurrentPresets] = useState<Record<string, string | null>>({});
+  const [activity, setActivity] = useState<ActivityEvent[]>([]);
+  // Bumped every second so stale badges (past their TTL) re-evaluate and
+  // disappear even when no new activity is arriving.
+  const [, setNow] = useState(Date.now());
+
+  // Poll the real-time detection feed. Fast enough that a line cross /
+  // sensor trip shows on the tile within ~1s of happening.
+  useEffect(() => {
+    let cancelled = false;
+    const pull = async () => {
+      try {
+        const body = await fetchRecentActivity(50);
+        if (!cancelled) setActivity(body.available ? (body.events ?? []) : []);
+      } catch {
+        if (!cancelled) setActivity([]);
+      }
+    };
+    pull();
+    const poll = setInterval(() => { if (!document.hidden) pull(); }, 1000);
+    const tick = setInterval(() => setNow(Date.now()), 1000);
+    return () => { cancelled = true; clearInterval(poll); clearInterval(tick); };
+  }, []);
+
+  // Group fresh (within TTL) events by camera, newest first.
+  const activityByCamera = useMemo(() => {
+    const cutoff = Date.now() - ACTIVITY_TTL_MS;
+    const out: Record<number, ActivityEvent[]> = {};
+    for (const e of activity) {
+      if (e.ts * 1000 < cutoff) continue;
+      (out[e.camera_id] ??= []).push(e);
+    }
+    return out;
+  }, [activity]);
 
   // Refresh per-camera current-preset every 2s so zone overlays come live
   // immediately after a goto/jog. The PtzPanel + sensor goto routes all
@@ -106,6 +142,7 @@ export default function Live() {
                 isControlled={cam.camera_id === controlledId}
                 onTakeControl={() => setControlledId(cam.camera_id)}
                 currentPreset={currentPresets[String(cam.camera_id)] ?? null}
+                activity={activityByCamera[cam.camera_id] ?? []}
               />
             ))}
           </div>
@@ -116,13 +153,14 @@ export default function Live() {
 }
 
 function CameraTile({
-  cam, showZones, isControlled, onTakeControl, currentPreset,
+  cam, showZones, isControlled, onTakeControl, currentPreset, activity,
 }: {
   cam: Camera;
   showZones: boolean;
   isControlled: boolean;
   onTakeControl: () => void;
   currentPreset: string | null;
+  activity: ActivityEvent[];
 }) {
   const imgRef = useRef<HTMLImageElement | null>(null);
   const overlayRef = useRef<HTMLCanvasElement | null>(null);
@@ -273,8 +311,9 @@ function CameraTile({
     };
   }, [zones, activeZones, currentPreset, dormantCount]);
 
+  const hasAlert = activity.length > 0;
   return (
-    <article className={`cam${isControlled ? " cam-controlled" : ""}`}>
+    <article className={`cam${isControlled ? " cam-controlled" : ""}${hasAlert ? " cam-alerting" : ""}`}>
       <header>
         <h2>Camera {cam.camera_id} · {cam.endpoint}</h2>
         <span className={cam.workers_group_id ? "pill pill-ok" : "pill pill-idle"}>
@@ -319,6 +358,19 @@ function CameraTile({
             )}
           </div>
         )}
+        {activity.length > 0 && (
+          <div className="cam-activity">
+            {activity.slice(0, 3).map((e) => (
+              <span key={e.seq} className={`cam-activity-badge act-${activityTone(e.kind)}`}>
+                <span className="act-glyph">{activityGlyph(e.kind)}</span>
+                <span className="act-text">
+                  {e.label}{e.zone_name && e.kind !== "sensor" ? ` · ${e.zone_name}` : ""}
+                </span>
+                <span className="act-status">{e.status === "evaluating" ? "evaluating…" : e.status}</span>
+              </span>
+            ))}
+          </div>
+        )}
         {errored && (
           <span className="placeholder">
             cam {cam.camera_id} snapshot failed — see browser console / itips logs
@@ -353,4 +405,20 @@ function CameraTile({
       </div>
     </article>
   );
+}
+
+// ─── activity badge helpers ───────────────────────────────────────
+function activityGlyph(kind: string): string {
+  switch (kind) {
+    case "line_crossing": return "⊘";
+    case "intrusion":     return "⚠";
+    case "loitering":     return "◷";
+    case "sensor":        return "◉";
+    default:              return "•";
+  }
+}
+function activityTone(kind: string): "bad" | "warn" | "info" {
+  if (kind === "intrusion" || kind === "line_crossing") return "bad";
+  if (kind === "loitering") return "warn";
+  return "info";   // sensor + anything else
 }

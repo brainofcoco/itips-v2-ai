@@ -59,6 +59,7 @@ def register_dashboard(
     webhook_dispatcher=None,
     preset_state=None,
     camera_settings=None,
+    activity_tap=None,
 ) -> None:
     """Wire all dashboard routes onto the given Flask app.
 
@@ -242,6 +243,22 @@ def register_dashboard(
                 "Cache-Control": "no-store",
             },
         )
+
+    @app.get("/api/activity/recent")
+    def recent_activity():  # noqa: ANN202
+        """Real-time detection feed (line cross / intrusion / loiter /
+        sensor trip) for the Live page — published the instant a
+        detection happens, before model validation or incident packaging."""
+        if activity_tap is None:
+            return jsonify({"available": False, "events": []})
+        try:
+            limit = int(request.args.get("limit", 50))
+        except (TypeError, ValueError):
+            limit = 50
+        return jsonify({
+            "available": True,
+            "events": activity_tap.recent(limit=max(1, min(limit, 200))),
+        })
 
     # ─── workers (face DB) ─────────────────────────────────────────
 
@@ -585,6 +602,7 @@ def register_dashboard(
                       for f in sorted(package.rglob("*")) if f.is_file()],
             "face_captures": _list_subdir("face_captures"),
             "plate_captures": _list_subdir("plate_captures"),
+            "sensor_captures": _list_subdir("sensor_captures"),
             "video_files": [e["filename"] for e in manifest_files
                             if e.get("kind", "").startswith("video_")],
             "has_pdf": has_pdf,
@@ -649,6 +667,66 @@ def register_dashboard(
             abort(404)
         inline = _truthy(request.args.get("inline"))
         return send_file(candidate, as_attachment=not inline)
+
+    @app.delete("/api/incidents/<incident_id>")
+    def delete_incident(incident_id: str):  # noqa: ANN202
+        """Permanently remove an incident package from disk.
+
+        Irreversible — signed evidence is destroyed. The dashboard
+        confirms with the operator before calling.
+        """
+        package = _safe_incident_dir(incident_id)
+        if package is None:
+            return jsonify({"ok": False, "error": "incident not found"}), 404
+        import shutil
+        try:
+            shutil.rmtree(package)
+        except OSError as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 500
+        return jsonify({"ok": True, "incident_id": incident_id})
+
+    @app.post("/api/incidents/bulk-delete")
+    def bulk_delete_incidents():  # noqa: ANN202
+        """Delete multiple incidents in one call.
+
+        Body either:
+            {"ids": ["abc...", "def..."]}   # specific set
+            {"all": true}                    # every package on disk
+        Returns per-id status so the UI can show what was actually
+        removed (handy when some IDs are stale).
+        """
+        body = request.get_json(silent=True) or {}
+        delete_all = bool(body.get("all"))
+        ids = body.get("ids") or []
+        if not delete_all and not ids:
+            return jsonify({"ok": False, "error": "provide ids[] or all=true"}), 400
+        if delete_all:
+            root = Path(settings.evidence.store_path) / "incidents"
+            if root.exists():
+                ids = [p.name for p in root.iterdir() if p.is_dir()]
+            else:
+                ids = []
+        import shutil
+        results = []
+        deleted = 0
+        for raw_id in ids:
+            iid = str(raw_id)
+            package = _safe_incident_dir(iid)
+            if package is None:
+                results.append({"incident_id": iid, "status": "not_found"})
+                continue
+            try:
+                shutil.rmtree(package)
+                results.append({"incident_id": iid, "status": "ok"})
+                deleted += 1
+            except OSError as exc:
+                results.append({"incident_id": iid, "status": "error", "error": str(exc)})
+        return jsonify({
+            "ok": True,
+            "requested": len(ids),
+            "deleted": deleted,
+            "results": results,
+        })
 
     # ─── health checks ─────────────────────────────────────────────
     # Per-camera capability matrix. Caches a result briefly so a click-happy
@@ -1336,6 +1414,80 @@ def register_dashboard(
             return jsonify({"ok": False, "error": str(exc),
                             "payload": getattr(exc, "payload", None)}), 502
 
+    @app.get("/api/sensors/zones/<int:zone_id>/config")
+    def hub_get_zone_config(zone_id: int):  # noqa: ANN202
+        """Read-only dump of the hub's zone configuration. Used to find
+        the siren-linkage field name before we toggle it."""
+        err = _admin_or_503()
+        if err is not None:
+            return err
+        try:
+            return jsonify({"ok": True, "config": axpro_admin.get_zone_config(zone_id)})
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"ok": False, "error": str(exc),
+                            "payload": getattr(exc, "payload", None)}), 502
+
+    def _armed_rejection_hint(exc) -> str | None:
+        """The AX PRO refuses zone-config writes while armed. Detect that
+        specific rejection so we can return an actionable message instead
+        of a raw hub error code."""
+        blob = f"{exc} {getattr(exc, 'payload', '')}".lower()
+        if "armedstatus" in blob or "invalid operation" in blob:
+            return ("hub is armed — disarm the subsystem (Sensors page or "
+                    "Hik-Connect) before changing zone config. The silent "
+                    "flag persists once set, so you only need to do this once, "
+                    "then re-arm.")
+        return None
+
+    @app.post("/api/sensors/zones/<int:zone_id>/silent")
+    def hub_set_zone_silent(zone_id: int):  # noqa: ANN202
+        """Make a zone 'silent' so the hub reports its alarm but doesn't
+        sound its own siren — ITIPS sounds it after evaluation instead.
+        Body: {"silent": true|false} (defaults to true)."""
+        err = _admin_or_503()
+        if err is not None:
+            return err
+        body = request.get_json(silent=True) or {}
+        silent = bool(body.get("silent", True))
+        try:
+            payload = axpro_admin.set_zone_silent(zone_id, silent)
+            return jsonify({
+                "ok": True, "zone_id": zone_id, "silent": silent, "payload": payload,
+            })
+        except Exception as exc:  # noqa: BLE001
+            hint = _armed_rejection_hint(exc)
+            return jsonify({"ok": False, "error": str(exc), "hint": hint,
+                            "payload": getattr(exc, "payload", None)}), 502
+
+    @app.post("/api/sensors/hub/silence-mapped")
+    def hub_silence_mapped():  # noqa: ANN202
+        """Set `silentEnabled` on every zone that has a sensor→camera
+        binding, so the hub stops auto-sounding for the zones ITIPS
+        watches. Body: {"silent": true|false} (defaults to true).
+        Returns a per-zone result so partial failures are visible."""
+        err = _admin_or_503()
+        if err is not None:
+            return err
+        if sensor_map is None:
+            return jsonify({"ok": False, "error": "sensor map not wired"}), 503
+        body = request.get_json(silent=True) or {}
+        silent = bool(body.get("silent", True))
+        results = []
+        hint = None
+        for m in sensor_map.all():
+            try:
+                axpro_admin.set_zone_silent(m.zone_id, silent)
+                results.append({"zone_id": m.zone_id, "status": "ok"})
+            except Exception as exc:  # noqa: BLE001
+                results.append({"zone_id": m.zone_id, "status": "error",
+                                "error": str(exc)})
+                hint = hint or _armed_rejection_hint(exc)
+        ok_count = sum(1 for r in results if r["status"] == "ok")
+        return jsonify({
+            "ok": True, "silent": silent, "hint": hint,
+            "updated": ok_count, "total": len(results), "results": results,
+        })
+
     # ─── siren (panic alarm) ──────────────────────────────────────
     # Manual control of the hub's siren (Hikvision "One-Key Alarm").
     # PUT to `oneKeyAlarm/{sub_id}` triggers every siren bound to that
@@ -1995,7 +2147,12 @@ def _decode_upload(request) -> "np.ndarray | None":  # type: ignore[name-defined
         return None
     import cv2
     import numpy as np
-    buf = np.frombuffer(blob, dtype="uint8")
+    from itips.camera.jpeg_utils import trim_to_jpeg_eoi
+    # Most ML Lab uploads are clean JPEGs from a phone or file picker,
+    # but operators routinely save snapshots straight from a camera
+    # web UI which often carry the same trailing vendor metadata as
+    # snapshot.cgi — trim defensively so the engines don't see noise.
+    buf = np.frombuffer(trim_to_jpeg_eoi(blob), dtype="uint8")
     frame = cv2.imdecode(buf, cv2.IMREAD_COLOR)
     return frame
 

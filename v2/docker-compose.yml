@@ -48,7 +48,14 @@ services:
     # tmpfs for transient frame copies — keeps SD/NVMe wear down.
     tmpfs:
       - /tmp:size=128m
-    mem_limit: 4g
+    # The three CPU ML engines (InsightFace buffalo_l + EasyOCR + YOLO)
+    # plus onnxruntime/torch and frame buffers sit at ~3.9 GiB resident.
+    # At a 4 GiB cap the first inference spike pushes against the limit,
+    # the kernel stalls reclaiming, and nginx sees the upstream go quiet
+    # → intermittent 502 on the first ML call. 6 GiB leaves headroom for
+    # the load spike. On a Mac, raise the Docker Desktop VM memory
+    # (Settings → Resources) above 8 GiB and you can push this to 8g.
+    mem_limit: 6g
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:5050/health"]
       interval: 30s

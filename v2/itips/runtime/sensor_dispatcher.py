@@ -34,6 +34,7 @@ class SensorDispatcher(threading.Thread):
         event_tap: SensorEventTap,
         threat_evaluator=None,
         preset_state=None,
+        activity_tap=None,
         pan_settle_s: float = 2.0,
         snapshot_timeout_s: float = 4.0,
         per_zone_cooldown_s: float = 10.0,
@@ -52,6 +53,9 @@ class SensorDispatcher(threading.Thread):
         # BehaviorEngine knows which preset-bound zones are active right
         # now and the Live overlay can mirror that.
         self._preset_state = preset_state
+        # Real-time Live-page feed — a sensor trip shows up the instant
+        # it's dispatched, before the pan/snapshot/evaluation pipeline.
+        self._activity_tap = activity_tap
         self._pan_settle_s = float(pan_settle_s)
         self._snapshot_timeout_s = float(snapshot_timeout_s)
         self._per_zone_cooldown_s = float(per_zone_cooldown_s)
@@ -138,6 +142,40 @@ class SensorDispatcher(threading.Thread):
             self._event_tap.publish(event, outcome=outcome)
             logger.info("sensor zone=%d has no map entry — alarm only", event.zone_id)
             return
+
+        # Surface the trip on the Live page immediately — before the
+        # pan / snapshot / evaluation pipeline runs.
+        if self._activity_tap is not None:
+            self._activity_tap.publish(
+                camera_id=mapping.camera_id,
+                kind="sensor",
+                label=event.zone_name or f"Sensor zone {event.zone_id}",
+                zone_id=event.zone_id,
+                zone_name=event.zone_name,
+                detail={"sensor_type": event.event_type, "source": event.source},
+                status="evaluating",
+                source="axpro",
+            )
+
+        # Route any sensor-attached JPEG (PIR-cam alarm picture) into the
+        # alert engine *before* we pan. The picture is evidence regardless
+        # of whether the pan + threat-eval chain completes — and routing
+        # early means it's buffered ready for the incident that may open
+        # later this cycle.
+        if event.picture_bytes is not None and self._alert_engine is not None:
+            try:
+                self._alert_engine.record_sensor_capture(
+                    mapping.camera_id,
+                    jpeg=event.picture_bytes,
+                    source=f"axpro_{event.event_type or 'sensor'}",
+                    zone_id=event.zone_id,
+                    zone_name=event.zone_name,
+                )
+            except Exception:
+                logger.exception(
+                    "sensor zone=%d: record_sensor_capture crashed",
+                    event.zone_id,
+                )
 
         client = self._dahua_manager.get(mapping.camera_id)
         if client is None:

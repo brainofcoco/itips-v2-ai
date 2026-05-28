@@ -46,6 +46,7 @@ class PublicApiServer(threading.Thread):
         webhook_dispatcher=None,
         preset_state=None,
         camera_settings=None,
+        activity_tap=None,
     ) -> None:
         super().__init__(name="api-public", daemon=True)
         self._frame_bus = frame_bus
@@ -69,6 +70,7 @@ class PublicApiServer(threading.Thread):
         self._webhook_dispatcher = webhook_dispatcher
         self._preset_state = preset_state
         self._camera_settings = camera_settings
+        self._activity_tap = activity_tap
         self._app = self._build_app()
         self._server = None
 
@@ -101,6 +103,7 @@ class PublicApiServer(threading.Thread):
             webhook_dispatcher=self._webhook_dispatcher,
             preset_state=self._preset_state,
             camera_settings=self._camera_settings,
+            activity_tap=self._activity_tap,
         )
 
         @app.get("/health")

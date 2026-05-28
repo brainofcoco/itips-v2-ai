@@ -133,17 +133,12 @@ class DahuaCameraEndpoint:
                 self.host, r.status_code, len(r.content),
             )
             return None
-        # Trim anything after the JPEG end-of-image marker (FF D9).
-        # Dahua snapshots routinely carry vendor metadata appended
-        # after EOI; libjpeg-turbo logs noisy
-        # `Corrupt JPEG data: N extraneous bytes before marker 0xfe`
-        # warnings to stderr when it sees them. Truncating at EOI
-        # eliminates the warning at the source without changing the
-        # decoded image.
-        content = r.content
-        eoi = content.rfind(b"\xff\xd9")
-        if eoi != -1:
-            content = content[: eoi + 2]
+        # Trim trailing vendor metadata that Dahua appends after the
+        # JPEG end-of-image marker (FF D9). Without this libjpeg-turbo
+        # writes a noisy "Corrupt JPEG data" warning to stderr for
+        # every snapshot. See itips/camera/jpeg_utils.py.
+        from itips.camera.jpeg_utils import trim_to_jpeg_eoi
+        content = trim_to_jpeg_eoi(r.content)
         buf = np.frombuffer(content, dtype=np.uint8)
         frame = cv2.imdecode(buf, cv2.IMREAD_COLOR)
         if frame is None:

@@ -224,7 +224,12 @@ class DahuaEventDispatcher(threading.Thread):
             try:
                 import cv2
                 import numpy as np
-                buf = np.frombuffer(event.jpeg, dtype=np.uint8)
+                from itips.camera.jpeg_utils import trim_to_jpeg_eoi
+                # Dahua event JPEGs carry trailing vendor metadata after
+                # FF D9, same as snapshot.cgi. Without the trim libjpeg
+                # writes a "Corrupt JPEG data" warning to stderr on every
+                # event even though decoding succeeds.
+                buf = np.frombuffer(trim_to_jpeg_eoi(event.jpeg), dtype=np.uint8)
                 frame = cv2.imdecode(buf, cv2.IMREAD_COLOR)
                 if frame is not None:
                     return frame

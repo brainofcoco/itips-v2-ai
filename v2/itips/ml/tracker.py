@@ -49,9 +49,18 @@ class IoUTracker:
         *,
         iou_threshold: float = 0.25,
         max_age_s: float = 6.0,
+        centroid_gate_factor: float = 1.5,
     ) -> None:
         self._iou_threshold = float(iou_threshold)
         self._max_age_s = float(max_age_s)
+        # At low sample rates (the continuous watcher runs ~2 fps) a
+        # walking subject's box no longer overlaps its previous frame, so
+        # IoU drops below threshold and the tracker would spawn a fresh
+        # id every frame — leaving `history` stuck at length 1 and
+        # line-crossing unable to fire. After the IoU pass we fall back
+        # to nearest-centroid matching, gated to roughly this many box
+        # dimensions of movement between frames, to preserve identity.
+        self._centroid_gate_factor = float(centroid_gate_factor)
         self._tracks_by_camera: dict[int, list[TrackedObject]] = {}
         self._next_id = 1
         self._lock = threading.Lock()
@@ -89,7 +98,33 @@ class IoUTracker:
                 else:
                     unmatched_dets.append(det)
 
+            # Centroid-distance fallback: rescue detections IoU couldn't
+            # place by matching them to the nearest unconsumed track of
+            # the same class, as long as the centroid moved less than the
+            # gate (scaled by the detection's box size). This is what
+            # keeps a person's track alive across the line at low fps.
+            still_unmatched: list[Detection] = []
             for det in unmatched_dets:
+                dc = _centroid(det.bbox)
+                bw = max(0.0, det.bbox[2] - det.bbox[0])
+                bh = max(0.0, det.bbox[3] - det.bbox[1])
+                gate = max(bw, bh) * self._centroid_gate_factor
+                best_idx, best_dist = -1, gate
+                for i, trk in enumerate(tracks):
+                    if i in consumed_tracks:
+                        continue
+                    if trk.class_name != det.class_name:
+                        continue
+                    dist = _centroid_dist(dc, trk.centroid)
+                    if dist < best_dist:
+                        best_dist, best_idx = dist, i
+                if best_idx >= 0:
+                    self._extend_track(tracks[best_idx], det, ts)
+                    consumed_tracks.add(best_idx)
+                else:
+                    still_unmatched.append(det)
+
+            for det in still_unmatched:
                 tracks.append(self._new_track(det, ts))
 
             self._tracks_by_camera[camera_id] = tracks
@@ -138,6 +173,10 @@ class IoUTracker:
 def _centroid(bbox: tuple[float, float, float, float]) -> tuple[float, float]:
     x1, y1, x2, y2 = bbox
     return ((x1 + x2) / 2.0, (y1 + y2) / 2.0)
+
+
+def _centroid_dist(a: tuple[float, float], b: tuple[float, float]) -> float:
+    return ((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2) ** 0.5
 
 
 def _iou(a: tuple[float, float, float, float], b: tuple[float, float, float, float]) -> float:

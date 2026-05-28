@@ -203,7 +203,12 @@ class FaceEngine:
 def _decode_jpeg(image_bytes: bytes):
     import cv2
     import numpy as np
-    buf = np.frombuffer(image_bytes, dtype="uint8")
+    from itips.camera.jpeg_utils import trim_to_jpeg_eoi
+    # Dahua snapshots + event JPEGs carry trailing vendor metadata
+    # after the EOI marker; without trimming, libjpeg spams
+    # "Corrupt JPEG data: N extraneous bytes" on every face recog
+    # call coming from the live pipeline.
+    buf = np.frombuffer(trim_to_jpeg_eoi(image_bytes), dtype="uint8")
     frame = cv2.imdecode(buf, cv2.IMREAD_COLOR)
     if frame is None:
         raise ValueError("could not decode image bytes as JPEG/PNG")

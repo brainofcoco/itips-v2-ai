@@ -24,9 +24,19 @@ class SensorEvent:
     source: str = "axpro"         # axpro | simulate
     received_ts: float = field(default_factory=time.time)
     raw: dict = field(default_factory=dict)
+    # JPEG bytes the sensor itself attached to its alarm — currently only
+    # pircam devices populate this. Stays out of `to_dict` so the event
+    # tap / JSON event log don't try to serialise raw image bytes.
+    picture_bytes: Optional[bytes] = field(default=None, repr=False)
 
     def to_dict(self) -> dict:
-        return asdict(self)
+        d = asdict(self)
+        d.pop("picture_bytes", None)
+        # Surface presence without dumping the bytes themselves.
+        d["has_picture"] = self.picture_bytes is not None
+        if self.picture_bytes is not None:
+            d["picture_bytes_len"] = len(self.picture_bytes)
+        return d
 
 
 class SensorEventTap:

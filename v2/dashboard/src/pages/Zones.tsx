@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   deleteZone, fetchCameras, fetchCurrentPresets, fetchPresets, fetchZones,
-  saveZone, snapshotUrl,
+  gotoPreset, saveZone, snapshotUrl,
 } from "../api/client";
 import type {
   Camera, CameraPreset, Zone, ZoneDirection, ZoneType,
@@ -11,6 +11,11 @@ import {
   colorForZone, drawHandles, drawInProgress, drawZone, findHandleAt, findSegmentAt,
   normFromPx, pxFromNorm, type Point,
 } from "../lib/zoneCanvas";
+
+// Sentinel values for the preset filter dropdown — real preset names
+// can't collide because they never start with "__".
+const FILTER_ALL = "__all";
+const FILTER_ALWAYS = "__always";
 
 type DraftMode = "new" | "edit";
 
@@ -47,6 +52,9 @@ export default function Zones() {
   const [cursor, setCursor] = useState<string>("crosshair");
   const [presets, setPresets] = useState<CameraPreset[]>([]);
   const [currentPreset, setCurrentPreset] = useState<string | null>(null);
+  // Which zones to show/edit: FILTER_ALL, FILTER_ALWAYS, or a preset name.
+  const [presetFilter, setPresetFilter] = useState<string>(FILTER_ALL);
+  const [panning, setPanning] = useState(false);
 
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
 
@@ -66,6 +74,7 @@ export default function Zones() {
     setDraft(null);
     setPresets([]);
     setCurrentPreset(null);
+    setPresetFilter(FILTER_ALL);
     const img = new Image();
     img.src = snapshotUrl(cameraId);
     img.onload = () => setImage(img);
@@ -88,10 +97,66 @@ export default function Zones() {
     fetchPresets(cameraId)
       .then((body) => setPresets(body.presets ?? []))
       .catch(() => setPresets([]));
+    // Default the filter to whatever preset the camera is currently at,
+    // so the operator immediately sees just that view's zones rather
+    // than every preset's lines stacked on one frame.
     fetchCurrentPresets()
-      .then((body) => setCurrentPreset(body.cameras?.[String(cameraId)] ?? null))
+      .then((body) => {
+        const cur = body.cameras?.[String(cameraId)] ?? null;
+        setCurrentPreset(cur);
+        if (cur) setPresetFilter(cur);
+      })
       .catch(() => setCurrentPreset(null));
   }, [cameraId]);
+
+  const reloadSnapshot = useCallback(() => {
+    if (cameraId == null) return;
+    const img = new Image();
+    img.src = snapshotUrl(cameraId);   // snapshotUrl appends a cache-buster
+    img.onload = () => setImage(img);
+    img.onerror = () => setImage(null);
+  }, [cameraId]);
+
+  // Switching the filter to a specific preset pans the camera there and
+  // refreshes the still, so the snapshot under the zones actually matches
+  // the orientation they were drawn for. "All" / "Always-active" don't
+  // move the camera.
+  const onSelectPresetFilter = useCallback(async (value: string) => {
+    setPresetFilter(value);
+    setDraft(null);
+    if (cameraId == null) return;
+    if (value === FILTER_ALL || value === FILTER_ALWAYS) return;
+    const preset = presets.find((p) => p.name === value);
+    if (!preset) return;
+    if (currentPreset === value) return;   // already there, no pan needed
+    setPanning(true);
+    setStatus({ text: `Panning camera to “${value}”…`, ok: true });
+    try {
+      const r = await gotoPreset(cameraId, preset.index);
+      if (!r.ok) {
+        setStatus({ text: "Couldn't pan to preset: " + (r.error || "unknown"), ok: false });
+        return;
+      }
+      setCurrentPreset(value);
+      // Give the dome ~2s to arrive before grabbing the still.
+      await new Promise((res) => setTimeout(res, 2000));
+      reloadSnapshot();
+      setStatus({ text: `Showing zones for preset “${value}”.`, ok: true });
+    } catch (e) {
+      setStatus({ text: "Couldn't pan to preset: " + e, ok: false });
+    } finally {
+      setPanning(false);
+    }
+  }, [cameraId, presets, currentPreset, reloadSnapshot]);
+
+  // Zones visible under the current filter, paired with their original
+  // index so colours stay stable when the list is narrowed.
+  const visibleZones = useMemo(() => {
+    const indexed = zones.map((z, idx) => ({ z, idx }));
+    if (presetFilter === FILTER_ALL) return indexed;
+    if (presetFilter === FILTER_ALWAYS) return indexed.filter(({ z }) => !z.preset_name);
+    return indexed.filter(({ z }) => z.preset_name === presetFilter);
+  }, [zones, presetFilter]);
 
   const refreshZones = useCallback(async () => {
     if (cameraId == null) return;
@@ -125,7 +190,7 @@ export default function Zones() {
       g.textAlign = "start";
     }
     const editingId = draft?.mode === "edit" ? draft.originalZoneId : undefined;
-    zones.forEach((z, idx) => {
+    visibleZones.forEach(({ z, idx }) => {
       if (z.zone_id === editingId) return;   // editing copy is drawn instead
       drawZone(g, z, W, H, {
         color: colorForZone(idx),
@@ -160,7 +225,7 @@ export default function Zones() {
       }
       drawHandles(g, draft.points.map((p) => pxFromNorm(p, W, H)), color);
     }
-  }, [image, zones, draft]);
+  }, [image, zones, draft, visibleZones]);
 
   // Mouse → canvas coordinates, in the canvas's internal pixel space.
   const canvasXY = useCallback((evt: { clientX: number; clientY: number }): [number, number] | null => {
@@ -233,11 +298,14 @@ export default function Zones() {
     if (!xy) return;
     const [x, y] = xy;
 
-    // No draft → clicking a zone selects it for editing.
+    // No draft → clicking a zone selects it for editing. Only the
+    // currently-visible (filtered) zones are hit-tested so a hidden
+    // zone from another preset can't be grabbed by accident.
     if (!draft) {
-      const idx = zoneUnderPoint(zones, x / c.width, y / c.height);
-      if (idx !== -1) {
-        beginEdit(zones[idx]);
+      const visible = visibleZones.map((v) => v.z);
+      const hit = zoneUnderPoint(visible, x / c.width, y / c.height);
+      if (hit !== -1) {
+        beginEdit(visible[hit]);
       } else {
         beginNew([normFromPx(x, y, c.width, c.height)]);
       }
@@ -260,7 +328,7 @@ export default function Zones() {
     // Append vertex.
     const np = normFromPx(x, y, c.width, c.height);
     setDraft({ ...draft, points: [...draft.points, np] });
-  }, [canvasXY, cameraId, draft, draggingIdx, handlesPx, zones]);
+  }, [canvasXY, cameraId, draft, draggingIdx, handlesPx, visibleZones]);
 
   const onCanvasContext = useCallback((evt: React.MouseEvent<HTMLCanvasElement>) => {
     if (!draft) return;
@@ -282,9 +350,15 @@ export default function Zones() {
   }, [canvasXY, draft, handlesPx]);
 
   const beginNew = useCallback((seedPoints: Point[] = []) => {
-    setDraft({ ...EMPTY_DRAFT, points: seedPoints });
+    // Pre-bind the new zone to whatever the filter is focused on, so a
+    // zone drawn while viewing preset X automatically activates at X.
+    const presetForNew =
+      presetFilter === FILTER_ALL ? (currentPreset ?? "")
+      : presetFilter === FILTER_ALWAYS ? ""
+      : presetFilter;
+    setDraft({ ...EMPTY_DRAFT, points: seedPoints, preset_name: presetForNew });
     setStatus(null);
-  }, []);
+  }, [presetFilter, currentPreset]);
 
   const beginEdit = useCallback((z: Zone) => {
     setDraft({
@@ -411,6 +485,24 @@ export default function Zones() {
             ))}
             {cameras.length === 0 && <option value="">(no cameras)</option>}
           </select>
+          <label className="inline" title="Show only the zones mapped for one preset — picking a preset also pans the camera there so the snapshot matches.">
+            <span className="muted small">show</span>
+            <select
+              value={presetFilter}
+              onChange={(e) => onSelectPresetFilter(e.target.value)}
+              disabled={panning}
+              style={{ width: "auto", minWidth: 170 }}
+            >
+              <option value={FILTER_ALL}>All zones</option>
+              <option value={FILTER_ALWAYS}>Always-active only</option>
+              {presets.length > 0 && <option disabled>──────────</option>}
+              {presets.map((p) => (
+                <option key={p.index} value={p.name}>
+                  preset: {p.name}{currentPreset === p.name ? " ●" : ""}
+                </option>
+              ))}
+            </select>
+          </label>
           {!draft ? (
             <button className="primary" onClick={() => beginNew()}>+ New zone</button>
           ) : (
@@ -424,10 +516,16 @@ export default function Zones() {
           title="Snapshot"
           actions={
             <span className="muted small" title="ITIPS-tracked PTZ orientation">
-              camera at:&nbsp;
-              <strong style={{ color: currentPreset ? "var(--accent)" : "var(--muted)" }}>
-                {currentPreset ?? "unknown preset"}
-              </strong>
+              {panning ? (
+                <em>panning…</em>
+              ) : (
+                <>
+                  camera at:&nbsp;
+                  <strong style={{ color: currentPreset ? "var(--accent)" : "var(--muted)" }}>
+                    {currentPreset ?? "unknown preset"}
+                  </strong>
+                </>
+              )}
             </span>
           }
         >
@@ -538,16 +636,27 @@ export default function Zones() {
           )}
 
           <Section
-            title={`Zones (${zones.length})`}
+            title={
+              presetFilter === FILTER_ALL
+                ? `Zones (${zones.length})`
+                : `Zones (${visibleZones.length} of ${zones.length})`
+            }
             actions={!draft && (
               <button className="primary small" onClick={() => beginNew()}>+ New</button>
             )}
           >
             {zones.length === 0 ? (
               <p className="muted">No zones yet for this camera. Click the snapshot or press <strong>+ New zone</strong>.</p>
+            ) : visibleZones.length === 0 ? (
+              <p className="muted">
+                No zones for this filter.{" "}
+                {presetFilter !== FILTER_ALL && (
+                  <>Click the snapshot to draw one{presetFilter !== FILTER_ALWAYS ? ` for preset “${presetFilter}”` : " (always-active)"}, or switch to <strong>All zones</strong>.</>
+                )}
+              </p>
             ) : (
               <ul className="zone-cards">
-                {zones.map((z, idx) => {
+                {visibleZones.map(({ z, idx }) => {
                   const color = colorForZone(idx);
                   const isEditing = draft?.mode === "edit" && draft.originalZoneId === z.zone_id;
                   return (

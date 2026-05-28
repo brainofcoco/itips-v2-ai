@@ -105,6 +105,13 @@ class AxProAlertStream(threading.Thread):
         # Optional listeners for raw stream events — webhook subsystem
         # binds here so subscribers can opt into the full firehose.
         self._raw_listeners: list[Callable[[dict[str, Any]], None]] = []
+        # Parser carry-over: a JSON event part on the wire is often
+        # immediately followed by an image/jpeg part containing the
+        # alarm picture (PIR-cam devices). We hold the JSON event
+        # pending until we see what the next part is — if it's a JPEG
+        # we attach the bytes and dispatch; if it's another JSON we
+        # dispatch the previous one without a picture and start fresh.
+        self._pending_event: Optional[dict[str, Any]] = None
 
     # ─── lifecycle ────────────────────────────────────────────────
 
@@ -204,36 +211,87 @@ class AxProAlertStream(threading.Thread):
             buf = self._drain_frames(buf)
 
     def _drain_frames(self, buf: bytes) -> bytes:
+        """Walk through `--boundary` multipart segments.
+
+        Each segment has the shape `<headers>\r\n\r\n<body>` between
+        two boundary markers. We classify each by Content-Type:
+
+          * application/json  → an event; buffer it as `pending_event`
+          * image/jpeg        → an alarm picture; attach to the
+                                pending JSON event and dispatch
+
+        If a new JSON event arrives while one is still pending (no
+        picture followed), we dispatch the previous one without a
+        picture and continue. State carries across drain calls so
+        partial multipart segments on a chunk boundary don't drop
+        events.
+        """
+        import json
         while True:
-            # Frames are `--boundary\r\n...headers...\r\n\r\n<body>--boundary…`
-            m = re.search(rb"\r\n\r\n(.*?)(?=--boundary|$)", buf, flags=re.DOTALL)
-            if m is None:
+            b1 = buf.find(b"--boundary")
+            if b1 == -1:
                 return buf
-            frame = m.group(1).strip()
-            next_boundary = buf.find(b"--boundary", m.end())
-            if next_boundary == -1:
-                # Need more bytes before this frame is complete.
+            sep = buf.find(b"\r\n\r\n", b1)
+            if sep == -1:
+                # Headers not fully arrived yet.
                 return buf
-            buf = buf[next_boundary:]
-            if not frame:
+            b2 = buf.find(b"--boundary", sep + 4)
+            if b2 == -1:
+                # Body still streaming in.
+                return buf
+            headers_blob = buf[b1:sep]
+            body = buf[sep + 4 : b2]
+            # Hub adds a trailing CRLF before the next boundary.
+            if body.endswith(b"\r\n"):
+                body = body[:-2]
+            buf = buf[b2:]
+            if not body:
                 continue
-            try:
-                import json
-                data = json.loads(frame)
-            except Exception:
-                logger.debug("AxProAlertStream: unparseable frame: %r", frame[:120])
-                continue
-            self._events_received += 1
-            for listener in self._raw_listeners:
+            ctype = _parse_content_type(headers_blob)
+            if "json" in ctype:
                 try:
-                    listener(data)
+                    data = json.loads(body)
                 except Exception:
-                    logger.exception("raw alertStream listener crashed")
-            self._handle_event(data)
+                    logger.debug(
+                        "AxProAlertStream: unparseable JSON part: %r", body[:120],
+                    )
+                    continue
+                # New JSON event — flush any pending one that never got
+                # its picture.
+                if self._pending_event is not None:
+                    self._consume_event(self._pending_event, picture=None)
+                self._pending_event = data
+            elif "image" in ctype:
+                if self._pending_event is None:
+                    logger.debug(
+                        "AxProAlertStream: orphan image part (%d bytes) — no preceding event",
+                        len(body),
+                    )
+                    continue
+                self._consume_event(self._pending_event, picture=bytes(body))
+                self._pending_event = None
+            else:
+                logger.debug(
+                    "AxProAlertStream: ignoring part with content-type=%r (%d bytes)",
+                    ctype, len(body),
+                )
+
+    def _consume_event(
+        self, data: dict[str, Any], *, picture: Optional[bytes],
+    ) -> None:
+        self._events_received += 1
+        for listener in self._raw_listeners:
+            try:
+                listener(data)
+            except Exception:
+                logger.exception("raw alertStream listener crashed")
+        self._handle_event(data, picture=picture)
 
     # ─── event mapping ────────────────────────────────────────────
 
-    def _handle_event(self, data: dict[str, Any]) -> None:
+    def _handle_event(
+        self, data: dict[str, Any], *, picture: Optional[bytes] = None,
+    ) -> None:
         event_type = str(data.get("eventType") or "")
         event_state = str(data.get("eventState") or "")
 
@@ -241,7 +299,7 @@ class AxProAlertStream(threading.Thread):
             self._handle_cid(data, event_state)
             return
         if event_type == "zoneEvent":
-            self._handle_zone(data, event_state)
+            self._handle_zone(data, event_state, picture=picture)
             return
         # Everything else (videoloss, motion on a camera channel, etc.)
         # is logged at debug but not dispatched — these are typically
@@ -289,7 +347,10 @@ class AxProAlertStream(threading.Thread):
         except Exception:
             logger.exception("AxProAlertStream: dispatch crashed (cid=%d)", code)
 
-    def _handle_zone(self, data: dict[str, Any], event_state: str) -> None:
+    def _handle_zone(
+        self, data: dict[str, Any], event_state: str,
+        *, picture: Optional[bytes] = None,
+    ) -> None:
         if event_state != "active":
             return
         zone = data.get("Zone") or {}
@@ -306,10 +367,28 @@ class AxProAlertStream(threading.Thread):
             zone_name=str(zone.get("name") or ""),
             source="axpro",
             raw=data,
+            picture_bytes=picture,
         )
+        # PIR-cam devices ride a JPEG along with the alarm. Surface
+        # presence/absence at INFO so the operator can tell whether
+        # their device has "alarm picture upload" enabled — silent
+        # failure (no picture, no log) is the worst outcome.
+        if detector == "pircam":
+            if picture is not None:
+                logger.info(
+                    "AxProAlertStream: pircam zone=%d carried %d-byte JPEG",
+                    zone_id, len(picture),
+                )
+            else:
+                logger.info(
+                    "AxProAlertStream: pircam zone=%d fired without a JPEG "
+                    "(check 'Alarm picture upload' on the device)",
+                    zone_id,
+                )
         logger.warning(
-            "AxProAlertStream: zoneEvent zone=%d type=%s — dispatching",
+            "AxProAlertStream: zoneEvent zone=%d type=%s%s — dispatching",
             zone_id, event_type,
+            f" + {len(picture)}B JPEG" if picture else "",
         )
         try:
             self._dispatcher.dispatch(event)
@@ -326,3 +405,15 @@ def _coerce_zone_id(raw) -> Optional[int]:
         return int(raw)
     except (TypeError, ValueError):
         return None
+
+
+_CT_RE = re.compile(rb"content-type\s*:\s*([^\r\n;]+)", re.IGNORECASE)
+
+
+def _parse_content_type(headers_blob: bytes) -> str:
+    """Pull the Content-Type value (lowercased, no params) from a
+    multipart part's header block. Returns '' if absent."""
+    m = _CT_RE.search(headers_blob)
+    if not m:
+        return ""
+    return m.group(1).strip().lower().decode("ascii", errors="replace")

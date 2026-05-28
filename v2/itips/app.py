@@ -21,6 +21,12 @@ from itips.utils.logging import configure as configure_logging
 def run() -> int:
     configure_logging(log_file=Path("/opt/itips/var/logs/itips.log")
                       if settings.mode == "prod" else None)
+    _quiet_libjpeg_noise()
+    # libjpeg-turbo / PaddlePaddle write some warnings *directly* to
+    # fd 2, bypassing both Python's logging and OpenCV's logger.
+    # Install a fd-level filter that drops the known-cosmetic lines.
+    from itips.utils.stderr_filter import install_stderr_filter
+    install_stderr_filter()
     logger = logging.getLogger("itips.app")
     logger.info("ITIPS V2 (Dahua-native) starting — mode=%s site=%s device=%s",
                 settings.mode, settings.tenant.site_id or "(unset)",
@@ -28,6 +34,37 @@ def run() -> int:
 
     orchestrator = Orchestrator(deps_factory=_build_deps)
     return orchestrator.run()
+
+
+def _quiet_libjpeg_noise() -> None:
+    """Drop OpenCV's log threshold below WARN.
+
+    libjpeg-turbo (used by cv2 for JPEG decode) writes warnings like
+    ``Corrupt JPEG data: N extraneous bytes before marker 0xfe`` for
+    images that decode fine but contain non-standard segments. Dahua
+    snapshots and event JPEGs trip this constantly. The messages are
+    cosmetic — the decoded image is correct — but they spam the logs
+    at ~30 lines/minute on a quiet site, which masks real errors and
+    confuses operators reading the log.
+
+    We silence WARN-level OpenCV messages globally; ERROR and FATAL
+    still surface, so a genuine decode failure is still visible.
+    """
+    import os
+    os.environ.setdefault("OPENCV_LOG_LEVEL", "ERROR")
+    try:
+        import cv2
+        # cv2 ≥ 4.7 exposes setLogLevel directly; older builds need the
+        # utils.logging module. Try both — failure is non-fatal.
+        try:
+            cv2.setLogLevel(3)            # 3 == LOG_LEVEL_ERROR
+        except AttributeError:
+            from cv2.utils import logging as _cvlog
+            _cvlog.setLogLevel(_cvlog.LOG_LEVEL_ERROR)
+    except Exception:
+        # No cv2, or an older version without setLogLevel — the env var
+        # above is the belt-and-braces path.
+        pass
 
 
 def _build_deps():
@@ -81,6 +118,11 @@ def _build_deps():
 
     frame_bus = FrameBus()
     event_tap = EventTap()
+    # Real-time "something just happened" feed (line cross, intrusion,
+    # sensor trip) for the Live page — published before any model
+    # validation or incident packaging.
+    from itips.runtime.activity_tap import ActivityTap
+    activity_tap = ActivityTap()
 
     # Continuous RTSP grabbers feed:
     #   1. IncidentRecorder — so pre/post MP4s contain actual footage.
@@ -171,6 +213,20 @@ def _build_deps():
         event_tap=sensor_event_tap,
         threat_evaluator=threat_evaluator,
         preset_state=preset_state,
+        activity_tap=activity_tap,
+    )
+
+    # Continuous zone evaluation — runs the behavior engine against the
+    # live RTSP frames (preset-gated) so line-cross / intrusion / loiter
+    # are detected by ITIPS in real time and surfaced on Live, rather
+    # than only when the camera's own IVS fires.
+    from itips.runtime.behavior_watcher import BehaviorWatcher
+    behavior_watcher = BehaviorWatcher(
+        frame_bus=frame_bus,
+        behavior_engine=ml_state.behavior_engine,
+        dahua_manager=dahua_manager,
+        activity_tap=activity_tap,
+        target_fps=2.0,
     )
 
     # AX PRO hub listener — None unless ITIPS_AXPRO_* env are set.
@@ -191,10 +247,11 @@ def _build_deps():
     axpro_alertstream = _build_axpro_alertstream(axpro_listener, sensor_dispatcher)
     # Hub-control helper for the dashboard's hub-admin routes.
     axpro_admin = _build_axpro_admin(axpro_listener)
-    # Auto-sound the hub siren on every confirmed incident (PRD §3.3
-    # Stage 3). Gated behind ITIPS_AXPRO_AUTO_SIREN=true so a dev
-    # environment doesn't blast a live site on every test alert.
-    _wire_auto_siren(alert_engine, axpro_admin)
+    # Sound the hub siren only on a ThreatEvaluator INTRUDER verdict —
+    # after ITIPS has looked at the scene — rather than letting the
+    # panel auto-sound on every sensor trip. Gated by
+    # ITIPS_AXPRO_AUTO_SIREN (off in dev so synthetic events stay quiet).
+    _wire_auto_siren(threat_evaluator, axpro_admin)
 
     # Outbound webhooks — fan AlertEngine + validator + sensor events
     # out to registered subscriber URLs. Always built (so the dashboard
@@ -265,6 +322,7 @@ def _build_deps():
         webhook_dispatcher=webhook_dispatcher,
         preset_state=preset_state,
         camera_settings=camera_settings,
+        activity_tap=activity_tap,
     )
     inbound_api = InboundApiServer(
         dahua_manager=dahua_manager,
@@ -284,6 +342,7 @@ def _build_deps():
     # to services so they get the same start()/stop() lifecycle.
     services.extend(rtsp_grabbers.values())
     services.append(recovery_watcher)
+    services.append(behavior_watcher)
     if threat_evaluator is not None:
         services.append(threat_evaluator)
     if ml_state.embedding_store is not None:
@@ -478,35 +537,49 @@ def _wire_camera_recovery(
         grabber.add_reconnect_listener(_on_reconnect)
 
 
-def _wire_auto_siren(alert_engine, axpro_admin) -> None:
-    """Hook AlertEngine's lifecycle so a confirmed incident auto-sounds
-    the hub siren. Opt-in via ITIPS_AXPRO_AUTO_SIREN=true; default off
-    so a dev environment doesn't blast a live site every time you fire
-    a synthetic event."""
-    import os
-    if axpro_admin is None or alert_engine is None:
-        return
-    if (os.environ.get("ITIPS_AXPRO_AUTO_SIREN") or "").lower() not in {"1", "true", "yes"}:
-        return
-    sub_id = int(os.environ.get("ITIPS_AXPRO_AUTO_SIREN_SUBSYS") or "1")
-    logger = logging.getLogger("itips.app.axpro")
+def _wire_auto_siren(threat_evaluator, axpro_admin) -> None:
+    """Sound the hub siren only when the ThreatEvaluator confirms an
+    INTRUDER — i.e. *after* ITIPS has panned, sampled the scene, and
+    failed to match an authorised worker. This is the "go check first,
+    then sound it" behaviour: the hub itself stays silent (see each
+    zone's `silentEnabled` flag) and ITIPS is the sole siren trigger.
 
-    def _on_lifecycle(stage: str, info: dict) -> None:
-        if stage != "confirmed":
+    Opt-in via ITIPS_AXPRO_AUTO_SIREN=true; default off so a dev box
+    running synthetic events doesn't blast a live 100 dB siren. With it
+    off, the verdict still flows through the rest of the pipeline
+    (incident, webhooks) — only the physical siren is withheld.
+    """
+    import os
+    if axpro_admin is None or threat_evaluator is None:
+        return
+    logger = logging.getLogger("itips.app.axpro")
+    enabled = (os.environ.get("ITIPS_AXPRO_AUTO_SIREN") or "").lower() in {"1", "true", "yes"}
+    sub_id = int(os.environ.get("ITIPS_AXPRO_AUTO_SIREN_SUBSYS") or "1")
+
+    def _on_verdict(payload: dict) -> None:
+        if payload.get("verdict") != "intruder" or not payload.get("armed"):
+            return
+        cam = payload.get("camera_id")
+        if not enabled:
+            logger.warning(
+                "INTRUDER on cam%s — code-siren is DISABLED "
+                "(set ITIPS_AXPRO_AUTO_SIREN=true to sound subsys %d)",
+                cam, sub_id,
+            )
             return
         try:
             axpro_admin.start_siren(sub_id)
             logger.warning(
-                "auto-siren: started on subsys %d (incident %s, signal=%s)",
-                sub_id, info.get("incident_id"), info.get("signal"),
+                "code-siren: SOUNDED subsys %d on confirmed INTRUDER (cam%s)",
+                sub_id, cam,
             )
         except Exception:
-            logger.exception("auto-siren: start_siren failed")
+            logger.exception("code-siren: start_siren failed")
 
-    alert_engine.add_lifecycle_listener(_on_lifecycle)
+    threat_evaluator.add_verdict_listener(_on_verdict)
     logger.info(
-        "Auto-siren wired — will sound subsys %d on every confirmed incident",
-        sub_id,
+        "Code-siren wired to INTRUDER verdict (subsys %d) — enabled=%s",
+        sub_id, enabled,
     )
 
 

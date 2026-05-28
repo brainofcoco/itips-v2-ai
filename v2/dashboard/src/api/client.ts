@@ -95,6 +95,9 @@ export async function deletePreset(
 export async function fetchCurrentPresets(): Promise<CurrentPresetsResponse> {
   return getJson<CurrentPresetsResponse>("/api/presets/current");
 }
+export async function fetchRecentActivity(limit = 50): Promise<import("./types").ActivityResponse> {
+  return getJson<import("./types").ActivityResponse>(`/api/activity/recent?limit=${limit}`);
+}
 export async function fetchBasePreset(
   cameraId: number,
 ): Promise<{ available: boolean; base_preset_name: string | null }> {
@@ -160,6 +163,22 @@ export function incidentFileUrl(id: string, name: string, inline = false): strin
 }
 export async function runTestIncident(): Promise<{ ok: boolean; incident_id?: string; error?: string }> {
   return postJson("/api/evidence/test/run");
+}
+export async function deleteIncident(
+  id: string,
+): Promise<{ ok: boolean; error?: string }> {
+  return del(`/api/incidents/${encodeURIComponent(id)}`);
+}
+export async function bulkDeleteIncidents(
+  payload: { ids?: string[]; all?: boolean },
+): Promise<{
+  ok: boolean;
+  requested?: number;
+  deleted?: number;
+  results?: Array<{ incident_id: string; status: string; error?: string }>;
+  error?: string;
+}> {
+  return postJson("/api/incidents/bulk-delete", payload);
 }
 
 // ─── sensors ─────────────────────────────────────────────────────────

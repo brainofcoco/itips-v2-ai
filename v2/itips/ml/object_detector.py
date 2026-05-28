@@ -35,11 +35,32 @@ class ObjectDetector:
         self,
         *,
         model_name: str = "yolov8n.pt",
-        confidence: float = 0.4,
+        confidence: Optional[float] = None,
+        imgsz: Optional[int] = None,
         device: Optional[str] = None,
     ) -> None:
+        import os
         self._model_name = model_name
-        self._confidence = float(confidence)
+        # Confidence floor and inference resolution. The cameras feed 4K
+        # (3840×2160) frames; at YOLO's default imgsz=640 a 4K frame is
+        # downscaled ~6× and mid-distance road objects shrink below the
+        # detector's reach — which is why crossings on the road camera
+        # never fired. Default to 1280 so those objects survive the
+        # downscale, and a slightly looser 0.3 confidence for recall.
+        # Both env-tunable: drop ITIPS_BEHAVIOR_IMGSZ to 960 if CPU
+        # struggles, raise on the Jetson GPU.
+        def _envf(name: str, dflt: float) -> float:
+            try:
+                return float(os.environ.get(name) or dflt)
+            except ValueError:
+                return dflt
+        def _envi(name: str, dflt: int) -> int:
+            try:
+                return int(os.environ.get(name) or dflt)
+            except ValueError:
+                return dflt
+        self._confidence = float(confidence) if confidence is not None else _envf("ITIPS_BEHAVIOR_CONF", 0.3)
+        self._imgsz = int(imgsz) if imgsz is not None else _envi("ITIPS_BEHAVIOR_IMGSZ", 1280)
         # Ultralytics auto-selects CUDA when available; pin manually for JetPack.
         self._device = device
         self._model = None
@@ -99,7 +120,7 @@ class ObjectDetector:
     def detect(self, frame: "np.ndarray") -> list[Detection]:
         """`frame` is BGR uint8 (OpenCV) — YOLO accepts that natively."""
         model = self._ensure_model()
-        kwargs = {"conf": self._confidence, "verbose": False}
+        kwargs = {"conf": self._confidence, "imgsz": self._imgsz, "verbose": False}
         if self._device is not None:
             kwargs["device"] = self._device
         results = model.predict(frame, **kwargs)

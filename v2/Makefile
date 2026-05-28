@@ -9,7 +9,7 @@ COMPOSE ?= docker compose
 PYTHON ?= python3
 
 .PHONY: help install build up down logs restart shell ps test lint fmt typecheck check clean fresh \
-        dash-up dash-down dash-logs dash-dev
+        dash-up dash-build dash-down dash-logs dash-dev
 
 help:  ## Show available targets
 	@awk 'BEGIN {FS = ":.*##"; printf "Usage: make \033[36m<target>\033[0m\n\nTargets:\n"} \
@@ -68,11 +68,24 @@ fresh: clean down  ## Hard reset — clean + down (does NOT touch evidence_store
 # ─── Vite/React dashboard (opt-in `dev` profile) ────────────────────
 dash-up:  ## Start itips + dashboard (Mac/lab — bundles a frontend)
 	@mkdir -p ./var ./evidence_store
-	COMPOSE_PROFILES=dev $(COMPOSE) up -d --build
+	@# Try a rebuild, but if BuildKit can't reach Docker Hub to resolve
+	@# base-image metadata (a common transient outage), fall back to
+	@# starting with the images already built locally so the stack still
+	@# comes up. Use `make dash-build` to force a rebuild and surface the
+	@# error instead.
+	@COMPOSE_PROFILES=dev $(COMPOSE) up -d --build || { \
+		echo ""; \
+		echo "  ⚠ build failed (Docker Hub unreachable?) — starting with existing local images"; \
+		COMPOSE_PROFILES=dev $(COMPOSE) up -d; \
+	}
 	@echo ""
 	@echo "  Vite dashboard: http://localhost:3000"
 	@echo "  Legacy console: http://localhost:5050/dashboard"
 	@echo ""
+
+dash-build:  ## Force a rebuild of itips + dashboard (fails loudly if Hub is down)
+	@mkdir -p ./var ./evidence_store
+	COMPOSE_PROFILES=dev $(COMPOSE) up -d --build
 
 dash-down:  ## Stop both services (itips + dashboard)
 	COMPOSE_PROFILES=dev $(COMPOSE) down

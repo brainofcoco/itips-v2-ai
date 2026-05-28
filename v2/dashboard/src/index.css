@@ -283,16 +283,53 @@ label.field > span { font-weight: 500; }
 /* ── selectable list (incidents sidebar etc.) ── */
 .select-list { list-style: none; padding: 0; margin: 0; }
 .select-list > li {
-  padding: 0.55rem 0.75rem;
+  padding: 0;
   border-bottom: 1px solid var(--border);
+  display: block;
+}
+.select-list > li:hover { background: var(--panel-2); }
+.select-list > li.active { background: var(--panel-2); border-left: 3px solid var(--accent); }
+.select-list small { color: var(--muted); font-size: 0.75rem; display: block; }
+
+/* row inside an incident list item: checkbox + label + delete */
+.incident-row {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.55rem 0.75rem;
+}
+.incident-row-body {
+  flex: 1;
+  min-width: 0;
   cursor: pointer;
   display: flex;
   flex-direction: column;
   gap: 0.15rem;
 }
-.select-list > li:hover { background: var(--panel-2); }
-.select-list > li.active { background: var(--panel-2); border-left: 3px solid var(--accent); }
-.select-list small { color: var(--muted); font-size: 0.75rem; }
+.incident-row-del {
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--muted);
+  padding: 0.15rem 0.45rem;
+  font-size: 0.85rem;
+  border-radius: 4px;
+}
+.incident-row-del:hover:not(:disabled) {
+  color: #ff7a73;
+  border-color: rgba(229,83,75,0.35);
+  background: rgba(229,83,75,0.08);
+}
+
+button.danger-ghost {
+  background: transparent;
+  border: 1px solid rgba(229,83,75,0.35);
+  color: #ff9b95;
+}
+button.danger-ghost:hover:not(:disabled) {
+  background: rgba(229,83,75,0.12);
+  color: #ffb0aa;
+  border-color: rgba(229,83,75,0.55);
+}
 
 /* ── two-column split (incidents) ── */
 .split {
@@ -685,6 +722,62 @@ label.field > span { font-weight: 500; }
   border-color: var(--accent);
   box-shadow: 0 0 0 1px rgba(93,180,255,0.45);
 }
+
+/* Live tile: real-time detection alert state */
+.cam.cam-alerting {
+  border-color: var(--bad);
+  box-shadow: 0 0 0 1px rgba(229,83,75,0.55), 0 0 14px rgba(229,83,75,0.35);
+  animation: cam-alert-pulse 1.4s ease-in-out infinite;
+}
+@keyframes cam-alert-pulse {
+  0%, 100% { box-shadow: 0 0 0 1px rgba(229,83,75,0.55), 0 0 8px rgba(229,83,75,0.25); }
+  50%      { box-shadow: 0 0 0 1px rgba(229,83,75,0.7),  0 0 18px rgba(229,83,75,0.5); }
+}
+
+/* activity badge stack — top-center of the feed */
+.cam-activity {
+  position: absolute;
+  top: 0.5rem;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.3rem;
+  pointer-events: none;
+  max-width: calc(100% - 1rem);
+}
+.cam-activity-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.22rem 0.6rem;
+  border-radius: 999px;
+  font-size: 0.74rem;
+  font-weight: 600;
+  color: #fff;
+  backdrop-filter: blur(4px);
+  box-shadow: 0 1px 4px rgba(0,0,0,0.4);
+  white-space: nowrap;
+  animation: cam-activity-in 0.18s ease-out;
+}
+@keyframes cam-activity-in {
+  from { opacity: 0; transform: translateY(-4px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.cam-activity-badge .act-glyph { font-size: 0.9rem; line-height: 1; }
+.cam-activity-badge .act-status {
+  font-weight: 500;
+  opacity: 0.85;
+  font-size: 0.68rem;
+  padding-left: 0.3rem;
+  border-left: 1px solid rgba(255,255,255,0.35);
+}
+.cam-activity-badge.act-bad  { background: rgba(229,83,75,0.92); }
+.cam-activity-badge.act-warn { background: rgba(210,153,34,0.92); color: #1a1205; }
+.cam-activity-badge.act-warn .act-status { border-left-color: rgba(0,0,0,0.3); }
+.cam-activity-badge.act-info { background: rgba(93,180,255,0.92); color: #06121f; }
+.cam-activity-badge.act-info .act-status { border-left-color: rgba(0,0,0,0.3); }
 
 /* ── help callout (used in Add binding) ── */
 .help-callout {

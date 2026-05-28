@@ -103,6 +103,26 @@ class BehaviorEngine:
             return []
         return self.analyse_full(camera_id, frame, ts=ts).alerts
 
+    def analyse_detailed(
+        self,
+        camera_id: int,
+        frame: "np.ndarray",
+        ts: Optional[float] = None,
+    ) -> "BehaviorAnalysis":
+        """Like `analyse` but returns the full BehaviorAnalysis (alerts +
+        detections + tracks) so the continuous watcher can log what YOLO
+        actually saw. Still active-zone gated, so cameras with no active
+        zone for the current preset skip the detector entirely."""
+        if not self._active_zones(camera_id):
+            return BehaviorAnalysis(alerts=[], detections=[], tracks=[])
+        return self.analyse_full(camera_id, frame, ts=ts)
+
+    def active_zone_types(self, camera_id: int) -> list[str]:
+        """Zone types active for the camera's current preset — lets the
+        watcher decide whether to sample fast (a line needs high temporal
+        resolution) or slow (regions/loiter are fine at low fps)."""
+        return [z.zone_type for z in self._active_zones(camera_id)]
+
     def _active_zones(self, camera_id: int):
         """Filter the camera's zones down to those that should fire
         right now — preset-bound zones only count when the camera is
