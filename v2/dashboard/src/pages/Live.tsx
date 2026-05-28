@@ -5,6 +5,7 @@ import {
 } from "../api/client";
 import type { Camera, Zone } from "../api/types";
 import { colorForZone, drawZone } from "../lib/zoneCanvas";
+import PtzPanel from "../components/PtzPanel";
 
 // Why snapshot polling instead of MJPEG:
 // Each MJPEG <img src="/live/N"> holds one of the browser's six
@@ -20,13 +21,22 @@ export default function Live() {
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [showZones, setShowZones] = useState(true);
+  const [controlledId, setControlledId] = useState<number | null>(null);
 
   useEffect(() => {
     let cancelled = false;
     (async () => {
       try {
         const cams = await fetchCameras();
-        if (!cancelled) setCameras(cams);
+        if (!cancelled) {
+          setCameras(cams);
+          // Default the PTZ panel to the first PTZ-capable camera, else
+          // the first camera, so the panel is usable on first load.
+          if (cams.length && controlledId == null) {
+            const ptz = cams.find((c) => c.ptz_connected !== false) ?? cams[0];
+            setControlledId(ptz.camera_id);
+          }
+        }
       } catch (e) {
         if (!cancelled) setError(String(e));
       } finally {
@@ -36,7 +46,7 @@ export default function Live() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, []);   // eslint-disable-line react-hooks/exhaustive-deps
 
   return (
     <>
@@ -61,17 +71,37 @@ export default function Live() {
       ) : cameras.length === 0 ? (
         <p className="muted">No cameras configured.</p>
       ) : (
-        <div className="cam-grid">
-          {cameras.map((cam) => (
-            <CameraTile key={cam.camera_id} cam={cam} showZones={showZones} />
-          ))}
-        </div>
+        <>
+          <PtzPanel
+            cameras={cameras}
+            cameraId={controlledId}
+            onSelectCamera={setControlledId}
+          />
+          <div className="cam-grid">
+            {cameras.map((cam) => (
+              <CameraTile
+                key={cam.camera_id}
+                cam={cam}
+                showZones={showZones}
+                isControlled={cam.camera_id === controlledId}
+                onTakeControl={() => setControlledId(cam.camera_id)}
+              />
+            ))}
+          </div>
+        </>
       )}
     </>
   );
 }
 
-function CameraTile({ cam, showZones }: { cam: Camera; showZones: boolean }) {
+function CameraTile({
+  cam, showZones, isControlled, onTakeControl,
+}: {
+  cam: Camera;
+  showZones: boolean;
+  isControlled: boolean;
+  onTakeControl: () => void;
+}) {
   const imgRef = useRef<HTMLImageElement | null>(null);
   const overlayRef = useRef<HTMLCanvasElement | null>(null);
   const [busy, setBusy] = useState<"fire" | "stand" | null>(null);
@@ -191,7 +221,7 @@ function CameraTile({ cam, showZones }: { cam: Camera; showZones: boolean }) {
   }, [zones]);
 
   return (
-    <article className="cam">
+    <article className={`cam${isControlled ? " cam-controlled" : ""}`}>
       <header>
         <h2>Camera {cam.camera_id} · {cam.endpoint}</h2>
         <span className={cam.workers_group_id ? "pill pill-ok" : "pill pill-idle"}>
@@ -242,6 +272,19 @@ function CameraTile({ cam, showZones }: { cam: Camera; showZones: boolean }) {
         <button disabled={busy !== null} onClick={handleStand}>
           {busy === "stand" ? "…" : "Stand down"}
         </button>
+        {isControlled ? (
+          <span className="pill pill-ok" title="PTZ panel above controls this camera">
+            PTZ • controlling
+          </span>
+        ) : (
+          <button
+            onClick={onTakeControl}
+            disabled={cam.ptz_connected === false}
+            title={cam.ptz_connected === false ? "PTZ not available on this camera" : "Drive this camera from the PTZ panel"}
+          >
+            Control PTZ
+          </button>
+        )}
         <span className="spacer" />
         {zoneSummary && <span className="muted small">{zoneSummary}</span>}
         <span className={cam.ptz_connected ? "pill pill-ok" : "pill pill-idle"}>

@@ -55,6 +55,19 @@ export async function gotoPreset(
 ): Promise<{ ok: boolean; error?: string }> {
   return postJson(`/api/cameras/${cameraId}/presets/${index}/goto`, {});
 }
+
+export type PtzDirection =
+  | "up" | "down" | "left" | "right"
+  | "left_up" | "right_up" | "left_down" | "right_down"
+  | "zoom_wide" | "zoom_tele"
+  | "focus_near" | "focus_far";
+
+export async function ptzJog(
+  cameraId: number, direction: PtzDirection,
+  action: "start" | "stop", speed = 4,
+): Promise<{ ok: boolean; error?: string; hint?: string }> {
+  return postJson(`/api/test/ptz/${cameraId}/${direction}`, { action, speed });
+}
 export async function fireDeterrence(cameraId: number): Promise<void> {
   await postJson(`/api/deterrence/${cameraId}/fire`, { light: true, speaker: true });
 }

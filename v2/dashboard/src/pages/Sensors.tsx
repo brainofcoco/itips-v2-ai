@@ -355,8 +355,8 @@ function AddMappingForm({
   }, [cameraId, newPresetName, presets, reloadPresets]);
 
   const submit = useCallback(async () => {
-    if (effectiveZoneId == null || effectiveZoneId <= 0) {
-      alert("Pick a sensor zone (or enter a positive number).");
+    if (effectiveZoneId == null || effectiveZoneId < 0) {
+      alert("Pick a sensor zone (or enter a non-negative number).");
       return;
     }
     if (cameraId == null) { alert("Pick a camera."); return; }
