@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
-  fetchPresets, gotoPreset, ptzJog, saveCurrentPreset,
+  deletePreset, fetchPresets, gotoPreset, ptzJog, saveCurrentPreset,
   type PtzDirection,
 } from "../api/client";
 import type { Camera, CameraPreset } from "../api/types";
@@ -19,7 +19,7 @@ export default function PtzPanel({ cameras, cameraId, onSelectCamera }: Props) {
   const [presets, setPresets] = useState<CameraPreset[]>([]);
   const [presetIndex, setPresetIndex] = useState<number | "">("");
   const [newPresetName, setNewPresetName] = useState("");
-  const [busy, setBusy] = useState<"goto" | "save" | null>(null);
+  const [busy, setBusy] = useState<"goto" | "save" | "delete" | null>(null);
   const [status, setStatus] = useState<string | null>(null);
 
   // Track which direction is currently jogging so we can guarantee a
@@ -156,11 +156,33 @@ export default function PtzPanel({ cameras, cameraId, onSelectCamera }: Props) {
       await reloadPresets(cameraId);
       setPresetIndex(r.preset.index);
       setNewPresetName("");
-      setStatus(`Saved preset "${r.preset.name}" (#${r.preset.index}).`);
+      // Camera may keep its auto-name (firmware quirk). Tell the operator.
+      if (r.name_warning) {
+        setStatus(r.name_warning);
+      } else {
+        setStatus(`Saved preset "${r.preset.name}" (#${r.preset.index}).`);
+      }
     } finally {
       setBusy(null);
     }
   }, [cameraId, newPresetName, presets, reloadPresets]);
+
+  const onDeletePreset = useCallback(async () => {
+    if (cameraId == null || presetIndex === "") return;
+    const p = presets.find((x) => x.index === presetIndex);
+    const label = p ? `"${p.name}" (#${p.index})` : `preset #${presetIndex}`;
+    if (!confirm(`Delete ${label} from cam${cameraId}? This removes it from the camera.`)) return;
+    setBusy("delete");
+    try {
+      const r = await deletePreset(cameraId, presetIndex);
+      if (!r.ok) { setStatus(`Delete failed: ${r.error ?? "unknown"}`); return; }
+      await reloadPresets(cameraId);
+      setPresetIndex("");
+      setStatus(`Deleted ${label}.`);
+    } finally {
+      setBusy(null);
+    }
+  }, [cameraId, presetIndex, presets, reloadPresets]);
 
   const disabled = cameraId == null;
 
@@ -244,6 +266,13 @@ export default function PtzPanel({ cameras, cameraId, onSelectCamera }: Props) {
               onClick={onGotoPreset}
             >
               {busy === "goto" ? "…" : "Go"}
+            </button>
+            <button
+              disabled={disabled || presetIndex === "" || busy === "delete"}
+              onClick={onDeletePreset}
+              title="Delete this preset from the camera"
+            >
+              {busy === "delete" ? "…" : "Delete"}
             </button>
           </div>
           <div className="ptz-preset-row">

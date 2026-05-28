@@ -33,6 +33,38 @@ async function del<T>(path: string): Promise<T> {
   return (await res.json()) as T;
 }
 
+// Multipart POST that doesn't blow up on non-JSON error responses
+// (nginx 504 HTML pages, 413 entity-too-large, etc.). Returns the
+// parsed JSON on success and an `{error, http_status}` envelope on
+// failure so the JsonView in the ML Lab shows something readable
+// instead of "Unexpected token '<'".
+async function postForm(url: string, form: FormData): Promise<any> {
+  let res: Response;
+  try {
+    res = await fetch(url, { method: "POST", body: form });
+  } catch (e) {
+    return { error: `network failure: ${e}` };
+  }
+  const ct = res.headers.get("content-type") || "";
+  if (ct.includes("application/json")) {
+    try { return await res.json(); }
+    catch (e) { return { error: `bad JSON in ${res.status} response: ${e}`, http_status: res.status }; }
+  }
+  // Fall back to text and try to make sense of common upstream pages.
+  const raw = await res.text();
+  const stripped = raw.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim().slice(0, 280);
+  const hint =
+    res.status === 504 ? " — request exceeded nginx proxy_read_timeout. Bump it or retry."
+    : res.status === 502 ? " — upstream (itips) did not respond. Check container logs."
+    : res.status === 413 ? " — payload too large for nginx client_max_body_size."
+    : "";
+  return {
+    error: `HTTP ${res.status} ${res.statusText}${hint}`,
+    body_preview: stripped || "(empty)",
+    http_status: res.status,
+  };
+}
+
 // ─── cameras ─────────────────────────────────────────────────────────
 export async function fetchCameras(): Promise<Camera[]> {
   const body = await getJson<CamerasResponse | Camera[]>("/api/cameras");
@@ -44,11 +76,21 @@ export async function fetchPresets(cameraId: number): Promise<PresetsResponse> {
 }
 export async function saveCurrentPreset(
   cameraId: number, name?: string, index?: number,
-): Promise<{ ok: boolean; preset?: { index: number; name: string }; error?: string }> {
+): Promise<{
+  ok: boolean;
+  preset?: { index: number; name: string };
+  name_warning?: string;
+  error?: string;
+}> {
   const body: Record<string, unknown> = {};
   if (name) body.name = name;
   if (index != null) body.index = index;
   return postJson(`/api/cameras/${cameraId}/presets`, body);
+}
+export async function deletePreset(
+  cameraId: number, index: number,
+): Promise<{ ok: boolean; error?: string }> {
+  return del(`/api/cameras/${cameraId}/presets/${index}`);
 }
 export async function gotoPreset(
   cameraId: number, index: number,
@@ -213,23 +255,20 @@ export async function recognizeFace(file: File, cameraId = 0, dispatch = false):
   form.append("image", file);
   form.append("camera_id", String(cameraId));
   const url = `/api/ml/face/recognize${dispatch ? "?dispatch=1" : ""}`;
-  const res = await fetch(url, { method: "POST", body: form });
-  return res.json();
+  return postForm(url, form);
 }
 export async function readPlate(file: File, cameraId = 0, dispatch = false): Promise<any> {
   const form = new FormData();
   form.append("image", file);
   form.append("camera_id", String(cameraId));
   const url = `/api/ml/plate/read${dispatch ? "?dispatch=1" : ""}`;
-  const res = await fetch(url, { method: "POST", body: form });
-  return res.json();
+  return postForm(url, form);
 }
 export async function analyseBehavior(cameraId: number, file: File, dispatch = false): Promise<any> {
   const form = new FormData();
   form.append("image", file);
   const url = `/api/ml/behavior/${cameraId}/analyse${dispatch ? "?dispatch=1" : ""}`;
-  const res = await fetch(url, { method: "POST", body: form });
-  return res.json();
+  return postForm(url, form);
 }
 export async function runOpenAIScenario(
   scenario: string, file: File, extras: Record<string, string> = {},
@@ -237,10 +276,7 @@ export async function runOpenAIScenario(
   const form = new FormData();
   form.append("image", file);
   for (const [k, v] of Object.entries(extras)) if (v) form.append(k, v);
-  const res = await fetch(`/api/ml/openai/validate/${scenario}`, {
-    method: "POST", body: form,
-  });
-  return res.json();
+  return postForm(`/api/ml/openai/validate/${scenario}`, form);
 }
 
 // ─── zones ───────────────────────────────────────────────────────────

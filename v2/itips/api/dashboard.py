@@ -1475,12 +1475,25 @@ def register_dashboard(
             preset = client.ptz.save_current_as_preset(name, index=idx)
         except Exception as exc:  # noqa: BLE001
             return jsonify({"ok": False, "error": str(exc)}), 502
-        return jsonify({
+        # If the operator asked for a name but the camera kept its own
+        # auto-name (firmware refused naming on every known path), tell
+        # them — silent fallback to "Preset5" was confusing.
+        name_warning = None
+        if name and (preset.name or "").strip() != name.strip():
+            name_warning = (
+                f"Camera kept its auto-name '{preset.name}' instead of "
+                f"'{name}'. This firmware does not accept renaming over HTTP; "
+                f"rename in the camera's web UI if you need the custom label."
+            )
+        payload = {
             "ok": True,
             "camera_id": camera_id,
             "preset": {"index": preset.index, "name": preset.name,
                        "pan": preset.pan, "tilt": preset.tilt, "zoom": preset.zoom},
-        }), 201
+        }
+        if name_warning:
+            payload["name_warning"] = name_warning
+        return jsonify(payload), 201
 
     @app.delete("/api/cameras/<int:camera_id>/presets/<int:index>")
     def delete_camera_preset(camera_id: int, index: int):  # noqa: ANN202

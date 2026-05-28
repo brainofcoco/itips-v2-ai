@@ -137,14 +137,18 @@ class DahuaPTZ:
             "arg2": index,
             "arg3": 0,
         })
-        # 2. Best-effort name. Some firmwares require the array slot
-        # (index-1), others want the preset id directly. Set both.
+        # 2. Best-effort name. Some firmwares accept the configManager
+        # path, some only accept the ptz.cgi SetPresetName command,
+        # and some return "OK" without actually persisting either —
+        # which is why this helper *verifies by readback* instead of
+        # trusting the camera's HTTP response.
         clean = (name or f"preset_{index}").strip()[:31]
         name_ok = self._try_set_preset_name(index, clean)
         if not name_ok:
-            logger.info(
+            logger.warning(
                 "PTZ %s: preset %d saved but name '%s' did not stick — "
-                "camera may not support config-mgr naming",
+                "tried all known firmware variants; the camera is keeping "
+                "its auto-name. Rename via the camera's web UI if needed.",
                 self._endpoint.safe_label(), index, clean,
             )
         # 3. Echo back what the camera says it has, so the caller binds
@@ -157,35 +161,83 @@ class DahuaPTZ:
         return PresetInfo(index=index, name=clean)
 
     def _try_set_preset_name(self, index: int, name: str) -> bool:
-        # Dahua's configManager addresses presets either as a 0-based
-        # array slot (PtzPreset[0]) or as a 1-based PresetTitle list.
-        # We try the array form first because that's what we observe
-        # most cameras emit, and fall back silently if it 404s.
-        params = {
-            "action": "setConfig",
-            f"PtzPreset[{index - 1}].Name":     name,
-            f"PtzPreset[{index - 1}].PresetID": str(index),
-        }
-        try:
-            r = self._endpoint.get(
-                "/cgi-bin/configManager.cgi", params=params, timeout=self._timeout,
-            )
-            if r.status_code == 200 and "ok" in (r.text or "").lower():
+        """Try every known firmware variant and verify each by readback.
+
+        The HTTP body is unreliable — some Dahua firmwares answer
+        "OK" to a malformed configManager key without applying it.
+        The only way to know is to refetch list_presets and compare
+        the name we got back to the one we asked for.
+        """
+        variants = [
+            # Modern firmwares: PtzPreset[] config table.
+            ("PtzPreset", lambda: self._endpoint.get(
+                "/cgi-bin/configManager.cgi",
+                params={
+                    "action": "setConfig",
+                    f"PtzPreset[{index - 1}].Name":     name,
+                    f"PtzPreset[{index - 1}].PresetID": str(index),
+                },
+                timeout=self._timeout,
+            )),
+            # Older NVR/IPC firmwares: PresetTitle[ch].Name[idx] table.
+            ("PresetTitle", lambda: self._endpoint.get(
+                "/cgi-bin/configManager.cgi",
+                params={
+                    "action": "setConfig",
+                    f"PresetTitle[{self._channel - 1}].Name[{index - 1}]": name,
+                },
+                timeout=self._timeout,
+            )),
+            # PTZ-cam firmwares that ignore configManager but expose a
+            # ptz.cgi SetPresetName command. Name goes in a query param;
+            # the arg2/arg3 slots are unused for this opcode.
+            ("ptz.SetPresetName", lambda: self._endpoint.get(
+                "/cgi-bin/ptz.cgi",
+                params={
+                    "action": "start",
+                    "code":   "SetPresetName",
+                    "channel": self._channel,
+                    "arg1": index,
+                    "arg2": 0,
+                    "arg3": 0,
+                    "name": name,
+                },
+                timeout=self._timeout,
+            )),
+        ]
+        for label, call in variants:
+            try:
+                r = call()
+            except Exception:
+                logger.exception(
+                    "PTZ %s: preset-name attempt %s crashed",
+                    self._endpoint.safe_label(), label,
+                )
+                continue
+            if r.status_code != 200:
+                logger.debug(
+                    "PTZ %s: %s preset-name returned HTTP %d",
+                    self._endpoint.safe_label(), label, r.status_code,
+                )
+                continue
+            # Verify — the only source of truth is what the camera lists.
+            if self._verify_preset_name(index, name):
+                logger.info(
+                    "PTZ %s: preset %d named '%s' via %s",
+                    self._endpoint.safe_label(), index, name, label,
+                )
                 return True
-        except Exception:
-            logger.exception("PTZ %s: preset-name PtzPreset config failed", self._endpoint.safe_label())
-        # Fallback — PresetTitle list form (older firmwares).
-        params2 = {
-            "action": "setConfig",
-            f"PresetTitle[{self._channel - 1}].Name[{index - 1}]": name,
-        }
-        try:
-            r2 = self._endpoint.get(
-                "/cgi-bin/configManager.cgi", params=params2, timeout=self._timeout,
+            logger.debug(
+                "PTZ %s: %s returned OK but name did not persist",
+                self._endpoint.safe_label(), label,
             )
-            return r2.status_code == 200 and "ok" in (r2.text or "").lower()
-        except Exception:
-            return False
+        return False
+
+    def _verify_preset_name(self, index: int, expected: str) -> bool:
+        for p in self.list_presets():
+            if p.index == index:
+                return (p.name or "").strip() == expected.strip()
+        return False
 
     def delete_preset(self, index: int) -> None:
         """Drop a preset by index. Used by the wizard when an operator

@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import {
   analyseBehavior, fetchCameras, fetchCapabilities, fetchEnrolledFaces,
   fetchMLStatus, fetchOpenAIStatus, readPlate, recognizeFace,
-  runOpenAIScenario, setCapabilityOverride, warmupML,
+  runOpenAIScenario, setCapabilityOverride, snapshotUrl, warmupML,
 } from "../api/client";
 import type {
   Camera, CapabilitiesResponse, EnrolledFacesResponse, MLEngineState,
@@ -56,7 +56,7 @@ export default function MLLab() {
       <BehaviorLab cameras={cameras} dispatch={dispatch} onRunDone={reloadAll} />
       <FaceOverrides cameras={cameras} caps={caps} onChanged={reloadAll} />
       <EnrolledList data={enrolled} />
-      <OpenAIPanel data={openai} onRun={reloadAll} />
+      <OpenAIPanel cameras={cameras} data={openai} onRun={reloadAll} />
     </>
   );
 }
@@ -67,6 +67,160 @@ function EnginePill({ label, state }: { label: string; state?: MLEngineState }) 
   return state.ready
     ? <Pill tone="ok">{label}: ready</Pill>
     : <Pill tone="warn">{label}: warming…</Pill>;
+}
+
+// ─── shared source picker ─────────────────────────────────────────
+
+type SourceKind = "file" | "live";
+
+interface SourcePickerProps {
+  source: SourceKind;
+  onSourceChange: (s: SourceKind) => void;
+  fileRef: React.RefObject<HTMLInputElement>;
+  cameraId: number | null;
+  onCameraChange: (id: number | null) => void;
+  cameras: Camera[];
+  requireCamera?: boolean;
+}
+
+// Lets the user pick whether the model runs on an uploaded still or on
+// a fresh JPEG grabbed from a camera's snapshot endpoint. The camera
+// selector serves a different role per mode: in "live" it's the
+// snapshot source AND the dispatch context; in "file" it's just the
+// dispatch context (telling AlertEngine "pretend this image came from
+// cam N").
+function SourcePicker({
+  source, onSourceChange, fileRef, cameraId, onCameraChange, cameras, requireCamera,
+}: SourcePickerProps) {
+  const [livePreviewTs, setLivePreviewTs] = useState(0);
+  const [fileName, setFileName] = useState<string | null>(null);
+  const [fileObjectUrl, setFileObjectUrl] = useState<string | null>(null);
+
+  useEffect(() => () => { if (fileObjectUrl) URL.revokeObjectURL(fileObjectUrl); }, [fileObjectUrl]);
+
+  // Auto-refresh the live thumbnail when the user switches into live mode
+  // or changes camera, so they see what they're about to run on.
+  useEffect(() => {
+    if (source === "live") setLivePreviewTs(Date.now());
+  }, [source, cameraId]);
+
+  const handleFilePicked = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const f = e.target.files?.[0];
+    if (!f) { setFileName(null); setFileObjectUrl(null); return; }
+    setFileName(f.name);
+    if (fileObjectUrl) URL.revokeObjectURL(fileObjectUrl);
+    setFileObjectUrl(URL.createObjectURL(f));
+  };
+
+  const camHelp = source === "live"
+    ? "live source — snapshot pulled from this camera, and dispatch context."
+    : "dispatch context — AlertEngine treats the upload as if it came from this camera.";
+
+  return (
+    <div className="lab-source">
+      <div className="lab-source-tabs" role="tablist">
+        <button
+          role="tab"
+          aria-selected={source === "file"}
+          className={`lab-tab${source === "file" ? " active" : ""}`}
+          onClick={() => onSourceChange("file")}
+        >
+          📁 Upload image
+        </button>
+        <button
+          role="tab"
+          aria-selected={source === "live"}
+          className={`lab-tab${source === "live" ? " active" : ""}`}
+          onClick={() => onSourceChange("live")}
+          disabled={cameras.length === 0}
+          title={cameras.length === 0 ? "No cameras configured" : "Grab a fresh snapshot from a camera"}
+        >
+          📷 Live snapshot
+        </button>
+      </div>
+
+      <div className="lab-source-grid">
+        <div className="lab-source-input">
+          {source === "file" ? (
+            <label className="field">
+              <span>Image file</span>
+              <input
+                ref={fileRef}
+                type="file"
+                accept="image/*"
+                onChange={handleFilePicked}
+              />
+              {fileObjectUrl && (
+                <img className="lab-thumb" src={fileObjectUrl} alt={fileName ?? "preview"} />
+              )}
+            </label>
+          ) : (
+            <div className="field">
+              <span>Live snapshot</span>
+              {cameraId != null ? (
+                <div className="lab-live">
+                  <img
+                    className="lab-thumb"
+                    src={`${snapshotUrl(cameraId)}&_=${livePreviewTs}`}
+                    alt={`cam${cameraId} preview`}
+                  />
+                  <button
+                    className="lab-refresh"
+                    onClick={() => setLivePreviewTs(Date.now())}
+                    title="Refresh preview — the Run button always pulls a fresh frame"
+                  >
+                    ↻ Refresh preview
+                  </button>
+                </div>
+              ) : (
+                <p className="muted small">Pick a camera to preview.</p>
+              )}
+            </div>
+          )}
+        </div>
+
+        <label className="field">
+          <span>
+            Camera {source === "live" ? "(live source)" : "(dispatch context)"}
+          </span>
+          <select
+            value={cameraId ?? ""}
+            onChange={(e) => {
+              const v = e.target.value;
+              onCameraChange(v === "" ? null : parseInt(v, 10));
+            }}
+          >
+            {!requireCamera && source === "file" && (
+              <option value="">— none —</option>
+            )}
+            {cameras.map((c) => (
+              <option key={c.camera_id} value={c.camera_id}>
+                cam{c.camera_id} · {c.endpoint}
+              </option>
+            ))}
+            {cameras.length === 0 && <option value="">(no cameras)</option>}
+          </select>
+          <span className="muted small">{camHelp}</span>
+        </label>
+      </div>
+    </div>
+  );
+}
+
+// Pull a fresh JPEG from the snapshot endpoint and wrap it as a File so
+// the existing multipart-upload APIs work unchanged.
+async function fetchSnapshotAsFile(cameraId: number): Promise<File> {
+  const url = snapshotUrl(cameraId);
+  const res = await fetch(url, { credentials: "same-origin" });
+  if (!res.ok) {
+    throw new Error(`snapshot ${cameraId} → ${res.status} ${res.statusText}`);
+  }
+  const blob = await res.blob();
+  return new File(
+    [blob],
+    `cam${cameraId}-${Date.now()}.jpg`,
+    { type: blob.type || "image/jpeg" },
+  );
 }
 
 // ─── face / plate / behavior labs ─────────────────────────────────
@@ -83,6 +237,7 @@ function FileLab({
 }) {
   const fileRef = useRef<HTMLInputElement | null>(null);
   const [cameraId, setCameraId] = useState<number | null>(null);
+  const [source, setSource] = useState<SourceKind>("file");
   const [result, setResult] = useState<unknown>(null);
   const [busy, setBusy] = useState(false);
 
@@ -91,9 +246,30 @@ function FileLab({
   }, [cameras, cameraId]);
 
   const onRun = async () => {
-    const file = fileRef.current?.files?.[0];
-    if (!file) { setResult({ error: "Pick an image first." }); return; }
-    if (requireCamera && cameraId == null) { setResult({ error: "Pick a camera first." }); return; }
+    let file: File | null = null;
+    if (source === "file") {
+      file = fileRef.current?.files?.[0] ?? null;
+      if (!file) { setResult({ error: "Pick an image file first." }); return; }
+    } else {
+      if (cameraId == null) {
+        setResult({ error: "Pick a camera to snapshot from." });
+        return;
+      }
+      setBusy(true);
+      setResult({ status: `grabbing snapshot from cam${cameraId}…` });
+      try {
+        file = await fetchSnapshotAsFile(cameraId);
+      } catch (e) {
+        setResult({ error: String(e) });
+        setBusy(false);
+        return;
+      }
+    }
+    if (requireCamera && cameraId == null) {
+      setResult({ error: "Pick a camera first." });
+      setBusy(false);
+      return;
+    }
     setBusy(true);
     setResult({ status: "running…" });
     try {
@@ -108,26 +284,19 @@ function FileLab({
   return (
     <Section title={`${title}${dispatch ? "  ·  routes through AlertEngine" : ""}`}>
       <p className="muted">{helpText}</p>
-      <div className="form-row">
-        <label className="field">
-          <span>Image</span>
-          <input ref={fileRef} type="file" accept="image/*" />
-        </label>
-        <label className="field">
-          <span>Camera ID</span>
-          <select
-            value={cameraId ?? ""}
-            onChange={(e) => setCameraId(parseInt(e.target.value, 10))}
-          >
-            {!requireCamera && <option value="0">— none (no dispatch context) —</option>}
-            {cameras.map((c) => (
-              <option key={c.camera_id} value={c.camera_id}>cam{c.camera_id} · {c.endpoint}</option>
-            ))}
-          </select>
-        </label>
-      </div>
+      <SourcePicker
+        source={source}
+        onSourceChange={setSource}
+        fileRef={fileRef}
+        cameraId={cameraId}
+        onCameraChange={setCameraId}
+        cameras={cameras}
+        requireCamera={requireCamera}
+      />
       <button className="primary" disabled={busy} onClick={onRun}>
-        {busy ? "Running…" : `Run ${title.toLowerCase()}`}
+        {busy ? "Running…" : source === "live"
+          ? `Snapshot + run ${title.toLowerCase()}`
+          : `Run ${title.toLowerCase()}`}
       </button>
       {result !== null && <JsonView value={result} />}
     </Section>
@@ -138,7 +307,7 @@ function FaceLab(props: { cameras: Camera[]; dispatch: boolean; onRunDone: () =>
   return (
     <FileLab
       title="Face recognize"
-      helpText="Runs Jetson InsightFace against the uploaded still. Result includes person_id, similarity, embedding stats."
+      helpText="InsightFace against the chosen image. Returns person_id, similarity, and embedding stats."
       cameras={props.cameras}
       dispatch={props.dispatch}
       run={async (file, camId) => {
@@ -153,7 +322,7 @@ function PlateLab(props: { cameras: Camera[]; dispatch: boolean; onRunDone: () =
   return (
     <FileLab
       title="Plate read"
-      helpText="Runs Jetson EasyOCR against the uploaded still."
+      helpText="EasyOCR against the chosen image. Returns plate text + per-character confidence."
       cameras={props.cameras}
       dispatch={props.dispatch}
       run={async (file, camId) => {
@@ -168,7 +337,7 @@ function BehaviorLab(props: { cameras: Camera[]; dispatch: boolean; onRunDone: (
   return (
     <FileLab
       title="Behavior analyse"
-      helpText="Runs YOLO + tracker on the still, evaluates against this camera's zones."
+      helpText="YOLO + tracker on the chosen image, evaluated against the selected camera's zones."
       cameras={props.cameras}
       dispatch={props.dispatch}
       requireCamera
@@ -268,10 +437,13 @@ function EnrolledList({ data }: { data: EnrolledFacesResponse | null }) {
 
 // ─── openai validator ─────────────────────────────────────────────
 
-function OpenAIPanel({ data, onRun }: { data: OpenAIStatus | null; onRun: () => void }) {
+function OpenAIPanel({
+  cameras, data, onRun,
+}: { cameras: Camera[]; data: OpenAIStatus | null; onRun: () => void }) {
   const fileRef = useRef<HTMLInputElement | null>(null);
   const [scenario, setScenario] = useState("");
-  const [cameraId, setCameraId] = useState("");
+  const [cameraId, setCameraId] = useState<number | null>(null);
+  const [source, setSource] = useState<SourceKind>("file");
   const [zone, setZone] = useState("");
   const [conf, setConf] = useState("");
   const [result, setResult] = useState<unknown>(null);
@@ -281,15 +453,38 @@ function OpenAIPanel({ data, onRun }: { data: OpenAIStatus | null; onRun: () => 
     if (!scenario && data?.scenarios?.length) setScenario(data.scenarios[0]);
   }, [data, scenario]);
 
+  useEffect(() => {
+    if (cameraId == null && cameras.length) setCameraId(cameras[0].camera_id);
+  }, [cameras, cameraId]);
+
   const submit = async () => {
-    const file = fileRef.current?.files?.[0];
     if (!scenario) { setResult({ error: "Pick a scenario." }); return; }
-    if (!file) { setResult({ error: "Pick an image first." }); return; }
+    let file: File | null = null;
+    if (source === "file") {
+      file = fileRef.current?.files?.[0] ?? null;
+      if (!file) { setResult({ error: "Pick an image file first." }); return; }
+    } else {
+      if (cameraId == null) {
+        setResult({ error: "Pick a camera to snapshot from." });
+        return;
+      }
+      setBusy(true);
+      setResult({ status: `grabbing snapshot from cam${cameraId}…` });
+      try {
+        file = await fetchSnapshotAsFile(cameraId);
+      } catch (e) {
+        setResult({ error: String(e) });
+        setBusy(false);
+        return;
+      }
+    }
     setBusy(true);
     setResult({ status: "running… (vision calls take 2–6s)" });
     try {
       const r = await runOpenAIScenario(scenario, file, {
-        camera_id: cameraId, zone_name: zone, confidence: conf,
+        camera_id: cameraId != null ? String(cameraId) : "",
+        zone_name: zone,
+        confidence: conf,
       });
       setResult(r);
       onRun();
@@ -318,13 +513,23 @@ function OpenAIPanel({ data, onRun }: { data: OpenAIStatus | null; onRun: () => 
                 {(data.scenarios ?? []).map((s) => <option key={s} value={s}>{s}</option>)}
               </select>
             </label>
-            <label className="field"><span>Image</span><input ref={fileRef} type="file" accept="image/*" /></label>
-            <label className="field"><span>Camera ID</span><input type="text" value={cameraId} onChange={(e) => setCameraId(e.target.value)} /></label>
-            <label className="field"><span>Zone name</span><input type="text" value={zone} onChange={(e) => setZone(e.target.value)} /></label>
-            <label className="field"><span>Local confidence</span><input type="text" value={conf} onChange={(e) => setConf(e.target.value)} /></label>
+            <label className="field"><span>Zone name</span>
+              <input type="text" value={zone} onChange={(e) => setZone(e.target.value)} />
+            </label>
+            <label className="field"><span>Local confidence</span>
+              <input type="text" value={conf} onChange={(e) => setConf(e.target.value)} />
+            </label>
           </div>
+          <SourcePicker
+            source={source}
+            onSourceChange={setSource}
+            fileRef={fileRef}
+            cameraId={cameraId}
+            onCameraChange={setCameraId}
+            cameras={cameras}
+          />
           <button className="primary" disabled={busy} onClick={submit}>
-            {busy ? "Running…" : "Run scenario"}
+            {busy ? "Running…" : source === "live" ? "Snapshot + run scenario" : "Run scenario"}
           </button>
           {result !== null && <JsonView value={result} />}
         </>
