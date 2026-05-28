@@ -198,6 +198,7 @@ def _build_deps():
         alert_engine=alert_engine,
         dahua_manager=dahua_manager,
         face_engine=ml_state.face_engine,
+        recorders=recorders,
         capture_dir=verdict_capture_dir,
     )
 
@@ -394,7 +395,8 @@ def _frame_bus_publisher(frame_bus, camera_id):
     return publish
 
 
-def _build_threat_evaluator(*, alert_engine, dahua_manager, face_engine, capture_dir=None):
+def _build_threat_evaluator(*, alert_engine, dahua_manager, face_engine,
+                            recorders=None, capture_dir=None):
     """Return a started ThreatEvaluator, or None when prerequisites are
     missing. Settings-disabled or no face engine ⇒ None ⇒ event_worker
     and sensor_dispatcher fall back to their legacy direct paths."""
@@ -417,6 +419,11 @@ def _build_threat_evaluator(*, alert_engine, dahua_manager, face_engine, capture
         face_engine=face_engine,
         window_seconds=settings.threat_evaluator.window_seconds,
         sample_interval_s=settings.threat_evaluator.sample_interval_s,
+        holdoff_clear_seconds=settings.threat_evaluator.holdoff_clear_seconds,
+        escalate_after_seconds=settings.threat_evaluator.escalate_after_seconds,
+        clip_pre_seconds=settings.threat_evaluator.clip_pre_seconds,
+        clip_post_seconds=settings.threat_evaluator.clip_post_seconds,
+        recorders=recorders,
         capture_dir=capture_dir,
     )
 

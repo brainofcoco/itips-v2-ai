@@ -104,7 +104,7 @@ export async function fetchRecentVerdicts(limit = 100): Promise<import("./types"
 export async function clearVerdicts(): Promise<{ ok: boolean; capture_dirs_removed?: number; error?: string }> {
   return del("/api/verdicts");
 }
-export async function fetchVerdictCaptures(captureId: string): Promise<{ ok: boolean; images: string[] }> {
+export async function fetchVerdictCaptures(captureId: string): Promise<{ ok: boolean; images: string[]; videos?: string[] }> {
   return getJson(`/api/verdicts/captures/${encodeURIComponent(captureId)}`);
 }
 export function verdictCaptureUrl(captureId: string, filename: string): string {

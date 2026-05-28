@@ -157,15 +157,16 @@ export default function Investigations() {
 
 function VerdictDetail({ verdict, onClose }: { verdict: VerdictEvent; onClose: () => void }) {
   const [images, setImages] = useState<string[]>([]);
+  const [videos, setVideos] = useState<string[]>([]);
   const [imgLoading, setImgLoading] = useState(true);
 
   useEffect(() => {
     let cancelled = false;
     setImgLoading(true);
-    if (!verdict.capture_id) { setImages([]); setImgLoading(false); return; }
+    if (!verdict.capture_id) { setImages([]); setVideos([]); setImgLoading(false); return; }
     fetchVerdictCaptures(verdict.capture_id)
-      .then((b) => { if (!cancelled) setImages(b.images ?? []); })
-      .catch(() => { if (!cancelled) setImages([]); })
+      .then((b) => { if (!cancelled) { setImages(b.images ?? []); setVideos(b.videos ?? []); } })
+      .catch(() => { if (!cancelled) { setImages([]); setVideos([]); } })
       .finally(() => { if (!cancelled) setImgLoading(false); });
     return () => { cancelled = true; };
   }, [verdict.capture_id]);
@@ -203,9 +204,36 @@ function VerdictDetail({ verdict, onClose }: { verdict: VerdictEvent; onClose: (
           </tbody>
         </table>
 
+        {verdict.capture_id && videos.length > 0 && (
+          <>
+            <h3>Evidence clip</h3>
+            {videos.map((name) => (
+              <div key={name} style={{ marginBottom: "0.75rem" }}>
+                <video
+                  src={verdictCaptureUrl(verdict.capture_id!, name)}
+                  controls
+                  preload="metadata"
+                  style={{ maxWidth: "100%", borderRadius: "6px" }}
+                />
+                <div>
+                  <a
+                    href={verdictCaptureUrl(verdict.capture_id!, name)}
+                    download
+                    target="_blank"
+                    rel="noopener"
+                    className="muted small"
+                  >
+                    Download / share clip ↓
+                  </a>
+                </div>
+              </div>
+            ))}
+          </>
+        )}
+
         <h3>Captured snapshots {images.length ? `(${images.length})` : ""}</h3>
         {imgLoading ? (
-          <p className="muted">Loading images…</p>
+          <p className="muted">Loading…</p>
         ) : !verdict.capture_id || images.length === 0 ? (
           <p className="muted">No snapshots were captured for this evaluation.</p>
         ) : (

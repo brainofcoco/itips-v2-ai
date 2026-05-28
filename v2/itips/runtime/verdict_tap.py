@@ -243,11 +243,12 @@ def _classify(
         n = payload.get("samples")
         return "uncertain", (
             f"Not escalated — no usable face in {n} sample(s); "
-            "couldn't confirm intruder vs worker"
+            "couldn't confirm intruder vs worker. Evidence clip recorded."
         )
     if verdict == "intruder":
+        early = " on dwell" if payload.get("escalated_early") else ""
         if escalated:
-            return "escalated", "Escalated — confirmed intruder, alarm fired"
+            return "escalated", f"Escalated — confirmed intruder{early}, alarm fired"
         return "suppressed_disarmed", (
             "Not escalated — intruder detected but the system was disarmed"
         )

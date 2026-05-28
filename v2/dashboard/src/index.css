@@ -854,6 +854,8 @@ button.danger-ghost:hover:not(:disabled) {
 .cam-activity-badge.act-warn .act-status { border-left-color: rgba(0,0,0,0.3); }
 .cam-activity-badge.act-info { background: rgba(93,180,255,0.92); color: #06121f; }
 .cam-activity-badge.act-info .act-status { border-left-color: rgba(0,0,0,0.3); }
+.cam-activity-badge.act-ok { background: rgba(63,185,109,0.92); color: #05140b; }
+.cam-activity-badge.act-ok .act-status { border-left-color: rgba(0,0,0,0.3); }
 
 /* ── help callout (used in Add binding) ── */
 .help-callout {

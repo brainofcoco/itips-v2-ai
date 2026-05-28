@@ -27,7 +27,9 @@ def _result(*, matched: bool, embedding_present: bool,
 
 
 def _make_evaluator(*, face_engine, window=0.6, sample=0.05,
-                    is_armed_fn=None):
+                    is_armed_fn=None, holdoff_clear=0.3,
+                    escalate_after=0.0, recorders=None, capture_dir=None,
+                    clip_pre=15.0, clip_post=15.0):
     alert = MagicMock()
     dahua = MagicMock()
     client = MagicMock()
@@ -40,6 +42,12 @@ def _make_evaluator(*, face_engine, window=0.6, sample=0.05,
         is_armed_fn=is_armed_fn,
         window_seconds=window,
         sample_interval_s=sample,
+        holdoff_clear_seconds=holdoff_clear,
+        escalate_after_seconds=escalate_after,
+        recorders=recorders,
+        capture_dir=capture_dir,
+        clip_pre_seconds=clip_pre,
+        clip_post_seconds=clip_post,
     )
     return ev, alert
 
@@ -101,21 +109,27 @@ def test_uncertain_when_no_face_ever_seen_back_to_camera():
         matched=False, embedding_present=False, similarity=0.0,
     )
     ev, alert = _make_evaluator(face_engine=face_engine, window=0.4)
+    received: list[dict] = []
+    ev.add_verdict_listener(received.append)
     ev.start()
     try:
         ev.trigger(camera_id=3, trigger_kind="camera:line_cross",
                    initial_frame=_frame())
         assert _wait_until(
-            lambda: alert.handle_behaviour_alert_simple.called,
+            lambda: any(p["verdict"] == "uncertain" for p in received),
             timeout=3.0,
         )
     finally:
         ev.stop()
-    # Crucial: no INTRUDER alarm fired for a worker with their back turned.
+    # UNCERTAIN is recorded as a verdict only (→ Investigations); it must
+    # NOT open an incident or fire any alarm — crucially, no INTRUDER for a
+    # worker with their back turned.
     alert.handle_face_intruder.assert_not_called()
     alert.handle_personnel_seen.assert_not_called()
-    kw = alert.handle_behaviour_alert_simple.call_args.kwargs
-    assert kw["alert_type"] == "threat_uncertain"
+    alert.handle_behaviour_alert_simple.assert_not_called()
+    verdict = next(p for p in received if p["verdict"] == "uncertain")
+    assert verdict["camera_id"] == 3
+    assert verdict["alarm_fired"] is False
 
 
 def test_intruder_suppressed_when_system_disarmed():
@@ -127,19 +141,25 @@ def test_intruder_suppressed_when_system_disarmed():
         face_engine=face_engine, window=0.4,
         is_armed_fn=lambda: False,  # hub disarmed
     )
+    received: list[dict] = []
+    ev.add_verdict_listener(received.append)
     ev.start()
     try:
         ev.trigger(camera_id=4, trigger_kind="camera:line_cross",
                    initial_frame=_frame())
         assert _wait_until(
-            lambda: alert.handle_behaviour_alert_simple.called,
+            lambda: any(p["verdict"] == "intruder" for p in received),
             timeout=3.0,
         )
     finally:
         ev.stop()
+    # Disarmed → the intruder observation is recorded as a verdict only;
+    # no incident is opened and no alarm fires.
     alert.handle_face_intruder.assert_not_called()
-    kw = alert.handle_behaviour_alert_simple.call_args.kwargs
-    assert kw["alert_type"] == "threat_observation_disarmed"
+    alert.handle_behaviour_alert_simple.assert_not_called()
+    verdict = next(p for p in received if p["verdict"] == "intruder")
+    assert verdict["armed"] is False
+    assert verdict["alarm_fired"] is False
 
 
 def test_verdict_listener_receives_all_three_paths():
@@ -230,12 +250,108 @@ def test_verdict_listener_receives_all_three_paths():
     assert uncertain["alarm_fired"] is False
 
 
+def _authorized_engine():
+    face_engine = MagicMock()
+    face_engine.recognize.return_value = _result(
+        matched=True, embedding_present=True, similarity=0.9,
+        person_id="p-1", full_name="Sam",
+    )
+    return face_engine
+
+
+def test_authorized_verdict_enters_holdoff():
+    ev, _ = _make_evaluator(face_engine=_authorized_engine())
+    ev.start()
+    try:
+        ev.trigger(camera_id=21, trigger_kind="camera:face_event",
+                   initial_frame=_frame())
+        assert _wait_until(lambda: 21 in ev._holdoff)
+    finally:
+        ev.stop()
+
+
+def test_holdoff_drops_further_triggers():
+    """While held off, new triggers open no window and re-fire no verdict."""
+    face_engine = _authorized_engine()
+    # Long clear window so the hold-off stays up for the whole test.
+    ev, alert = _make_evaluator(face_engine=face_engine, holdoff_clear=30.0)
+    ev.start()
+    try:
+        ev.trigger(camera_id=22, trigger_kind="camera:face_event",
+                   initial_frame=_frame())
+        assert _wait_until(lambda: 22 in ev._holdoff)
+        seen = alert.handle_personnel_seen.call_count
+        for _ in range(3):
+            ev.trigger(camera_id=22, trigger_kind="camera:face_event",
+                       initial_frame=_frame())
+        # Give the loop time to (not) act on the dropped triggers.
+        assert not _wait_until(
+            lambda: alert.handle_personnel_seen.call_count > seen,
+            timeout=0.5,
+        )
+        assert all(w["camera_id"] != 22 for w in ev.active_windows())
+    finally:
+        ev.stop()
+
+
+def test_holdoff_lifts_after_frame_clears_then_resumes():
+    face_engine = _authorized_engine()
+    match = face_engine.recognize.return_value
+    ev, alert = _make_evaluator(face_engine=face_engine, holdoff_clear=0.2)
+    ev.start()
+    try:
+        ev.trigger(camera_id=23, trigger_kind="camera:face_event",
+                   initial_frame=_frame())
+        assert _wait_until(lambda: 23 in ev._holdoff)
+        # Worker leaves the frame: no face from now on → hold-off lifts.
+        face_engine.recognize.return_value = _result(
+            matched=False, embedding_present=False, similarity=0.0)
+        assert _wait_until(lambda: 23 not in ev._holdoff, timeout=3.0)
+        # Worker returns and faces the camera → fresh window re-authorizes.
+        face_engine.recognize.return_value = match
+        before = alert.handle_personnel_seen.call_count
+        ev.trigger(camera_id=23, trigger_kind="camera:face_event",
+                   initial_frame=_frame())
+        assert _wait_until(
+            lambda: alert.handle_personnel_seen.call_count > before,
+            timeout=3.0)
+    finally:
+        ev.stop()
+
+
+def test_holdoff_face_event_resets_clear_countdown():
+    """A face event arriving mid-countdown means the worker is still there,
+    so the clear timer resets and the hold-off stays up."""
+    face_engine = _authorized_engine()
+    # Generous clear window so the countdown can't lift before we assert.
+    ev, _ = _make_evaluator(face_engine=face_engine, holdoff_clear=2.0)
+    ev.start()
+    try:
+        ev.trigger(camera_id=24, trigger_kind="camera:face_event",
+                   initial_frame=_frame())
+        assert _wait_until(lambda: 24 in ev._holdoff)
+        # Frame goes clear, countdown starts.
+        face_engine.recognize.return_value = _result(
+            matched=False, embedding_present=False, similarity=0.0)
+        assert _wait_until(lambda: ev._holdoff.get(24) is not None
+                           and ev._holdoff[24].clear_since is not None)
+        # A camera face event resets the countdown back to None.
+        ev.trigger(camera_id=24, trigger_kind="camera:face_event",
+                   initial_frame=_frame())
+        assert ev._holdoff.get(24) is not None
+        assert ev._holdoff[24].clear_since is None
+    finally:
+        ev.stop()
+
+
 def test_multiple_triggers_collapse_into_one_window():
     face_engine = MagicMock()
     face_engine.recognize.return_value = _result(
         matched=False, embedding_present=False, similarity=0.0,
     )
-    ev, alert = _make_evaluator(face_engine=face_engine, window=0.5)
+    ev, _ = _make_evaluator(face_engine=face_engine, window=0.5)
+    received: list[dict] = []
+    ev.add_verdict_listener(received.append)
     ev.start()
     try:
         ev.trigger(camera_id=5, trigger_kind="camera:line_cross",
@@ -245,12 +361,119 @@ def test_multiple_triggers_collapse_into_one_window():
         ev.trigger(camera_id=5, trigger_kind="sensor:zone-1",
                    initial_frame=_frame())
         assert _wait_until(
-            lambda: alert.handle_behaviour_alert_simple.called,
+            lambda: any(p["camera_id"] == 5 for p in received),
             timeout=3.0,
         )
     finally:
         ev.stop()
-    # Three triggers, one verdict.
-    assert alert.handle_behaviour_alert_simple.call_count == 1
-    triggers = alert.handle_behaviour_alert_simple.call_args.kwargs["details"]["triggers"]
-    assert len(triggers) == 3
+    # Three triggers, one collapsed verdict carrying all three.
+    verdicts = [p for p in received if p["camera_id"] == 5]
+    assert len(verdicts) == 1
+    assert len(verdicts[0]["triggers"]) == 3
+
+
+# ─── dwell-based early escalation ─────────────────────────────────────
+
+
+def test_dwell_escalates_to_intruder_early():
+    """A confirmed stranger (face seen, never matched) who keeps dwelling is
+    escalated before the full window expires."""
+    face_engine = MagicMock()
+    face_engine.recognize.return_value = _result(
+        matched=False, embedding_present=True, similarity=0.2,
+    )
+    # Long window so it's the escalation, not expiry, that fires.
+    ev, alert = _make_evaluator(face_engine=face_engine, window=10.0,
+                                sample=0.05, escalate_after=0.3)
+    ev.start()
+    try:
+        ev.trigger(camera_id=30, trigger_kind="behavior:region_intrusion",
+                   initial_frame=_frame())
+        assert _wait_until(lambda: alert.handle_face_intruder.called, timeout=3.0)
+    finally:
+        ev.stop()
+    kw = alert.handle_face_intruder.call_args.kwargs
+    assert kw["details"]["escalated_early"] is True
+
+
+def test_dwell_escalates_without_a_face():
+    """Person-presence: someone who keeps dwelling in the zone is escalated
+    even when no usable face is ever captured (back to camera)."""
+    face_engine = MagicMock()
+    face_engine.recognize.return_value = _result(
+        matched=False, embedding_present=False, similarity=0.0,
+    )
+    ev, alert = _make_evaluator(face_engine=face_engine, window=10.0,
+                                sample=0.05, escalate_after=0.3)
+    ev.start()
+    try:
+        # Re-trigger continuously to simulate a person lingering in the zone
+        # (this is what the BehaviorWatcher does at ~2 fps while YOLO sees
+        # someone), with no face ever recognised.
+        end = time.monotonic() + 2.0
+        while time.monotonic() < end and not alert.handle_face_intruder.called:
+            ev.trigger(camera_id=31, trigger_kind="behavior:region_intrusion",
+                       initial_frame=_frame())
+            time.sleep(0.05)
+        assert alert.handle_face_intruder.called
+    finally:
+        ev.stop()
+    assert alert.handle_face_intruder.call_args.kwargs["details"]["escalated_early"] is True
+
+
+# ─── UNCERTAIN evidence clip ──────────────────────────────────────────
+
+
+class _FakeRecorder:
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    def export_clip(self, out_path, *, center_ts, pre_seconds, post_seconds):
+        self.calls.append({
+            "out_path": out_path, "center_ts": center_ts,
+            "pre": pre_seconds, "post": post_seconds,
+        })
+        from pathlib import Path
+        Path(out_path).write_bytes(b"\x00\x00\x00\x18ftypmp42")  # stub mp4
+
+
+def test_uncertain_exports_pre_post_clip(tmp_path):
+    face_engine = MagicMock()
+    face_engine.recognize.return_value = _result(
+        matched=False, embedding_present=False, similarity=0.0,
+    )
+    rec = _FakeRecorder()
+    ev, _ = _make_evaluator(
+        face_engine=face_engine, window=0.4, sample=0.05,
+        recorders={32: rec}, capture_dir=tmp_path, clip_pre=15, clip_post=15,
+    )
+    received: list[dict] = []
+    ev.add_verdict_listener(received.append)
+    ev.start()
+    try:
+        ev.trigger(camera_id=32, trigger_kind="behavior:region_intrusion",
+                   initial_frame=_frame())
+        assert _wait_until(
+            lambda: any(p["verdict"] == "uncertain" for p in received), timeout=3.0)
+    finally:
+        ev.stop()
+    assert len(rec.calls) == 1
+    assert rec.calls[0]["pre"] == 15 and rec.calls[0]["post"] == 15
+    verdict = next(p for p in received if p["verdict"] == "uncertain")
+    assert verdict["clip"] == "clip.mp4"
+    assert (tmp_path / verdict["capture_id"] / "clip.mp4").exists()
+
+
+# ─── hold-off person accessor (Live "authorized" badge) ───────────────
+
+
+def test_holdoff_person_reports_authorized_worker():
+    ev, _ = _make_evaluator(face_engine=_authorized_engine())
+    ev.start()
+    try:
+        ev.trigger(camera_id=33, trigger_kind="camera:face_event",
+                   initial_frame=_frame())
+        assert _wait_until(lambda: ev.holdoff_person(33) == "Sam")
+        assert ev.holdoff_person(999) is None
+    finally:
+        ev.stop()

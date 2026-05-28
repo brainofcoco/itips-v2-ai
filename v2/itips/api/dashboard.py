@@ -307,12 +307,16 @@ def register_dashboard(
 
     @app.get("/api/verdicts/captures/<capture_id>")
     def list_verdict_captures(capture_id: str):  # noqa: ANN202
-        """List the JPEG filenames captured for a verdict."""
+        """List the JPEG stills and any MP4 evidence clip for a verdict."""
         d = _verdict_capture_dir(capture_id)
         if d is None:
-            return jsonify({"ok": True, "images": []})
+            return jsonify({"ok": True, "images": [], "videos": []})
         images = sorted(f.name for f in d.iterdir() if f.suffix == ".jpg")
-        return jsonify({"ok": True, "capture_id": capture_id, "images": images})
+        videos = sorted(f.name for f in d.iterdir() if f.suffix == ".mp4")
+        return jsonify({
+            "ok": True, "capture_id": capture_id,
+            "images": images, "videos": videos,
+        })
 
     @app.get("/api/verdicts/captures/<capture_id>/<filename>")
     def get_verdict_capture(capture_id: str, filename: str):  # noqa: ANN202
@@ -322,7 +326,8 @@ def register_dashboard(
         candidate = (d / filename).resolve()
         if not candidate.is_file() or d not in candidate.parents:
             abort(404)
-        return send_file(candidate, mimetype="image/jpeg")
+        mimetype = "video/mp4" if candidate.suffix == ".mp4" else "image/jpeg"
+        return send_file(candidate, mimetype=mimetype)
 
     # ─── workers (ML face DB) ──────────────────────────────────────
     # Enrolment and recognition run entirely on the local face engine

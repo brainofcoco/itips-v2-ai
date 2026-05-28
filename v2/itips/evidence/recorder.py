@@ -158,6 +158,63 @@ class IncidentRecorder:
         with self._lock:
             return self._active is not None
 
+    def export_clip(
+        self,
+        out_path: Path,
+        *,
+        center_ts: float,
+        pre_seconds: float,
+        post_seconds: float,
+    ) -> None:
+        """Cut a standalone MP4 spanning `[center_ts - pre, center_ts + post]`
+        from the ring buffer and write it to `out_path`.
+
+        `center_ts` is a `time.monotonic()` value — the same clock the buffer
+        timestamps frames with — typically the moment a subject entered. Runs
+        on a daemon thread (encoding is best-effort and must not block the
+        caller), and is independent of the incident pre/post recording, so it
+        can be used for verdicts that never open an incident (UNCERTAIN)."""
+        snapshot = self._buffer.snapshot()
+        threading.Thread(
+            target=self._export_clip_async,
+            args=(Path(out_path), snapshot, center_ts, pre_seconds, post_seconds),
+            name=f"recorder-clip-cam{self.camera_id}",
+            daemon=True,
+        ).start()
+
+    def _export_clip_async(
+        self,
+        out_path: Path,
+        snapshot: list[tuple[float, np.ndarray]],
+        center_ts: float,
+        pre_seconds: float,
+        post_seconds: float,
+    ) -> None:
+        lo, hi = center_ts - float(pre_seconds), center_ts + float(post_seconds)
+        frames = [(t, f) for t, f in snapshot if lo <= t <= hi]
+        if not frames:
+            logger.info("cam%d: no buffered frames for clip around %.1f",
+                        self.camera_id, center_ts)
+            return
+        fps, size = self._derive_fps_and_size(frames)
+        # H.264 (not the PRD-default H.265): this clip is played back in a
+        # browser <video> on the Investigations page, and Chrome/Firefox
+        # can't decode HEVC/MP4 — it'd show as a 0:00 unplayable clip.
+        writer = self._open_writer(out_path, fps, size, encoder="libx264")
+        if writer is None:
+            return
+        written = 0
+        try:
+            for _, frame in frames:
+                if frame.shape[1] == size[0] and frame.shape[0] == size[1]:
+                    writer.write(frame)
+                    written += 1
+            writer.release()
+            logger.info("cam%d: verdict clip written → %s (%d frames, %.1ffps)",
+                        self.camera_id, out_path.name, written, fps)
+        except Exception:
+            logger.exception("cam%d: verdict clip encode failed", self.camera_id)
+
     # ─── internals ────────────────────────────────────────────────
 
     def _derive_fps_and_size(self, snapshot: list[tuple[float, np.ndarray]]):
@@ -175,9 +232,10 @@ class IncidentRecorder:
         fps = max(_MIN_FPS, min(_MAX_FPS, fps))
         return float(fps), (w, h)
 
-    def _open_writer(self, path: Path, fps: float, size: tuple[int, int]):
+    def _open_writer(self, path: Path, fps: float, size: tuple[int, int],
+                     *, encoder: Optional[str] = None):
         # H.265 via ffmpeg when available, cv2/mp4v fallback otherwise.
-        writer = open_writer(path, fps=fps, size=size)
+        writer = open_writer(path, fps=fps, size=size, encoder=encoder)
         if not writer.isOpened():
             logger.error("cam%d: could not open writer at %s", self.camera_id, path)
             return None

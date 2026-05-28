@@ -227,17 +227,38 @@ class BehaviorWatcher(threading.Thread):
         self._last_published[key] = now
         detail = dict(getattr(alert, "details", {}) or {})
         detail.setdefault("class_name", getattr(alert, "class_name", ""))
+        # If this camera is held off after an authorized worker, the activity
+        # is that same worker still moving around — surface it as "authorized"
+        # so the Live tile shows a green badge, not an intrusion alarm.
+        person = self._holdoff_person(camera_id)
+        if person is not None:
+            detail["person_name"] = person
+            status = "authorized"
+        else:
+            status = "evaluating"
         self._activity.publish(
             camera_id=camera_id,
             kind=alert.alert_type,
             zone_id=getattr(alert, "zone_id", None),
             zone_name=getattr(alert, "zone_name", ""),
             detail=detail,
-            status="evaluating",
+            status=status,
             source="behavior",
         )
         logger.info(
-            "BehaviorWatcher: cam%d %s in zone '%s' — activity published",
+            "BehaviorWatcher: cam%d %s in zone '%s' — activity published (%s)",
             camera_id, alert.alert_type,
             getattr(alert, "zone_name", "") or getattr(alert, "zone_id", "?"),
+            status,
         )
+
+    def _holdoff_person(self, camera_id: int) -> Optional[str]:
+        """Authorized worker name if the evaluator is holding this camera
+        off, else None. Defensive — evaluator may be absent or older."""
+        ev = self._threat_evaluator
+        if ev is None or not hasattr(ev, "holdoff_person"):
+            return None
+        try:
+            return ev.holdoff_person(camera_id)
+        except Exception:
+            return None

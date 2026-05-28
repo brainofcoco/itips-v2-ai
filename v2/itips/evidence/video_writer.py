@@ -22,13 +22,17 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 
-def open_writer(path: Path, fps: float, size: tuple[int, int]):
-    """Return a writer with cv2-compatible .write() / .release() / .isOpened()."""
+def open_writer(path: Path, fps: float, size: tuple[int, int],
+                *, encoder: Optional[str] = None):
+    """Return a writer with cv2-compatible .write() / .release() / .isOpened().
+
+    `encoder` overrides the default (env `ITIPS_VIDEO_ENCODER`, else libx265).
+    Pass `libx264` for clips that must play in a browser `<video>` — HEVC/MP4
+    won't decode in Chrome/Firefox."""
+    enc = encoder or os.environ.get("ITIPS_VIDEO_ENCODER", "libx265")
     if _ffmpeg_available():
         try:
-            return _FfmpegHevcWriter(path, fps=fps, size=size,
-                                     encoder=os.environ.get("ITIPS_VIDEO_ENCODER",
-                                                            "libx265"))
+            return _FfmpegWriter(path, fps=fps, size=size, encoder=enc)
         except Exception:
             logger.exception("ffmpeg writer failed to open %s — falling back to cv2", path)
     return _Cv2Mp4vWriter(path, fps=fps, size=size)
@@ -38,8 +42,11 @@ def _ffmpeg_available() -> bool:
     return shutil.which("ffmpeg") is not None
 
 
-class _FfmpegHevcWriter:
-    """Pipes raw BGR frames into an ffmpeg subprocess transcoding to H.265."""
+class _FfmpegWriter:
+    """Pipes raw BGR frames into an ffmpeg subprocess transcoding to MP4.
+
+    Encoder is H.265 by default (PRD §4.3); pass `libx264`/`h264_nvenc` for a
+    browser-playable clip."""
 
     def __init__(self, path: Path, *, fps: float, size: tuple[int, int],
                  encoder: str) -> None:
@@ -56,11 +63,15 @@ class _FfmpegHevcWriter:
             "-i", "pipe:0",
             "-c:v", encoder,
         ]
-        # libx265 needs preset/crf; hevc_nvenc uses different knobs.
+        # Each encoder takes different rate/quality knobs.
         if encoder == "libx265":
             cmd += ["-preset", "ultrafast", "-crf", "26"]
         elif encoder == "hevc_nvenc":
             cmd += ["-preset", "p4", "-cq", "26"]
+        elif encoder == "libx264":
+            cmd += ["-preset", "veryfast", "-crf", "23"]
+        elif encoder == "h264_nvenc":
+            cmd += ["-preset", "p4", "-cq", "23"]
         cmd += [
             "-pix_fmt", "yuv420p",
             "-movflags", "+faststart",

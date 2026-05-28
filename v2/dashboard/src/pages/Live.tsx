@@ -311,7 +311,9 @@ function CameraTile({
     };
   }, [zones, activeZones, currentPreset, dormantCount]);
 
-  const hasAlert = activity.length > 0;
+  // Authorized activity (a recognised worker still in view during hold-off)
+  // is not an alarm — only non-authorized activity reddens the tile.
+  const hasAlert = activity.some((e) => e.status !== "authorized");
   return (
     <article className={`cam${isControlled ? " cam-controlled" : ""}${hasAlert ? " cam-alerting" : ""}`}>
       <header>
@@ -360,15 +362,26 @@ function CameraTile({
         )}
         {activity.length > 0 && (
           <div className="cam-activity">
-            {activity.slice(0, 3).map((e) => (
-              <span key={e.seq} className={`cam-activity-badge act-${activityTone(e.kind)}`}>
-                <span className="act-glyph">{activityGlyph(e.kind)}</span>
-                <span className="act-text">
-                  {e.label}{e.zone_name && e.kind !== "sensor" ? ` · ${e.zone_name}` : ""}
+            {activity.slice(0, 3).map((e) => {
+              const authorized = e.status === "authorized";
+              const who = (e.detail?.person_name as string) || "";
+              return (
+                <span
+                  key={e.seq}
+                  className={`cam-activity-badge act-${authorized ? "ok" : activityTone(e.kind)}`}
+                >
+                  <span className="act-glyph">{authorized ? "✓" : activityGlyph(e.kind)}</span>
+                  <span className="act-text">
+                    {authorized
+                      ? `Authorized${who ? ` · ${who}` : ""}`
+                      : `${e.label}${e.zone_name && e.kind !== "sensor" ? ` · ${e.zone_name}` : ""}`}
+                  </span>
+                  <span className="act-status">
+                    {authorized ? "in view" : e.status === "evaluating" ? "evaluating…" : e.status}
+                  </span>
                 </span>
-                <span className="act-status">{e.status === "evaluating" ? "evaluating…" : e.status}</span>
-              </span>
-            ))}
+              );
+            })}
           </div>
         )}
         {errored && (

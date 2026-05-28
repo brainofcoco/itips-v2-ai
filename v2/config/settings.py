@@ -114,6 +114,21 @@ class ThreatEvaluatorConfig:
     enabled: bool = field(default_factory=lambda: _env_bool("ITIPS_THREAT_EVALUATOR_ENABLED", True))
     window_seconds: float = field(default_factory=lambda: _env_float("ITIPS_THREAT_EVALUATOR_WINDOW_S", 15.0))
     sample_interval_s: float = field(default_factory=lambda: _env_float("ITIPS_THREAT_EVALUATOR_SAMPLE_S", 1.0))
+    # After an AUTHORIZED verdict, stop re-evaluating that camera until its
+    # frame has been clear of faces for this long — so a recognised worker
+    # standing in view isn't re-checked (and re-nagged) on every event.
+    holdoff_clear_seconds: float = field(default_factory=lambda: _env_float("ITIPS_THREAT_EVALUATOR_HOLDOFF_CLEAR_S", 15.0))
+    # If an unrecognised person keeps dwelling in the zone this long (no
+    # enrolled worker matched), escalate to INTRUDER early instead of waiting
+    # out the full window — even if their face was never captured. A matched
+    # worker closes the window AUTHORIZED first, so this only hits strangers.
+    # 0 disables early escalation.
+    escalate_after_seconds: float = field(default_factory=lambda: _env_float("ITIPS_THREAT_EVALUATOR_ESCALATE_AFTER_S", 3.0))
+    # On an UNCERTAIN verdict (someone present but no usable face), cut an
+    # evidence clip of this many seconds before/after they entered, pulled
+    # from the recorder's pre-event ring buffer, for the Investigations page.
+    clip_pre_seconds: float = field(default_factory=lambda: _env_float("ITIPS_THREAT_EVALUATOR_CLIP_PRE_S", 15.0))
+    clip_post_seconds: float = field(default_factory=lambda: _env_float("ITIPS_THREAT_EVALUATOR_CLIP_POST_S", 15.0))
 
 
 @dataclass(frozen=True)
