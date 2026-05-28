@@ -125,6 +125,17 @@ def _build_deps():
         preset_state=preset_state,
         camera_settings=camera_settings,
     )
+    # Recovery watcher — catches the cases the RTSP listeners miss:
+    # short stutters where cv2 keeps the capture alive, container
+    # restarts (preset_state is in-memory), or a reconnect goto that
+    # fired before the camera's HTTP API was ready. Restores to the
+    # base preset whenever a camera's tracker is empty.
+    from itips.camera.recovery_watcher import CameraRecoveryWatcher
+    recovery_watcher = CameraRecoveryWatcher(
+        dahua_manager=dahua_manager,
+        preset_state=preset_state,
+        camera_settings=camera_settings,
+    )
 
     # ML fallback — all optional; engines only init if ml extras installed.
     ml_state = _build_ml_layer(
@@ -272,6 +283,7 @@ def _build_deps():
     # RTSP grabbers must outlive the orchestrator's worker loop — added
     # to services so they get the same start()/stop() lifecycle.
     services.extend(rtsp_grabbers.values())
+    services.append(recovery_watcher)
     if threat_evaluator is not None:
         services.append(threat_evaluator)
     if ml_state.embedding_store is not None:

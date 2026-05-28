@@ -39,25 +39,57 @@ class PresetStateTracker:
         self._lock = threading.Lock()
         # camera_id -> (preset_name, recorded_ts)
         self._state: dict[int, tuple[str, float]] = {}
+        # camera_id -> unix_ts before which auto-restore is suppressed.
+        # Set by operator-initiated clears (manual jog) so the recovery
+        # watcher doesn't yank the camera back to base while the operator
+        # is looking around.
+        self._manual_until: dict[int, float] = {}
 
     def record_goto(self, camera_id: int, preset_name: str) -> None:
         """Note that the camera is now (or about to be) at `preset_name`.
 
         Called by every path that pans the camera to a preset. Idempotent
         — same preset name back-to-back just refreshes the timestamp.
+        Always clears any pending manual-override window (a successful
+        goto is a stronger signal than the operator's last jog).
         """
         name = (preset_name or "").strip()
         if not name:
             return
         with self._lock:
             self._state[int(camera_id)] = (name, time.time())
+            self._manual_until.pop(int(camera_id), None)
         logger.debug("preset_state: cam%d → '%s'", camera_id, name)
 
-    def clear(self, camera_id: int) -> None:
-        """Forget the camera's preset (e.g. on a manual jog where we
-        no longer know where it's pointing)."""
+    def clear(self, camera_id: int, *, manual_grace_s: float = 0.0) -> None:
+        """Forget the camera's preset.
+
+        `manual_grace_s` suppresses the recovery watcher for that many
+        seconds — used when the *operator* moves the camera (manual
+        jog) so we don't immediately yank it back to base while they're
+        still looking around. Default 0 is right for system-initiated
+        clears (stream disrupt) — restore as soon as possible.
+        """
+        cid = int(camera_id)
         with self._lock:
-            self._state.pop(int(camera_id), None)
+            self._state.pop(cid, None)
+            if manual_grace_s > 0:
+                self._manual_until[cid] = time.time() + float(manual_grace_s)
+            else:
+                # An explicit system clear cancels any prior manual hold —
+                # otherwise a jog 4 minutes ago would keep blocking
+                # recovery from a real disrupt happening now.
+                self._manual_until.pop(cid, None)
+
+    def auto_restore_allowed(self, camera_id: int) -> bool:
+        with self._lock:
+            until = self._manual_until.get(int(camera_id), 0.0)
+            return time.time() >= until
+
+    def manual_hold_remaining_s(self, camera_id: int) -> float:
+        with self._lock:
+            until = self._manual_until.get(int(camera_id), 0.0)
+            return max(0.0, until - time.time())
 
     def current(self, camera_id: int) -> Optional[str]:
         with self._lock:

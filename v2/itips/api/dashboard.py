@@ -1775,9 +1775,11 @@ def register_dashboard(
                 client.ptz.jog_start(direction, speed=speed)
                 # A manual jog moves the camera off whatever preset it
                 # was at — clear the tracker so preset-gated zones hide
-                # instead of firing on the new (unknown) view.
+                # instead of firing on the new (unknown) view. The 5-min
+                # grace tells the recovery watcher to keep its hands off
+                # while the operator is actively driving the PTZ.
                 if preset_state is not None:
-                    preset_state.clear(camera_id)
+                    preset_state.clear(camera_id, manual_grace_s=300.0)
         except ValueError as exc:
             return jsonify({"ok": False, "error": str(exc)}), 400
         except Exception as exc:  # noqa: BLE001
