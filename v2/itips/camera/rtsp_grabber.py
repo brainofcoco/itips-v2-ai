@@ -61,6 +61,13 @@ class RtspFrameGrabber(threading.Thread):
         self._stop = threading.Event()
         self._consumers: list[Callable[["np.ndarray"], None]] = []
         self._consumers_lock = threading.Lock()
+        # Connect/disrupt observers — invoked on a *separate* worker
+        # thread so a slow PTZ goto doesn't stall the grabber's RTSP
+        # loop. Disrupt fires whenever a previously-open stream goes
+        # away; reconnect fires after every subsequent re-open (not
+        # the initial connect).
+        self._disrupt_listeners: list[Callable[[int], None]] = []
+        self._reconnect_listeners: list[Callable[[int], None]] = []
 
     # ─── public surface ───────────────────────────────────────────────
 
@@ -69,6 +76,14 @@ class RtspFrameGrabber(threading.Thread):
         must return quickly. `IncidentRecorder.feed` qualifies."""
         with self._consumers_lock:
             self._consumers.append(fn)
+
+    def add_disrupt_listener(self, fn: Callable[[int], None]) -> None:
+        """Called with `camera_id` whenever a connected stream drops."""
+        self._disrupt_listeners.append(fn)
+
+    def add_reconnect_listener(self, fn: Callable[[int], None]) -> None:
+        """Called with `camera_id` after every *re*-open (post-drop)."""
+        self._reconnect_listeners.append(fn)
 
     def stop(self) -> None:
         self._stop.set()
@@ -94,6 +109,10 @@ class RtspFrameGrabber(threading.Thread):
             return
 
         backoff = self._reconnect_backoff_s
+        # `has_been_open` distinguishes a true reconnect from the
+        # initial connect — we only fire reconnect listeners after a
+        # drop has happened at least once.
+        has_been_open = False
         while not self._stop.is_set():
             cap = cv2.VideoCapture(self._rtsp_url, cv2.CAP_FFMPEG)
             try:
@@ -115,11 +134,15 @@ class RtspFrameGrabber(threading.Thread):
                 "cam %d: RTSP grabber connected (%s, fps cap %.1f)",
                 self.camera_id, self.safe_label(), self._target_fps,
             )
+            if has_been_open:
+                self._fire_listeners(self._reconnect_listeners, "reconnect")
             backoff = self._reconnect_backoff_s
             self._read_loop(cap)
             cap.release()
+            has_been_open = True
             if self._stop.is_set():
                 break
+            self._fire_listeners(self._disrupt_listeners, "disrupt")
             logger.warning(
                 "cam %d: RTSP stream dropped — reconnecting in %.1fs",
                 self.camera_id, backoff,
@@ -128,6 +151,33 @@ class RtspFrameGrabber(threading.Thread):
                 return
             backoff = min(backoff * 2, self._max_backoff_s)
         logger.info("cam %d: RTSP grabber stopped", self.camera_id)
+
+    def _fire_listeners(
+        self, listeners: list[Callable[[int], None]], label: str,
+    ) -> None:
+        # Hand off to a one-shot daemon thread so a slow listener (e.g.
+        # a PTZ goto that takes seconds) doesn't block the grabber's
+        # own reconnect/read loop.
+        if not listeners:
+            return
+        for fn in list(listeners):
+            t = threading.Thread(
+                target=self._safe_run_listener,
+                args=(fn, label),
+                name=f"rtsp-{label}-{self.camera_id}",
+                daemon=True,
+            )
+            t.start()
+
+    def _safe_run_listener(
+        self, fn: Callable[[int], None], label: str,
+    ) -> None:
+        try:
+            fn(self.camera_id)
+        except Exception:
+            logger.exception(
+                "cam %d: RTSP %s listener crashed", self.camera_id, label,
+            )
 
     def _read_loop(self, cap) -> None:
         last_forward = 0.0

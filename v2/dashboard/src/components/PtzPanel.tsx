@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
-  deletePreset, fetchPresets, gotoPreset, ptzJog, saveCurrentPreset,
-  type PtzDirection,
+  deletePreset, fetchBasePreset, fetchPresets, gotoPreset, ptzJog,
+  saveCurrentPreset, setBasePreset, type PtzDirection,
 } from "../api/client";
 import type { Camera, CameraPreset } from "../api/types";
 
@@ -19,8 +19,9 @@ export default function PtzPanel({ cameras, cameraId, onSelectCamera }: Props) {
   const [presets, setPresets] = useState<CameraPreset[]>([]);
   const [presetIndex, setPresetIndex] = useState<number | "">("");
   const [newPresetName, setNewPresetName] = useState("");
-  const [busy, setBusy] = useState<"goto" | "save" | "delete" | null>(null);
+  const [busy, setBusy] = useState<"goto" | "save" | "delete" | "base" | null>(null);
   const [status, setStatus] = useState<string | null>(null);
+  const [basePreset, setBasePresetState] = useState<string | null>(null);
 
   // Track which direction is currently jogging so we can guarantee a
   // matching stop even if the pointer leaves the button or the user
@@ -41,8 +42,12 @@ export default function PtzPanel({ cameras, cameraId, onSelectCamera }: Props) {
   useEffect(() => {
     setPresetIndex("");
     setStatus(null);
+    setBasePresetState(null);
     if (cameraId == null) { setPresets([]); return; }
     reloadPresets(cameraId);
+    fetchBasePreset(cameraId)
+      .then((b) => setBasePresetState(b.base_preset_name))
+      .catch(() => setBasePresetState(null));
   }, [cameraId, reloadPresets]);
 
   const stopActive = useCallback(async () => {
@@ -167,6 +172,26 @@ export default function PtzPanel({ cameras, cameraId, onSelectCamera }: Props) {
     }
   }, [cameraId, newPresetName, presets, reloadPresets]);
 
+  const onChangeBase = useCallback(async (name: string | null) => {
+    if (cameraId == null) return;
+    setBusy("base");
+    try {
+      const r = await setBasePreset(cameraId, name);
+      if (!r.ok) {
+        setStatus(`Base preset save failed: ${r.error ?? "unknown"}`);
+        return;
+      }
+      setBasePresetState(r.base_preset_name ?? null);
+      setStatus(name
+        ? `Auto-restore on reconnect: "${name}".`
+        : "Auto-restore on reconnect: off.");
+    } catch (e) {
+      setStatus(`Base preset save failed: ${e}`);
+    } finally {
+      setBusy(null);
+    }
+  }, [cameraId]);
+
   const onDeletePreset = useCallback(async () => {
     if (cameraId == null || presetIndex === "") return;
     const p = presets.find((x) => x.index === presetIndex);
@@ -289,6 +314,35 @@ export default function PtzPanel({ cameras, cameraId, onSelectCamera }: Props) {
             >
               {busy === "save" ? "…" : "Save"}
             </button>
+          </div>
+          <div className="ptz-preset-row ptz-base-row">
+            <label className="muted small ptz-base-label" title="If the camera disrupts (power blip, network drop, reboot) the system pans here on reconnect so zones stay valid.">
+              Base on reconnect
+            </label>
+            <select
+              value={basePreset ?? ""}
+              onChange={(e) => onChangeBase(e.target.value || null)}
+              disabled={disabled || busy === "base"}
+            >
+              <option value="">— off (no auto-restore) —</option>
+              {presets.map((p) => (
+                <option key={p.index} value={p.name}>
+                  #{p.index} · {p.name}
+                </option>
+              ))}
+            </select>
+            {presetIndex !== "" && (
+              <button
+                disabled={disabled || busy === "base"}
+                onClick={() => {
+                  const p = presets.find((x) => x.index === presetIndex);
+                  if (p) onChangeBase(p.name);
+                }}
+                title="Set the selected preset as the base"
+              >
+                Use selected
+              </button>
+            )}
           </div>
           <span className="muted small ptz-hint">
             Hold a button to move · arrow keys + / − also work

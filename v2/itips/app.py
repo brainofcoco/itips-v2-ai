@@ -98,11 +98,40 @@ def _build_deps():
             grabber.add_consumer(recorder.feed)
         grabber.add_consumer(_frame_bus_publisher(frame_bus, cam_id))
 
+    # Shared "what preset is each camera currently at" tracker. Built
+    # before the ML layer so the BehaviorEngine can gate zone evaluation
+    # on the camera being at the zone's bound preset. Sensor dispatcher
+    # and the dashboard PTZ routes also report into it.
+    from itips.camera.preset_state import PresetStateTracker
+    preset_state = PresetStateTracker()
+
+    # Per-camera operator settings — currently just `base_preset_name`,
+    # which drives the auto-restore on RTSP reconnect below.
+    from itips.camera.camera_settings import CameraSettingsStore
+    camera_settings = CameraSettingsStore(
+        path=personnel_store_path.parent / "camera_settings.json",
+    )
+
+    # Auto-restore on disrupt/reconnect: when the RTSP stream drops,
+    # clear preset_state so zones stop firing against the wrong view.
+    # When it comes back, pan the camera to its configured base preset
+    # (if any) so we re-establish a known orientation. Without this, a
+    # power blip leaves the camera parked at whatever the firmware
+    # decides and the operator has to click a preset by hand before
+    # zone evaluation can resume.
+    _wire_camera_recovery(
+        rtsp_grabbers=rtsp_grabbers,
+        dahua_manager=dahua_manager,
+        preset_state=preset_state,
+        camera_settings=camera_settings,
+    )
+
     # ML fallback — all optional; engines only init if ml extras installed.
     ml_state = _build_ml_layer(
         embedding_db_path=personnel_store_path.parent / "face_embeddings.sqlite",
         zones_path=personnel_store_path.parent / "zones.json",
         overrides_path=personnel_store_path.parent / "ml_overrides.json",
+        preset_state=preset_state,
     )
     openai_validator = _build_openai_validator()
 
@@ -130,6 +159,7 @@ def _build_deps():
         sensor_map=sensor_map,
         event_tap=sensor_event_tap,
         threat_evaluator=threat_evaluator,
+        preset_state=preset_state,
     )
 
     # AX PRO hub listener — None unless ITIPS_AXPRO_* env are set.
@@ -222,6 +252,8 @@ def _build_deps():
         openai_validator=openai_validator,
         webhook_store=webhook_store,
         webhook_dispatcher=webhook_dispatcher,
+        preset_state=preset_state,
+        camera_settings=camera_settings,
     )
     inbound_api = InboundApiServer(
         dahua_manager=dahua_manager,
@@ -359,6 +391,81 @@ def _build_axpro_admin(listener):
     return AxProAdmin(host=listener.host, client_supplier=listener.get_client)
 
 
+def _wire_camera_recovery(
+    *, rtsp_grabbers, dahua_manager, preset_state, camera_settings,
+) -> None:
+    """Attach disrupt + reconnect handlers to every camera's RTSP grabber.
+
+    Disrupt → clear the camera's entry in `preset_state` so zones go
+    dormant for the duration of the outage (we no longer know where the
+    camera is pointing).
+
+    Reconnect → look up the operator-configured base preset; if one is
+    set, pan there and record the new orientation. We sleep briefly
+    before the HTTP call because the camera's web stack is typically a
+    couple of seconds behind RTSP when the device is rebooting (RTSP
+    streams from a leaner subsystem). Without the wait, the first PTZ
+    call after a hard reboot tends to land on a closed socket and the
+    operator gets a useless retry on the next reconnect.
+    """
+    import time as _time
+
+    recovery_log = logging.getLogger("itips.app.recovery")
+
+    def _on_disrupt(cam_id: int) -> None:
+        preset_state.clear(cam_id)
+        recovery_log.info(
+            "cam%d: stream dropped — cleared preset_state (zones dormant)",
+            cam_id,
+        )
+
+    def _on_reconnect(cam_id: int) -> None:
+        settings_for = camera_settings.get(cam_id)
+        base = settings_for.base_preset_name
+        if not base:
+            recovery_log.info(
+                "cam%d: reconnected — no base preset configured, leaving "
+                "preset_state empty (zones stay dormant until operator "
+                "selects a preset)",
+                cam_id,
+            )
+            return
+        client = dahua_manager.get(cam_id)
+        if client is None:
+            recovery_log.warning(
+                "cam%d: reconnected but DahuaManager has no client — "
+                "skipping base-preset restore",
+                cam_id,
+            )
+            return
+        # Give the camera's HTTP API a moment to catch up with RTSP. On
+        # a clean reconnect this is wasted; on a full reboot it's the
+        # difference between success and a 502 we never retry.
+        _time.sleep(3.0)
+        try:
+            ok = client.ptz.goto_preset_by_name(base)
+        except Exception:
+            recovery_log.exception(
+                "cam%d: base-preset restore to %r crashed", cam_id, base,
+            )
+            return
+        if not ok:
+            recovery_log.warning(
+                "cam%d: base-preset %r not found on camera (preset "
+                "renamed or deleted?) — zones stay dormant",
+                cam_id, base,
+            )
+            return
+        preset_state.record_goto(cam_id, base)
+        recovery_log.info(
+            "cam%d: reconnected → panned to base preset %r", cam_id, base,
+        )
+
+    for cam_id, grabber in rtsp_grabbers.items():
+        grabber.add_disrupt_listener(_on_disrupt)
+        grabber.add_reconnect_listener(_on_reconnect)
+
+
 def _wire_auto_siren(alert_engine, axpro_admin) -> None:
     """Hook AlertEngine's lifecycle so a confirmed incident auto-sounds
     the hub siren. Opt-in via ITIPS_AXPRO_AUTO_SIREN=true; default off
@@ -435,7 +542,7 @@ class _MlLayerState:
 
 
 def _build_ml_layer(*, embedding_db_path, zones_path,
-                    overrides_path) -> "_MlLayerState":
+                    overrides_path, preset_state=None) -> "_MlLayerState":
     """Each engine fails independently — failure must never break boot."""
     logger = logging.getLogger("itips.app.ml")
     state = _MlLayerState()
@@ -472,6 +579,7 @@ def _build_ml_layer(*, embedding_db_path, zones_path,
         state.behavior_engine = BehaviorEngine(
             zone_store=state.zone_store,
             object_detector=state.object_detector,
+            preset_state=preset_state,
         )
         state.behavior_engine.warmup_async()
     except Exception:

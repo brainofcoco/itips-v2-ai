@@ -44,6 +44,8 @@ class PublicApiServer(threading.Thread):
         openai_validator=None,
         webhook_store=None,
         webhook_dispatcher=None,
+        preset_state=None,
+        camera_settings=None,
     ) -> None:
         super().__init__(name="api-public", daemon=True)
         self._frame_bus = frame_bus
@@ -65,6 +67,8 @@ class PublicApiServer(threading.Thread):
         self._openai_validator = openai_validator
         self._webhook_store = webhook_store
         self._webhook_dispatcher = webhook_dispatcher
+        self._preset_state = preset_state
+        self._camera_settings = camera_settings
         self._app = self._build_app()
         self._server = None
 
@@ -95,6 +99,8 @@ class PublicApiServer(threading.Thread):
             openai_validator=self._openai_validator,
             webhook_store=self._webhook_store,
             webhook_dispatcher=self._webhook_dispatcher,
+            preset_state=self._preset_state,
+            camera_settings=self._camera_settings,
         )
 
         @app.get("/health")

@@ -57,6 +57,8 @@ def register_dashboard(
     openai_validator=None,
     webhook_store=None,
     webhook_dispatcher=None,
+    preset_state=None,
+    camera_settings=None,
 ) -> None:
     """Wire all dashboard routes onto the given Flask app.
 
@@ -1428,6 +1430,50 @@ def register_dashboard(
             return jsonify({"ok": False, "error": str(exc),
                             "payload": getattr(exc, "payload", None)}), 502
 
+    @app.get("/api/presets/current")
+    def list_current_presets():  # noqa: ANN202
+        """Per-camera "what preset is each camera at right now?".
+
+        Drives zone-overlay filtering on the Live page. `null` means
+        ITIPS has not commanded a goto for that camera since boot (or
+        a manual jog cleared it) — the dashboard treats this as
+        "hide all preset-bound zones, evaluate only always-active ones".
+        """
+        if preset_state is None:
+            return jsonify({"available": False, "cameras": {}})
+        snapshot = preset_state.all()
+        return jsonify({
+            "available": True,
+            # JSON object keys must be strings.
+            "cameras": {str(cam): name for cam, name in snapshot.items()},
+        })
+
+    @app.get("/api/cameras/<int:camera_id>/base-preset")
+    def get_camera_base_preset(camera_id: int):  # noqa: ANN202
+        """The preset the system pans to when this camera's RTSP
+        stream comes back after a disrupt. `null` = no auto-restore."""
+        if camera_settings is None:
+            return jsonify({"available": False, "base_preset_name": None})
+        return jsonify({
+            "available": True,
+            "camera_id": camera_id,
+            "base_preset_name": camera_settings.get(camera_id).base_preset_name,
+        })
+
+    @app.put("/api/cameras/<int:camera_id>/base-preset")
+    def set_camera_base_preset(camera_id: int):  # noqa: ANN202
+        if camera_settings is None:
+            return jsonify({"ok": False, "error": "camera_settings not wired"}), 503
+        body = request.get_json(silent=True) or {}
+        # `null` / "" / missing → clear the binding (no auto-restore).
+        raw = body.get("name") if "name" in body else body.get("base_preset_name")
+        camera_settings.set_base_preset(camera_id, raw)
+        return jsonify({
+            "ok": True,
+            "camera_id": camera_id,
+            "base_preset_name": camera_settings.get(camera_id).base_preset_name,
+        })
+
     @app.get("/api/cameras/<int:camera_id>/presets")
     def list_camera_presets(camera_id: int):  # noqa: ANN202
         """Camera's onboard PTZ presets — drives the binding dropdown."""
@@ -1493,6 +1539,11 @@ def register_dashboard(
         }
         if name_warning:
             payload["name_warning"] = name_warning
+        # Saving snapshots the camera's *current* PTZ position into a
+        # preset — by definition the camera is now at that preset, so
+        # mirror it into the tracker for zone gating.
+        if preset_state is not None:
+            preset_state.record_goto(camera_id, preset.name)
         return jsonify(payload), 201
 
     @app.delete("/api/cameras/<int:camera_id>/presets/<int:index>")
@@ -1513,11 +1564,26 @@ def register_dashboard(
         client = dahua_manager.get(camera_id)
         if client is None:
             return jsonify({"ok": False, "error": "unknown camera"}), 404
+        # Resolve the preset's name *before* the goto so we can mirror
+        # the new orientation into preset_state for zone gating. The
+        # listing is cheap (one HTTP call) and the alternative — a second
+        # list after goto — would race with anything else that touches
+        # presets in parallel.
+        target_name = None
+        try:
+            for p in client.ptz.list_presets():
+                if p.index == index:
+                    target_name = p.name
+                    break
+        except Exception:
+            target_name = None
         try:
             client.ptz.go_to_preset(index)
         except Exception as exc:  # noqa: BLE001
             return jsonify({"ok": False, "error": str(exc)}), 502
-        return jsonify({"ok": True})
+        if preset_state is not None and target_name:
+            preset_state.record_goto(camera_id, target_name)
+        return jsonify({"ok": True, "preset_name": target_name})
 
     @app.post("/api/sensors/zones/<int:zone_id>/calibrate")
     def calibrate_sensor_zone(zone_id: int):  # noqa: ANN202
@@ -1581,6 +1647,9 @@ def register_dashboard(
             return jsonify({"ok": False,
                             "error": f"invalid mapping: {exc}"}), 400
         sensor_map.upsert(mapping)
+        # Calibrate also leaves the camera at the saved preset.
+        if preset_state is not None:
+            preset_state.record_goto(camera_id, preset.name)
         return jsonify({
             "ok": True,
             "mapping": _sensor_mapping_to_dict(mapping),
@@ -1633,6 +1702,9 @@ def register_dashboard(
                 "ok": False,
                 "error": f"preset '{mapping.preset_name}' not found on camera",
             }), 502
+        # Test-pan leaves the camera at the bound preset.
+        if preset_state is not None:
+            preset_state.record_goto(mapping.camera_id, mapping.preset_name)
         # Snapshot URL with a cache-buster so the wizard refreshes
         # rather than serving an old frame.
         ts = int(time.time() * 1000)
@@ -1701,6 +1773,11 @@ def register_dashboard(
                 client.ptz.jog_stop(direction)
             else:
                 client.ptz.jog_start(direction, speed=speed)
+                # A manual jog moves the camera off whatever preset it
+                # was at — clear the tracker so preset-gated zones hide
+                # instead of firing on the new (unknown) view.
+                if preset_state is not None:
+                    preset_state.clear(camera_id)
         except ValueError as exc:
             return jsonify({"ok": False, "error": str(exc)}), 400
         except Exception as exc:  # noqa: BLE001
@@ -1868,6 +1945,7 @@ def _zone_to_dict(zone) -> dict:
         "points": [list(p) for p in zone.points],
         "name": zone.name,
         "direction": zone.direction,
+        "preset_name": getattr(zone, "preset_name", None),
         "metadata": dict(zone.metadata or {}),
     }
 
@@ -1875,12 +1953,15 @@ def _zone_to_dict(zone) -> dict:
 def _zone_from_dict(body: dict):
     """Lazy ml/ import so the dashboard works without the ml extras."""
     from itips.ml.zone_store import Zone
+    preset_raw = body.get("preset_name")
+    preset_name = str(preset_raw).strip() if preset_raw else None
     return Zone(
         zone_id=str(body["zone_id"]),
         zone_type=str(body["zone_type"]),
         points=[tuple(p) for p in body.get("points", [])],
         name=str(body.get("name", "")),
         direction=str(body.get("direction", "Any")),
+        preset_name=preset_name or None,
         metadata=dict(body.get("metadata") or {}),
     )
 

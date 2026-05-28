@@ -2,9 +2,9 @@
 // All paths go through the Vite dev proxy → itips:5050, or nginx in prod.
 import type {
   CameraWorkersResponse, CamerasResponse, Camera, CapabilitiesResponse,
-  EnrolledFacesResponse, HealthResponse, IncidentDetail, IncidentsResponse,
-  ListenerStatus, MLStatus, OpenAIStatus, PresetsResponse,
-  SensorEventsResponse, SensorMappingsResponse, SensorMapping,
+  CurrentPresetsResponse, EnrolledFacesResponse, HealthResponse,
+  IncidentDetail, IncidentsResponse, ListenerStatus, MLStatus, OpenAIStatus,
+  PresetsResponse, SensorEventsResponse, SensorMappingsResponse, SensorMapping,
   SignatureVerifyResponse, SirenSummary, WebhookDeliveriesResponse,
   WebhookEventKindsResponse, WebhookSubscriber, WebhookSubscribersResponse,
   WorkersResponse, Zone, ZonesResponse,
@@ -91,6 +91,25 @@ export async function deletePreset(
   cameraId: number, index: number,
 ): Promise<{ ok: boolean; error?: string }> {
   return del(`/api/cameras/${cameraId}/presets/${index}`);
+}
+export async function fetchCurrentPresets(): Promise<CurrentPresetsResponse> {
+  return getJson<CurrentPresetsResponse>("/api/presets/current");
+}
+export async function fetchBasePreset(
+  cameraId: number,
+): Promise<{ available: boolean; base_preset_name: string | null }> {
+  return getJson(`/api/cameras/${cameraId}/base-preset`);
+}
+export async function setBasePreset(
+  cameraId: number, name: string | null,
+): Promise<{ ok: boolean; base_preset_name?: string | null; error?: string }> {
+  const res = await fetch(`/api/cameras/${cameraId}/base-preset`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name }),
+  });
+  if (!res.ok) throw new Error(`base-preset PUT → ${res.status} ${res.statusText}`);
+  return res.json();
 }
 export async function gotoPreset(
   cameraId: number, index: number,

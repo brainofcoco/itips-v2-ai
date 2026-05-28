@@ -201,6 +201,13 @@ export interface Zone {
   points: Array<[number, number]>;
   name?: string;
   direction?: ZoneDirection;
+  // Camera-side PTZ preset this zone is bound to. null/undefined means
+  // "always active" (suits fixed-view cameras).
+  preset_name?: string | null;
+}
+export interface CurrentPresetsResponse {
+  available: boolean;
+  cameras: Record<string, string | null>;
 }
 export interface ZonesResponse {
   available: boolean;

@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import {
-  fetchCameras, fetchZones, fireDeterrence, snapshotUrl, standdownDeterrence,
+  fetchCameras, fetchCurrentPresets, fetchZones, fireDeterrence,
+  snapshotUrl, standdownDeterrence,
 } from "../api/client";
 import type { Camera, Zone } from "../api/types";
 import { colorForZone, drawZone } from "../lib/zoneCanvas";
@@ -22,6 +23,25 @@ export default function Live() {
   const [loading, setLoading] = useState(true);
   const [showZones, setShowZones] = useState(true);
   const [controlledId, setControlledId] = useState<number | null>(null);
+  const [currentPresets, setCurrentPresets] = useState<Record<string, string | null>>({});
+
+  // Refresh per-camera current-preset every 2s so zone overlays come live
+  // immediately after a goto/jog. The PtzPanel + sensor goto routes all
+  // call into preset_state server-side; we just poll the result.
+  useEffect(() => {
+    let cancelled = false;
+    const pull = async () => {
+      try {
+        const body = await fetchCurrentPresets();
+        if (!cancelled) setCurrentPresets(body.cameras ?? {});
+      } catch {
+        if (!cancelled) setCurrentPresets({});
+      }
+    };
+    pull();
+    const t = setInterval(() => { if (!document.hidden) pull(); }, 2000);
+    return () => { cancelled = true; clearInterval(t); };
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -85,6 +105,7 @@ export default function Live() {
                 showZones={showZones}
                 isControlled={cam.camera_id === controlledId}
                 onTakeControl={() => setControlledId(cam.camera_id)}
+                currentPreset={currentPresets[String(cam.camera_id)] ?? null}
               />
             ))}
           </div>
@@ -95,12 +116,13 @@ export default function Live() {
 }
 
 function CameraTile({
-  cam, showZones, isControlled, onTakeControl,
+  cam, showZones, isControlled, onTakeControl, currentPreset,
 }: {
   cam: Camera;
   showZones: boolean;
   isControlled: boolean;
   onTakeControl: () => void;
+  currentPreset: string | null;
 }) {
   const imgRef = useRef<HTMLImageElement | null>(null);
   const overlayRef = useRef<HTMLCanvasElement | null>(null);
@@ -167,7 +189,17 @@ function CameraTile({
     };
   }, [cam.camera_id]);
 
-  // Redraw overlay whenever zones, visibility, or image size changes.
+  // Zones the engine actually evaluates right now: always-active ones,
+  // plus those bound to whatever preset the camera is currently at.
+  // Preserves the original index so colour assignment stays stable as
+  // zones come and go between presets.
+  const activeZones = useMemo(() => {
+    return zones
+      .map((z, originalIdx) => ({ z, originalIdx }))
+      .filter(({ z }) => !z.preset_name || z.preset_name === currentPreset);
+  }, [zones, currentPreset]);
+
+  // Redraw overlay whenever active zones, visibility, or image size changes.
   useEffect(() => {
     const c = overlayRef.current;
     if (!c) return;
@@ -178,15 +210,15 @@ function CameraTile({
     const g = c.getContext("2d")!;
     g.clearRect(0, 0, w, h);
     if (!showZones) return;
-    zones.forEach((z, idx) => {
+    activeZones.forEach(({ z, originalIdx }) => {
       drawZone(g, z, w, h, {
-        color: colorForZone(idx),
+        color: colorForZone(originalIdx),
         width: Math.max(2, Math.round(w / 640) + 1),
         label: z.name || z.zone_id,
         fillAlpha: 0.15,
       });
     });
-  }, [zones, showZones, imgSize]);
+  }, [activeZones, showZones, imgSize]);
 
   const handleFire = useCallback(async () => {
     setBusy("fire");
@@ -212,13 +244,34 @@ function CameraTile({
 
   const zoneSummary = useMemo(() => {
     if (zones.length === 0) return null;
-    const regions = zones.filter((z) => z.zone_type === "region").length;
-    const lines = zones.filter((z) => z.zone_type === "line").length;
-    const parts: string[] = [];
-    if (regions) parts.push(`${regions} region${regions === 1 ? "" : "s"}`);
-    if (lines) parts.push(`${lines} line${lines === 1 ? "" : "s"}`);
-    return parts.join(" · ");
-  }, [zones]);
+    const total = zones.length;
+    const active = activeZones.length;
+    if (active === total) return `${total} zone${total === 1 ? "" : "s"} active`;
+    return `${active}/${total} zone${total === 1 ? "" : "s"} active`;
+  }, [zones, activeZones]);
+
+  const dormantCount = zones.length - activeZones.length;
+  const presetBanner = useMemo(() => {
+    if (zones.length === 0) return null;
+    if (currentPreset) {
+      return {
+        text: dormantCount > 0
+          ? `at preset “${currentPreset}” — ${activeZones.length} active, ${dormantCount} hidden`
+          : `at preset “${currentPreset}” — ${activeZones.length} active`,
+        tone: "ok" as const,
+      };
+    }
+    // No preset known: any preset-bound zones stay hidden so we don't
+    // evaluate against the wrong view.
+    const hasBound = zones.some((z) => !!z.preset_name);
+    if (!hasBound) {
+      return { text: `${zones.length} zone${zones.length === 1 ? "" : "s"} (always active)`, tone: "ok" as const };
+    }
+    return {
+      text: `preset unknown — ${dormantCount} preset-bound zone${dormantCount === 1 ? "" : "s"} hidden`,
+      tone: "warn" as const,
+    };
+  }, [zones, activeZones, currentPreset, dormantCount]);
 
   return (
     <article className={`cam${isControlled ? " cam-controlled" : ""}`}>
@@ -248,15 +301,22 @@ function CameraTile({
           }}
         />
         <canvas ref={overlayRef} className="cam-overlay" aria-hidden />
-        {showZones && zones.length > 0 && (
+        {showZones && presetBanner && (
+          <div className={`cam-preset-banner cam-preset-${presetBanner.tone}`}>
+            {presetBanner.text}
+          </div>
+        )}
+        {showZones && activeZones.length > 0 && (
           <div className="cam-zone-legend">
-            {zones.slice(0, 5).map((z, idx) => (
+            {activeZones.slice(0, 5).map(({ z, originalIdx }) => (
               <span key={z.zone_id} className="cam-zone-chip">
-                <span className="dot" style={{ background: colorForZone(idx) }} />
+                <span className="dot" style={{ background: colorForZone(originalIdx) }} />
                 {z.name || z.zone_id}
               </span>
             ))}
-            {zones.length > 5 && <span className="cam-zone-chip muted">+{zones.length - 5}</span>}
+            {activeZones.length > 5 && (
+              <span className="cam-zone-chip muted">+{activeZones.length - 5}</span>
+            )}
           </div>
         )}
         {errored && (

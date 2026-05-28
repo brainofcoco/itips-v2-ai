@@ -1,8 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
-  deleteZone, fetchCameras, fetchZones, saveZone, snapshotUrl,
+  deleteZone, fetchCameras, fetchCurrentPresets, fetchPresets, fetchZones,
+  saveZone, snapshotUrl,
 } from "../api/client";
-import type { Camera, Zone, ZoneDirection, ZoneType } from "../api/types";
+import type {
+  Camera, CameraPreset, Zone, ZoneDirection, ZoneType,
+} from "../api/types";
 import Section from "../components/Section";
 import {
   colorForZone, drawHandles, drawInProgress, drawZone, findHandleAt, findSegmentAt,
@@ -19,6 +22,7 @@ interface Draft {
   name: string;
   direction: ZoneDirection;
   points: Point[];
+  preset_name: string;       // "" means always-active
 }
 
 const EMPTY_DRAFT: Draft = {
@@ -28,6 +32,7 @@ const EMPTY_DRAFT: Draft = {
   name: "",
   direction: "Any",
   points: [],
+  preset_name: "",
 };
 
 export default function Zones() {
@@ -40,6 +45,8 @@ export default function Zones() {
   const [draggingIdx, setDraggingIdx] = useState<number | null>(null);
   const [hoverHandle, setHoverHandle] = useState<number | null>(null);
   const [cursor, setCursor] = useState<string>("crosshair");
+  const [presets, setPresets] = useState<CameraPreset[]>([]);
+  const [currentPreset, setCurrentPreset] = useState<string | null>(null);
 
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
 
@@ -57,6 +64,8 @@ export default function Zones() {
     setImage(null);
     setZones([]);
     setDraft(null);
+    setPresets([]);
+    setCurrentPreset(null);
     const img = new Image();
     img.src = snapshotUrl(cameraId);
     img.onload = () => setImage(img);
@@ -75,6 +84,13 @@ export default function Zones() {
         setStatus({ text: "Failed to load zones: " + e, ok: false });
         setZones([]);
       });
+    // Preset list for the "Active when at preset" dropdown.
+    fetchPresets(cameraId)
+      .then((body) => setPresets(body.presets ?? []))
+      .catch(() => setPresets([]));
+    fetchCurrentPresets()
+      .then((body) => setCurrentPreset(body.cameras?.[String(cameraId)] ?? null))
+      .catch(() => setCurrentPreset(null));
   }, [cameraId]);
 
   const refreshZones = useCallback(async () => {
@@ -279,6 +295,7 @@ export default function Zones() {
       name: z.name ?? "",
       direction: z.direction ?? "Any",
       points: z.points.map((p) => [p[0], p[1]] as Point),
+      preset_name: z.preset_name ?? "",
     });
     setStatus({ text: `Editing "${z.zone_id}" — drag handles, right-click to remove, click segments to insert.`, ok: true });
   }, []);
@@ -328,6 +345,7 @@ export default function Zones() {
         name: draft.name.trim(),
         direction: draft.zone_type === "line" ? draft.direction : "Any",
         points: draft.points,
+        preset_name: draft.preset_name.trim() || null,
       });
       if (!reply.ok) {
         setStatus({ text: "Save failed: " + (reply.error || "unknown"), ok: false });
@@ -402,7 +420,17 @@ export default function Zones() {
       </div>
 
       <div className="zones-layout">
-        <Section title="Snapshot">
+        <Section
+          title="Snapshot"
+          actions={
+            <span className="muted small" title="ITIPS-tracked PTZ orientation">
+              camera at:&nbsp;
+              <strong style={{ color: currentPreset ? "var(--accent)" : "var(--muted)" }}>
+                {currentPreset ?? "unknown preset"}
+              </strong>
+            </span>
+          }
+        >
           <div className="canvas-wrap">
             <canvas
               ref={canvasRef}
@@ -479,6 +507,26 @@ export default function Zones() {
                     <option value="RightToLeft">Right → Left</option>
                   </select>
                 </label>
+                <label className="field" style={{ gridColumn: "1 / -1" }}>
+                  <span>Active when at preset</span>
+                  <select
+                    value={draft.preset_name}
+                    onChange={(e) => setDraft({ ...draft, preset_name: e.target.value })}
+                  >
+                    <option value="">Always active (no preset binding)</option>
+                    {presets.map((p) => (
+                      <option key={p.index} value={p.name}>
+                        #{p.index} · {p.name}
+                        {currentPreset === p.name ? "  (camera currently here)" : ""}
+                      </option>
+                    ))}
+                  </select>
+                  <span className="muted small">
+                    PTZ cameras: bind the zone to the preset it was drawn under, so the
+                    engine only evaluates and the Live overlay only draws it while the
+                    camera is at that view.
+                  </span>
+                </label>
               </div>
               <div className="row" style={{ marginTop: "0.6rem", justifyContent: "flex-end" }}>
                 <button onClick={onCancelDraft}>Cancel</button>
@@ -518,6 +566,20 @@ export default function Zones() {
                             <span className="muted small">{labelDirection(z.direction)}</span>
                           )}
                           <span className="muted small">{z.points.length} pts</span>
+                          {z.preset_name ? (
+                            <span
+                              className={`pill ${currentPreset === z.preset_name ? "pill-ok" : "pill-idle"}`}
+                              title={
+                                currentPreset === z.preset_name
+                                  ? "Camera is at this preset — zone is live"
+                                  : "Zone is dormant — camera is at a different view"
+                              }
+                            >
+                              @ {z.preset_name}
+                            </span>
+                          ) : (
+                            <span className="pill pill-ok" title="Always active">always</span>
+                          )}
                         </div>
                       </div>
                       <div className="zone-card-actions">

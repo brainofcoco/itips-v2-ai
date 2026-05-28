@@ -33,6 +33,7 @@ class SensorDispatcher(threading.Thread):
         sensor_map: SensorMap,
         event_tap: SensorEventTap,
         threat_evaluator=None,
+        preset_state=None,
         pan_settle_s: float = 2.0,
         snapshot_timeout_s: float = 4.0,
         per_zone_cooldown_s: float = 10.0,
@@ -47,6 +48,10 @@ class SensorDispatcher(threading.Thread):
         # evidence to review) but cannot produce a verdict. Production
         # boots the evaluator in app.py whenever the face engine loads.
         self._threat_evaluator = threat_evaluator
+        # Records the preset the dispatcher pans each camera to, so the
+        # BehaviorEngine knows which preset-bound zones are active right
+        # now and the Live overlay can mirror that.
+        self._preset_state = preset_state
         self._pan_settle_s = float(pan_settle_s)
         self._snapshot_timeout_s = float(snapshot_timeout_s)
         self._per_zone_cooldown_s = float(per_zone_cooldown_s)
@@ -154,6 +159,11 @@ class SensorDispatcher(threading.Thread):
                 "preset_name": mapping.preset_name,
             })
             return
+        # Tell the rest of the system "cam N is now at preset X" so
+        # preset-bound zones for that view become active for the
+        # behavior engine and the Live overlay.
+        if self._preset_state is not None:
+            self._preset_state.record_goto(mapping.camera_id, mapping.preset_name)
 
         # GotoPreset is fire-and-forget on Dahua; sleep for the dome to arrive.
         time.sleep(self._pan_settle_s)

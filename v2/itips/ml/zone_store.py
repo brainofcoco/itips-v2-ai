@@ -29,6 +29,14 @@ class Zone:
     points: list[tuple[float, float]]           # normalised [0,1]
     name: str = ""
     direction: str = "Any"                      # Any | LeftToRight | RightToLeft
+    # Camera-side PTZ preset this zone is bound to. When set, the
+    # behavior engine only evaluates the zone (and the Live overlay only
+    # draws it) while the camera is currently at this preset — drawn
+    # coordinates are only meaningful for that physical orientation.
+    # `None` means "always active", which suits fixed-view cameras and
+    # is the back-compat default for zones created before this field
+    # existed.
+    preset_name: Optional[str] = None
     metadata: dict = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -71,12 +79,15 @@ class ZoneStore:
                 zones: list[Zone] = []
                 for z in zones_raw:
                     try:
+                        preset_raw = z.get("preset_name")
+                        preset_name = str(preset_raw).strip() if preset_raw else None
                         zones.append(Zone(
                             zone_id=str(z["zone_id"]),
                             zone_type=str(z["zone_type"]),
                             points=[tuple(p) for p in z.get("points", [])],
                             name=str(z.get("name", "")),
                             direction=str(z.get("direction", "Any")),
+                            preset_name=preset_name or None,
                             metadata=dict(z.get("metadata") or {}),
                         ))
                     except (KeyError, ValueError) as exc:

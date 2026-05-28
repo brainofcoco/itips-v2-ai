@@ -67,12 +67,18 @@ class BehaviorEngine:
         loiter_dwell_s: float = 15.0,
         loiter_min_events: int = 3,
         tracker: Optional[IoUTracker] = None,
+        preset_state=None,
     ) -> None:
         self._zones = zone_store
         self._detector = object_detector
         self._tracker = tracker or IoUTracker()
         self._loiter_dwell_s = float(loiter_dwell_s)
         self._loiter_min_events = int(loiter_min_events)
+        # Used to gate preset-bound zones — a zone drawn at preset "Home"
+        # is only meaningful while the camera is at "Home"; for any other
+        # orientation the zone overlays a different patch of scene and
+        # would produce false alarms.
+        self._preset_state = preset_state
         # Per-(camera, track, zone): how long has this track been inside
         # the region zone, and have we already fired its loiter alert?
         self._dwell_state: dict[tuple[int, int, str], _DwellState] = {}
@@ -92,10 +98,28 @@ class BehaviorEngine:
     ) -> list[BehaviorAlert]:
         """Production path. Skips detection when the camera has no
         zones, to save the GPU on noisy VideoMotion events."""
-        zones = self._zones.for_camera(camera_id)
+        zones = self._active_zones(camera_id)
         if not zones:
             return []
         return self.analyse_full(camera_id, frame, ts=ts).alerts
+
+    def _active_zones(self, camera_id: int):
+        """Filter the camera's zones down to those that should fire
+        right now — preset-bound zones only count when the camera is
+        currently at that preset (per `PresetStateTracker`); zones
+        with no preset binding are always active."""
+        zones = self._zones.for_camera(camera_id)
+        if not zones:
+            return []
+        if self._preset_state is None:
+            return zones
+        current = self._preset_state.current(camera_id)
+        active = []
+        for z in zones:
+            bound = getattr(z, "preset_name", None)
+            if bound is None or (current is not None and bound == current):
+                active.append(z)
+        return active
 
     def analyse_full(
         self,
@@ -106,7 +130,7 @@ class BehaviorEngine:
         """Always runs the detector — even with no zones — so the ML
         Lab can surface what YOLO saw."""
         ts = float(ts) if ts is not None else time.time()
-        zones = self._zones.for_camera(camera_id)
+        zones = self._active_zones(camera_id)
 
         detections = self._detector.detect(frame)
         if not detections:
