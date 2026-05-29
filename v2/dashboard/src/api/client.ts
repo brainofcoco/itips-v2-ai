@@ -98,6 +98,10 @@ export async function fetchCurrentPresets(): Promise<CurrentPresetsResponse> {
 export async function fetchRecentActivity(limit = 50): Promise<import("./types").ActivityResponse> {
   return getJson<import("./types").ActivityResponse>(`/api/activity/recent?limit=${limit}`);
 }
+// Real-time push of the same feed — subscribe with `new EventSource(activityStreamUrl())`.
+export function activityStreamUrl(): string {
+  return "/api/activity/stream";
+}
 export async function fetchRecentVerdicts(limit = 100): Promise<import("./types").VerdictsResponse> {
   return getJson<import("./types").VerdictsResponse>(`/api/verdicts/recent?limit=${limit}`);
 }

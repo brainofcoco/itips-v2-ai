@@ -138,6 +138,7 @@ filter. Useful for end-to-end smoke tests during integration.
 | `alert.fire`           | Camera-side fire classification. |
 | `alert.smoke`          | Camera-side smoke classification. |
 | `sensor.event`         | Raw wireless sensor activation (door, contact, PIR, vibration). Fires once per accepted event, **before** the per-zone cooldown gate. |
+| `activity.detection`   | Raw detection (line cross, region intrusion, loiter, sensor trip) the **instant** it is observed — before validation or incident packaging. The earliest "someone is here" signal; also streamed over SSE at `GET /api/activity/stream`. |
 | `ai.validation`        | OpenAI vision validator returned a verdict for an alert. |
 | `test.ping`            | Manual ping from the dashboard `/test` endpoint. |
 
@@ -258,6 +259,27 @@ siren actually fired (false when the hub was disarmed).
   "source":      "axpro",
   "received_ts": 1716750123.45,
   "raw":         { …vendor payload… }
+}
+```
+
+### `activity.detection`
+
+Earliest "someone is here" signal — fired the instant a detection is
+tapped, before any validation or incident. `kind` is the detection type;
+the same payload is delivered live over SSE at `GET /api/activity/stream`.
+
+```json
+{
+  "seq":        1487,
+  "camera_id":  4,
+  "kind":       "line_crossing",
+  "label":      "Line crossing",
+  "zone_id":    1,
+  "zone_name":  "front gate",
+  "detail":     { …rule-specific fields… },
+  "status":     "detected",
+  "source":     "behavior",
+  "ts":         1716750123.45
 }
 ```
 

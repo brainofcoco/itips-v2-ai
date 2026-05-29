@@ -16,10 +16,13 @@ finishes.
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from collections import deque
-from typing import Any, Optional
+from typing import Any, Callable, Optional
+
+logger = logging.getLogger(__name__)
 
 
 class ActivityTap:
@@ -27,6 +30,13 @@ class ActivityTap:
         self._lock = threading.Lock()
         self._buf: deque[dict[str, Any]] = deque(maxlen=capacity)
         self._counter = 0
+        self._listeners: list[Callable[[dict[str, Any]], None]] = []
+
+    def add_listener(self, fn: Callable[[dict[str, Any]], None]) -> None:
+        """Out-of-band consumers (webhook dispatcher). Called on every
+        publish with the entry, off the detection hot path's lock."""
+        with self._lock:
+            self._listeners.append(fn)
 
     def publish(
         self,
@@ -55,7 +65,15 @@ class ActivityTap:
                 "ts": time.time(),
             }
             self._buf.append(entry)
-            return entry
+            listeners = list(self._listeners)
+        # Notify outside the lock so a slow consumer can't stall the
+        # detection hot path; dispatch() itself is non-blocking.
+        for fn in listeners:
+            try:
+                fn(entry)
+            except Exception:  # noqa: BLE001
+                logger.exception("activity tap listener failed")
+        return entry
 
     def recent(self, limit: Optional[int] = None) -> list[dict[str, Any]]:
         with self._lock:
@@ -63,6 +81,13 @@ class ActivityTap:
         if limit is not None:
             items = items[-limit:]
         return list(reversed(items))   # newest first
+
+    def since(self, cursor: int) -> tuple[list[dict[str, Any]], int]:
+        """Entries with seq > cursor, oldest-first, plus the new cursor.
+        Mirrors EventTap.since for the /api/activity/stream SSE generator."""
+        with self._lock:
+            items = [e for e in self._buf if e["seq"] > cursor]
+            return items, self._counter
 
     def clear(self) -> None:
         with self._lock:

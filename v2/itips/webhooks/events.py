@@ -33,6 +33,10 @@ EVENT_KINDS: dict[str, str] = {
     # zone fires (independent of any incident promotion).
     "sensor.event":         "Wireless sensor activation (door, contact, PIR, vibration).",
 
+    # Raw detection feed — published by ActivityTap the instant a
+    # detection happens, before validation or incident packaging.
+    "activity.detection":   "Real-time detection (line cross, region intrusion, loiter, sensor trip) the moment it is observed — the earliest 'someone is here' signal.",
+
     # AI second-opinion — published by OpenAIValidator
     "ai.validation":        "OpenAI vision validator returned a verdict for an alert.",
 

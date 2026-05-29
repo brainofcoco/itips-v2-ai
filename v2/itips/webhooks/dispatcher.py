@@ -236,6 +236,28 @@ class WebhookDispatcher:
 
         evaluator.add_verdict_listener(_listener)
 
+    def bind_activity_tap(self, activity_tap, *, tenant=None) -> None:
+        """Publish `activity.detection` for every raw detection the instant
+        it's tapped — earlier than `alert.*` (pre-validation) and the
+        finest-grained 'someone is here' signal a subscriber can get."""
+        if activity_tap is None or not hasattr(activity_tap, "add_listener"):
+            return
+
+        site_id = getattr(tenant, "site_id", None) if tenant else None
+        operator_id = getattr(tenant, "operator_id", None) if tenant else None
+        device_id = getattr(tenant, "device_id", None) if tenant else None
+
+        def _listener(entry: dict[str, Any]) -> None:
+            self.dispatch(WebhookEvent(
+                kind="activity.detection",
+                data=entry,
+                site_id=site_id,
+                operator_id=operator_id,
+                device_id=device_id,
+            ))
+
+        activity_tap.add_listener(_listener)
+
     # ─── internals ────────────────────────────────────────────────
 
     def _worker_loop(self) -> None:

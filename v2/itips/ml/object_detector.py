@@ -89,6 +89,13 @@ class ObjectDetector:
     def _ensure_model_safe(self) -> None:
         try:
             self._ensure_model()
+        except ObjectDetectorUnavailable as exc:
+            # Expected on the core image (no ml extras) — degrade to
+            # motion-only and log one line, not a boot-time traceback.
+            with self._init_lock:
+                self._init_error = exc
+                self._warmup_thread = None
+            logger.warning("behavior fallback unavailable — %s", exc)
         except Exception as exc:  # noqa: BLE001
             with self._init_lock:
                 self._init_error = exc

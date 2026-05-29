@@ -285,6 +285,9 @@ def _build_deps():
         webhook_dispatcher.bind_threat_evaluator(
             threat_evaluator, tenant=settings.tenant,
         )
+        webhook_dispatcher.bind_activity_tap(
+            activity_tap, tenant=settings.tenant,
+        )
         # AX PRO raw-stream firehose — sensor.event already covers
         # dispatched activations; this lets a subscriber consume
         # cidEvents (low-battery, tamper, arm/disarm) that don't enter

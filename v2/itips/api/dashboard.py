@@ -261,6 +261,41 @@ def register_dashboard(
             "events": activity_tap.recent(limit=max(1, min(limit, 200))),
         })
 
+    @app.get("/api/activity/stream")
+    def activity_stream():  # noqa: ANN202
+        """SSE push of the raw detection feed — same entries as
+        /api/activity/recent, delivered the instant they happen so the
+        Live page (or any consumer) doesn't have to poll."""
+        if activity_tap is None:
+            return Response("activity tap disabled\n", status=503,
+                            mimetype="text/plain")
+
+        def gen():
+            cursor = 0
+            yield ": connected\n\n"
+            last_send = time.monotonic()
+            # Replay the buffer once so a fresh subscriber gets context.
+            initial, cursor = activity_tap.since(cursor)
+            for ev in initial:
+                yield f"data: {json.dumps(ev)}\n\n"
+                last_send = time.monotonic()
+            while True:
+                new_items, cursor = activity_tap.since(cursor)
+                if new_items:
+                    for ev in new_items:
+                        yield f"data: {json.dumps(ev)}\n\n"
+                    last_send = time.monotonic()
+                elif (time.monotonic() - last_send) > 15:
+                    yield ": keepalive\n\n"
+                    last_send = time.monotonic()
+                time.sleep(0.4)
+
+        return Response(
+            stream_with_context(gen()),
+            mimetype="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
     @app.get("/api/verdicts/recent")
     def recent_verdicts():  # noqa: ANN202
         """ThreatEvaluator verdict history for the Investigations page —
@@ -613,6 +648,7 @@ def register_dashboard(
         has_highlight = any(e.get("kind") == "video_highlight" for e in manifest_files)
         return jsonify({
             "incident_id": incident_id,
+            "storage_path": str(package),
             "metadata": meta,
             "manifest": manifest,
             "signature": sig,
@@ -2093,6 +2129,7 @@ def _incident_summary(package: Path) -> dict | None:
     signature = _read_json(package / "signature.sha256")
     return {
         "incident_id": metadata.get("incident_id", package.name),
+        "storage_path": str(package),
         "site_id": metadata.get("site_id"),
         "operator_id": metadata.get("operator_id"),
         "device_id": metadata.get("device_id"),

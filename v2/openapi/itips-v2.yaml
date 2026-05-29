@@ -57,6 +57,15 @@ tags:
       warmup, and direct-invoke routes back the dashboard's ML Lab tab.
       Pass `?dispatch=1` on recognize/read/analyse to also fire the
       result through the AlertEngine — Alerts tab lights up in real time.
+  - name: Activity
+    description: |
+      Real-time detection feed (Live page) and ThreatEvaluator verdict
+      history with the captured stills/clips (Investigations page).
+  - name: Webhooks
+    description: |
+      Outbound push delivery. Subscribers register a URL + secret + event
+      filter and receive HMAC-signed POSTs as alerts / verdicts / sensor
+      events happen, instead of polling. Payload schema in docs/WEBHOOKS.md.
 security: []
 paths:
   /health:
@@ -306,7 +315,7 @@ paths:
   /api/incidents/{incident_id}:
     get:
       tags: [Incidents]
-      summary: Detailed view — metadata, manifest, signature, file list
+      summary: Detailed view — storage path, metadata, manifest, signature, captures
       parameters:
         - { name: incident_id, in: path, required: true, schema: { type: string } }
       responses:
@@ -314,20 +323,45 @@ paths:
           description: OK
           content:
             application/json:
-              schema: { type: object, additionalProperties: true }
+              schema: { $ref: "#/components/schemas/IncidentDetail" }
+        "404": { description: incident not found }
+    delete:
+      tags: [Incidents]
+      summary: Permanently delete an incident package from disk (irreversible)
+      parameters:
+        - { name: incident_id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  incident_id: { type: string }
+        "404": { description: incident not found }
+        "500": { description: delete failed }
 
   /api/incidents/{incident_id}/files/{filename}:
     get:
       tags: [Incidents]
       summary: Download a single file out of an incident package
+      description: |
+        `filename` is a package-relative path from IncidentDetail.files or a
+        *_captures[].filename (e.g. face_captures/0.jpg). `?inline=1` serves
+        inline (thumbnail / PDF / video preview) instead of as an attachment.
       parameters:
         - { name: incident_id, in: path, required: true, schema: { type: string } }
         - { name: filename, in: path, required: true, schema: { type: string } }
+        - { name: inline, in: query, required: false,
+            schema: { type: string, enum: ["1", "true"] } }
       responses:
         "200":
-          description: OK
+          description: The file (image / video / PDF / JSON, by extension)
           content:
             application/octet-stream: {}
+        "404": { description: incident or file not found }
 
   /api/test/events/recent:
     get:
@@ -359,8 +393,23 @@ paths:
 
   /api/test/ptz/{camera_id}/{direction}:
     post:
-      tags: [TestConsole]
-      summary: Jog PTZ in a direction (start/stop pair)
+      tags: [Cameras, TestConsole]
+      summary: Jog the camera PTZ (pan/tilt/zoom/focus) — aim it before saving a preset
+      description: |
+        Manual PTZ control. Send `action: start` to begin moving in
+        `direction`, then `action: stop` to halt — model it as a
+        press-and-hold button (start on mousedown, stop on mouseup).
+        `speed` is 1–8. `direction` covers the 4 pans, 4 diagonals, zoom
+        (`zoom_wide`/`zoom_tele`) and focus (`focus_near`/`focus_far`).
+
+        Set-a-preset flow:
+          1. Jog with up/down/left/right (+ diagonals) and zoom to aim.
+          2. `POST /api/cameras/{camera_id}/presets` — save the current
+             position as a named preset.
+          3. `POST /api/cameras/{camera_id}/presets/{index}/goto` — recall it.
+
+        A manual jog clears the camera's tracked preset for ~5 min, so
+        preset-gated zones don't fire on the unknown view while you drive.
       parameters:
         - { name: camera_id, in: path, required: true, schema: { type: integer } }
         - name: direction
@@ -380,6 +429,9 @@ paths:
                 speed: { type: integer, minimum: 1, maximum: 8, default: 4 }
       responses:
         "200": { description: OK }
+        "400": { description: invalid direction }
+        "404": { description: unknown camera }
+        "502": { description: "camera rejected the command — carries a hint (wrong PTZ channel / ONVIF perms / unsupported code)" }
         "400": { description: unknown direction }
 
   /api/test/simulate/{event_type}:
@@ -615,6 +667,39 @@ paths:
                     type: array
                     items: { $ref: "#/components/schemas/PresetInfo" }
         "404": { description: Unknown camera }
+    post:
+      tags: [Cameras]
+      summary: Save the camera's current PTZ position as a named preset
+      description: |
+        `index` omitted picks the next free slot [1..255]; `name` omitted
+        uses `preset_<index>`. Some firmware refuses naming over HTTP — the
+        response then carries `name_warning` and keeps the camera auto-name.
+      parameters:
+        - { name: camera_id, in: path, required: true, schema: { type: integer } }
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string }
+                index: { type: integer }
+      responses:
+        "201":
+          description: Saved
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  camera_id: { type: integer }
+                  preset: { $ref: "#/components/schemas/PresetInfo" }
+                  name_warning: { type: string }
+        "400": { description: index not an int }
+        "404": { description: Unknown camera }
+        "502": { description: camera rejected the save }
 
   # ─── Zones (behavioral fallback) ─────────────────────────────────
 
@@ -941,6 +1026,933 @@ paths:
               schema: { $ref: "#/components/schemas/BehaviorAnalysisResult" }
         "503": { description: Behavior engine not wired }
 
+  # ─── Live (MJPEG alias used by the dashboard <img> tag) ──────────
+  /live/{camera_id}:
+    get:
+      tags: [Snapshots]
+      summary: MJPEG feed (alias of /video_feed/{camera_id})
+      description: |
+        Identical annotated MJPEG stream as `/video_feed/{camera_id}`; the
+        dashboard binds `<img src="/live/{id}">`. Browsers cannot render the
+        camera RTSP directly, so plug a frontend into this HTTP feed.
+      parameters:
+        - { name: camera_id, in: path, required: true, schema: { type: integer } }
+      responses:
+        "200":
+          description: multipart/x-mixed-replace MJPEG stream
+          content:
+            multipart/x-mixed-replace: {}
+
+  # ─── Activity feed + Investigations verdicts ─────────────────────
+  /api/activity/recent:
+    get:
+      tags: [Activity]
+      summary: Real-time detection feed for the Live page
+      parameters:
+        - { name: limit, in: query, required: false,
+            schema: { type: integer, default: 50, maximum: 200 } }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  available: { type: boolean }
+                  events:
+                    type: array
+                    items: { type: object, additionalProperties: true }
+
+  /api/verdicts/recent:
+    get:
+      tags: [Activity]
+      summary: ThreatEvaluator verdict history (Investigations page)
+      parameters:
+        - { name: limit, in: query, required: false,
+            schema: { type: integer, default: 100, maximum: 300 } }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  available: { type: boolean }
+                  verdicts:
+                    type: array
+                    items: { type: object, additionalProperties: true }
+
+  /api/verdicts:
+    delete:
+      tags: [Activity]
+      summary: Wipe Investigations history (DB rows + captured JPEGs)
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  capture_dirs_removed: { type: integer }
+        "503": { description: verdict tap not wired }
+
+  /api/verdicts/captures/{capture_id}:
+    get:
+      tags: [Activity]
+      summary: List the stills + MP4 clip captured for one verdict
+      parameters:
+        - { name: capture_id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  capture_id: { type: string }
+                  images: { type: array, items: { type: string } }
+                  videos: { type: array, items: { type: string } }
+
+  /api/verdicts/captures/{capture_id}/{filename}:
+    get:
+      tags: [Activity]
+      summary: Fetch one capture file (JPEG still or MP4 clip)
+      parameters:
+        - { name: capture_id, in: path, required: true, schema: { type: string } }
+        - { name: filename, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: image/jpeg or video/mp4
+          content:
+            image/jpeg: {}
+            video/mp4: {}
+        "404": { description: not found }
+
+  # ─── Incidents (verify / bulk-delete / synthetic test package) ───
+  /api/incidents/{incident_id}/verify:
+    post:
+      tags: [Incidents]
+      summary: Re-verify a signed package (per-file SHA-256 + manifest hash)
+      parameters:
+        - { name: incident_id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  manifest_hash_signed: { type: string, nullable: true }
+                  manifest_hash_actual: { type: string }
+                  manifest_hash_ok: { type: boolean }
+                  files:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        filename: { type: string }
+                        status: { type: string, enum: [ok, mismatch, missing] }
+                        expected: { type: string, nullable: true }
+                        actual: { type: string, nullable: true }
+        "400": { description: manifest missing }
+        "404": { description: incident not found }
+
+  /api/incidents/bulk-delete:
+    post:
+      tags: [Incidents]
+      summary: Delete many incidents in one call
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                ids: { type: array, items: { type: string } }
+                all: { type: boolean, description: "delete every package on disk" }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  requested: { type: integer }
+                  deleted: { type: integer }
+                  results:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        incident_id: { type: string }
+                        status: { type: string, enum: [ok, not_found, error] }
+                        error: { type: string }
+        "400": { description: "neither ids[] nor all=true provided" }
+
+  /api/evidence/test/run:
+    post:
+      tags: [Incidents]
+      summary: Build a complete synthetic evidence package end-to-end
+      description: |
+        Real packager, signature and PDF — only the JPEG/event payloads are
+        synthetic. Returns the package dir + signature so the operator can
+        inspect it straight away in the Incidents tab.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  incident_id: { type: string }
+                  package_dir: { type: string }
+                  signature: { type: string, nullable: true }
+                  manifest_hash: { type: string, nullable: true }
+        "502": { description: finalize failed }
+        "503": { description: no packager wired }
+
+  # ─── Presets (current position, base/auto-restore, goto, delete) ─
+  /api/presets/current:
+    get:
+      tags: [Cameras]
+      summary: Current preset each camera is parked at
+      description: |
+        Drives zone-overlay filtering on the Live page. A `null` value for a
+        camera means no goto has been commanded since boot (or a manual jog
+        cleared it) — the UI then hides preset-bound zones for that camera.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  available: { type: boolean }
+                  cameras:
+                    type: object
+                    additionalProperties: { type: string, nullable: true }
+
+  /api/cameras/{camera_id}/base-preset:
+    get:
+      tags: [Cameras]
+      summary: Get the auto-restore preset (panned to when RTSP recovers)
+      parameters:
+        - { name: camera_id, in: path, required: true, schema: { type: integer } }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  available: { type: boolean }
+                  camera_id: { type: integer }
+                  base_preset_name: { type: string, nullable: true }
+    put:
+      tags: [Cameras]
+      summary: Set or clear the auto-restore preset
+      parameters:
+        - { name: camera_id, in: path, required: true, schema: { type: integer } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name:
+                  type: string
+                  nullable: true
+                  description: preset name; null or empty clears the binding
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  camera_id: { type: integer }
+                  base_preset_name: { type: string, nullable: true }
+        "503": { description: camera settings not wired }
+
+  /api/cameras/{camera_id}/presets/{index}:
+    delete:
+      tags: [Cameras]
+      summary: Delete an onboard PTZ preset by index
+      parameters:
+        - { name: camera_id, in: path, required: true, schema: { type: integer } }
+        - { name: index, in: path, required: true, schema: { type: integer } }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { type: object, properties: { ok: { type: boolean } } }
+        "404": { description: Unknown camera }
+        "502": { description: camera rejected the delete }
+
+  /api/cameras/{camera_id}/presets/{index}/goto:
+    post:
+      tags: [Cameras]
+      summary: Jump the PTZ to a preset by index
+      parameters:
+        - { name: camera_id, in: path, required: true, schema: { type: integer } }
+        - { name: index, in: path, required: true, schema: { type: integer } }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  preset_name: { type: string, nullable: true }
+        "404": { description: Unknown camera }
+        "502": { description: camera rejected the goto }
+
+  # ─── ML: OpenAI vision validator ─────────────────────────────────
+  /api/ml/openai/status:
+    get:
+      tags: [ML]
+      summary: OpenAI validator wiring, model, scenarios, hourly token usage
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  wired: { type: boolean }
+                  enabled: { type: boolean }
+                  configured: { type: boolean }
+                  model: { type: string }
+                  scenarios: { type: array, items: { type: string } }
+                  tokens_used_hour: { type: integer }
+                  tokens_cap_hour: { type: integer }
+                  recent:
+                    type: array
+                    items: { type: object, additionalProperties: true }
+
+  /api/ml/openai/validate/{scenario}:
+    post:
+      tags: [ML]
+      summary: Direct OpenAI vision probe (bypasses confidence/cooldown gating)
+      description: |
+        Multipart `image=` plus any scenario context fields as form keys.
+        Token quota still applies. Scenario must be one listed by
+        `/api/ml/openai/status`.
+      parameters:
+        - { name: scenario, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [image]
+              properties:
+                image: { type: string, format: binary }
+              additionalProperties: { type: string }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  scenario: { type: string }
+                  verdict: { type: string }
+                  category: { type: string }
+                  confidence: { type: number }
+                  summary: { type: string }
+                  model: { type: string }
+                  tokens_used: { type: integer }
+                  should_suppress: { type: boolean }
+                  should_escalate: { type: boolean }
+        "400": { description: unknown scenario or no image }
+        "502": { description: validator error or quota exhausted }
+        "503": { description: validator not enabled }
+
+  # ─── Sensors: AX PRO hub admin + siren (all 503 if hub not wired) ─
+  /api/sensors/hub/state:
+    get:
+      tags: [Sensors]
+      summary: Subsystem + zone snapshot (arming mode, bypass, silent flags)
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  subsystems: { type: array, items: { type: object, additionalProperties: true } }
+                  zones: { type: array, items: { type: object, additionalProperties: true } }
+        "502": { description: hub query failed }
+        "503": { description: AX PRO admin not wired }
+
+  /api/sensors/hub/disarm:
+    post:
+      tags: [Sensors]
+      summary: Disarm one or more subsystems
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                sub_ids: { type: array, items: { type: integer }, default: [1, 2, 3] }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  results: { type: array, items: { type: object, additionalProperties: true } }
+        "503": { description: AX PRO admin not wired }
+
+  /api/sensors/hub/arm-away:
+    post:
+      tags: [Sensors]
+      summary: Arm subsystems Away (disarms first, optional bypass clear)
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                sub_ids: { type: array, items: { type: integer }, default: [1, 2, 3] }
+                clear_bypass: { type: array, items: { type: integer } }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  disarm: { type: array, items: { type: object, additionalProperties: true } }
+                  bypass_recover: { type: array, items: { type: object, additionalProperties: true } }
+                  arm_away: { type: array, items: { type: object, additionalProperties: true } }
+        "503": { description: AX PRO admin not wired }
+
+  /api/sensors/zones/{zone_id}/bypass:
+    post:
+      tags: [Sensors]
+      summary: Bypass a hub zone
+      parameters:
+        - { name: zone_id, in: path, required: true, schema: { type: integer } }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { type: object, properties: { ok: { type: boolean }, payload: { type: object, additionalProperties: true } } }
+        "502": { description: hub rejected (e.g. armedStatus) }
+        "503": { description: AX PRO admin not wired }
+
+  /api/sensors/zones/{zone_id}/unbypass:
+    post:
+      tags: [Sensors]
+      summary: Clear an operational bypass on a hub zone
+      description: |
+        May 502 with `armedStatus` if the parent subsystem is armed — fall
+        back to `/api/sensors/hub/arm-away` with `clear_bypass=[zone_id]`.
+      parameters:
+        - { name: zone_id, in: path, required: true, schema: { type: integer } }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { type: object, properties: { ok: { type: boolean }, payload: { type: object, additionalProperties: true } } }
+        "502": { description: hub rejected (e.g. armedStatus) }
+        "503": { description: AX PRO admin not wired }
+
+  /api/sensors/hub/siren/status:
+    get:
+      tags: [Sensors]
+      summary: Per-siren status (online, signal, battery, tamper)
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { type: object, properties: { ok: { type: boolean }, sirens: { type: array, items: { type: object, additionalProperties: true } } } }
+        "502": { description: hub query failed }
+        "503": { description: AX PRO admin not wired }
+
+  /api/sensors/hub/siren/start:
+    post:
+      tags: [Sensors]
+      summary: Sound the siren (WARNING — real 100+ dB if paired)
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { type: object, properties: { sub_id: { type: integer, default: 1 } } }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { type: object, properties: { ok: { type: boolean }, payload: { type: object, additionalProperties: true } } }
+        "502": { description: hub rejected }
+        "503": { description: AX PRO admin not wired }
+
+  /api/sensors/hub/siren/stop:
+    post:
+      tags: [Sensors]
+      summary: Silence the siren
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { type: object, properties: { sub_id: { type: integer, default: 1 } } }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { type: object, properties: { ok: { type: boolean }, payload: { type: object, additionalProperties: true } } }
+        "502": { description: hub rejected }
+        "503": { description: AX PRO admin not wired }
+
+  /api/sensors/hub/siren/test:
+    post:
+      tags: [Sensors]
+      summary: Self-clearing siren burst (start, wait, stop)
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                sub_id: { type: integer, default: 1 }
+                duration_s: { type: number, default: 2.0, maximum: 10 }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { type: object, properties: { ok: { type: boolean }, payload: { type: object, additionalProperties: true } } }
+        "502": { description: hub rejected }
+        "503": { description: AX PRO admin not wired }
+
+  # ─── Webhooks (outbound push subscriptions) ──────────────────────
+  /api/webhooks/event-kinds:
+    get:
+      tags: [Webhooks]
+      summary: List the event kinds a subscriber can filter on
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  kinds:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        name: { type: string }
+                        description: { type: string }
+
+  /api/webhooks/subscribers:
+    get:
+      tags: [Webhooks]
+      summary: List subscribers (secrets omitted)
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  subscribers: { type: array, items: { $ref: "#/components/schemas/WebhookSubscriber" } }
+        "503": { description: webhooks not wired }
+    post:
+      tags: [Webhooks]
+      summary: Create a subscriber (secret returned ONCE in this response)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [url]
+              properties:
+                url: { type: string, description: "must start with http:// or https://" }
+                event_filter: { type: array, items: { type: string }, default: ["*"] }
+                description: { type: string }
+                enabled: { type: boolean, default: true }
+                secret: { type: string, description: "auto-generated if omitted" }
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  subscriber:
+                    allOf:
+                      - { $ref: "#/components/schemas/WebhookSubscriber" }
+                      - type: object
+                        properties: { secret: { type: string } }
+        "400": { description: bad url or unknown event kind }
+        "503": { description: webhooks not wired }
+
+  /api/webhooks/subscribers/{sub_id}:
+    get:
+      tags: [Webhooks]
+      summary: Get one subscriber (secret omitted)
+      parameters:
+        - { name: sub_id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { type: object, properties: { ok: { type: boolean }, subscriber: { $ref: "#/components/schemas/WebhookSubscriber" } } }
+        "404": { description: not found }
+        "503": { description: webhooks not wired }
+    patch:
+      tags: [Webhooks]
+      summary: Update url / event_filter / description / enabled / secret
+      parameters:
+        - { name: sub_id, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                url: { type: string }
+                event_filter: { type: array, items: { type: string } }
+                description: { type: string }
+                enabled: { type: boolean }
+                secret: { type: string }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { type: object, properties: { ok: { type: boolean }, subscriber: { $ref: "#/components/schemas/WebhookSubscriber" } } }
+        "400": { description: bad url or unknown event kind }
+        "404": { description: not found }
+        "503": { description: webhooks not wired }
+    delete:
+      tags: [Webhooks]
+      summary: Delete a subscriber
+      parameters:
+        - { name: sub_id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { type: object, properties: { ok: { type: boolean }, removed: { type: boolean } } }
+        "503": { description: webhooks not wired }
+
+  /api/webhooks/subscribers/{sub_id}/test:
+    post:
+      tags: [Webhooks]
+      summary: Queue a synthetic test delivery to one subscriber
+      parameters:
+        - { name: sub_id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { type: object, properties: { ok: { type: boolean }, queued: { type: integer } } }
+        "404": { description: subscriber not found or disabled }
+        "503": { description: dispatcher not running }
+
+  /api/webhooks/subscribers/{sub_id}/rotate-secret:
+    post:
+      tags: [Webhooks]
+      summary: Rotate the signing secret (new secret returned ONCE)
+      parameters:
+        - { name: sub_id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  subscriber:
+                    allOf:
+                      - { $ref: "#/components/schemas/WebhookSubscriber" }
+                      - type: object
+                        properties: { secret: { type: string } }
+        "404": { description: not found }
+        "503": { description: webhooks not wired }
+
+  /api/webhooks/deliveries:
+    get:
+      tags: [Webhooks]
+      summary: Recent delivery attempts (optionally filtered by subscriber)
+      parameters:
+        - { name: subscriber_id, in: query, required: false, schema: { type: string } }
+        - { name: limit, in: query, required: false, schema: { type: integer, default: 50 } }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  deliveries: { type: array, items: { type: object, additionalProperties: true } }
+        "503": { description: webhooks not wired }
+
+  # ─── Sensors: AX PRO calibration wizard + zone admin ─────────────
+  /api/sensors/listener/zones:
+    get:
+      tags: [Sensors]
+      summary: Diagnostic dump — raw hub zone payload + cached edge state
+      description: |
+        Use when a real sensor activates but nothing reaches the events
+        feed: compare `raw.ZoneList[...]` against `edge_state` to see if the
+        field name the listener reads matches this firmware's output.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  wired: { type: boolean }
+                  connected: { type: boolean }
+                  edge_state: { type: object, additionalProperties: true }
+                  raw: { type: object, additionalProperties: true }
+
+  /api/sensors/zones/{zone_id}/config:
+    get:
+      tags: [Sensors]
+      summary: Read a hub zone's configuration
+      parameters:
+        - { name: zone_id, in: path, required: true, schema: { type: integer } }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { type: object, properties: { ok: { type: boolean }, config: { type: object, additionalProperties: true } } }
+        "502": { description: hub query failed }
+        "503": { description: AX PRO admin not wired }
+    patch:
+      tags: [Sensors]
+      summary: Set a single zone-config key (e.g. armNoBypassEnabled)
+      parameters:
+        - { name: zone_id, in: path, required: true, schema: { type: integer } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [key, value]
+              properties:
+                key: { type: string, example: armNoBypassEnabled }
+                value: {}
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { type: object, properties: { ok: { type: boolean }, payload: { type: object, additionalProperties: true } } }
+        "400": { description: missing key or value }
+        "502": { description: hub rejected (e.g. armed) }
+        "503": { description: AX PRO admin not wired }
+
+  /api/sensors/zones/{zone_id}/silent:
+    post:
+      tags: [Sensors]
+      summary: Toggle a zone 'silent' (hub reports alarm but doesn't sound its siren)
+      description: |
+        ITIPS sounds the siren after evaluation instead. The silent flag
+        persists once set. Rejected with a `hint` if the subsystem is armed.
+      parameters:
+        - { name: zone_id, in: path, required: true, schema: { type: integer } }
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { type: object, properties: { silent: { type: boolean, default: true } } }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  zone_id: { type: integer }
+                  silent: { type: boolean }
+                  payload: { type: object, additionalProperties: true }
+        "502": { description: hub rejected (carries an actionable hint if armed) }
+        "503": { description: AX PRO admin not wired }
+
+  /api/sensors/hub/silence-mapped:
+    post:
+      tags: [Sensors]
+      summary: Set silent on every zone that has a sensor→camera binding
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { type: object, properties: { silent: { type: boolean, default: true } } }
+      responses:
+        "200":
+          description: OK (per-zone results so partial failures are visible)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  silent: { type: boolean }
+                  hint: { type: string, nullable: true }
+                  updated: { type: integer }
+                  total: { type: integer }
+                  results:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        zone_id: { type: integer }
+                        status: { type: string, enum: [ok, error] }
+                        error: { type: string }
+        "503": { description: AX PRO admin or sensor map not wired }
+
+  /api/sensors/zones/{zone_id}/calibrate:
+    post:
+      tags: [Sensors]
+      summary: Atomic save-preset + bind-sensor (calibration wizard)
+      description: |
+        Saves the camera's current PTZ position as a named preset AND binds
+        the hub zone to `(camera, preset)` in one action — the install step
+        operators most often forget to do in two.
+      parameters:
+        - { name: zone_id, in: path, required: true, schema: { type: integer } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [camera_id]
+              properties:
+                camera_id: { type: integer }
+                name: { type: string, description: "preset name; defaults to zone_<id>" }
+                sensor_type: { type: string, example: doorContact }
+                description: { type: string }
+                metadata: { type: object, additionalProperties: true }
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  mapping: { type: object, additionalProperties: true }
+                  preset: { $ref: "#/components/schemas/PresetInfo" }
+        "400": { description: camera_id missing or invalid mapping }
+        "404": { description: unknown camera }
+        "502": { description: saving preset failed }
+        "503": { description: sensor map not wired }
+
+  /api/sensors/zones/{zone_id}/test-pan:
+    post:
+      tags: [Sensors]
+      summary: Pan the bound camera home then to its preset; return a snapshot URL
+      description: |
+        Verifies a sensor binding by making the motion visible (away, then
+        back to the bound preset) and handing back a cache-busted snapshot URL.
+      parameters:
+        - { name: zone_id, in: path, required: true, schema: { type: integer } }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  mapping: { type: object, additionalProperties: true }
+                  snapshot_url: { type: string }
+        "404": { description: zone has no binding }
+        "502": { description: camera not connected or goto failed }
+        "503": { description: sensor map not wired }
+
+  # ─── Activity feed: real-time SSE push ───────────────────────────
+  /api/activity/stream:
+    get:
+      tags: [Activity]
+      summary: SSE push of the raw detection feed (real-time, no polling)
+      description: |
+        Server-sent events. Each `data:` line is one detection entry — the
+        same shape as `/api/activity/recent` items (`seq`, `camera_id`,
+        `kind` = line_crossing | intrusion | loitering | sensor, `label`,
+        `zone_id`, `zone_name`, `detail`, `status`, `source`, `ts`). The
+        buffer is replayed once on connect, then new entries stream as they
+        happen. Subscribe with `new EventSource("/api/activity/stream")`.
+        The same detections are also pushed to webhook subscribers as
+        `activity.detection`.
+      responses:
+        "200":
+          description: SSE stream
+          content:
+            text/event-stream: {}
+        "503": { description: activity tap not wired }
+
 components:
   securitySchemes:
     bearerAuth:
@@ -1023,10 +2035,60 @@ components:
           items: { type: integer }
           description: Defaults to every active camera.
 
+    CaptureFile:
+      type: object
+      properties:
+        filename:
+          type: string
+          description: Path relative to storage_path, e.g. face_captures/0.jpg — pass to /api/incidents/{id}/files/{filename}.
+        bytes: { type: integer }
+
+    IncidentDetail:
+      type: object
+      properties:
+        incident_id: { type: string }
+        storage_path:
+          type: string
+          description: Absolute path of the signed evidence package on the Jetson NVMe.
+        metadata:
+          type: object
+          additionalProperties: true
+          nullable: true
+          description: incident_metadata.json — classification, GPS, dispatch log, etc.
+        manifest:
+          type: object
+          additionalProperties: true
+          nullable: true
+          description: manifest.json — the signed list of files with per-file SHA-256.
+        signature:
+          type: object
+          additionalProperties: true
+          nullable: true
+          description: signature.sha256 — manifest_hash + HMAC signature.
+        files:
+          type: array
+          items: { type: string }
+          description: Every file in the package, relative to storage_path.
+        face_captures: { type: array, items: { $ref: "#/components/schemas/CaptureFile" } }
+        plate_captures: { type: array, items: { $ref: "#/components/schemas/CaptureFile" } }
+        sensor_captures: { type: array, items: { $ref: "#/components/schemas/CaptureFile" } }
+        video_files:
+          type: array
+          items: { type: string }
+          description: Evidence clip filenames (manifest kind video_*).
+        has_pdf: { type: boolean }
+        has_highlight: { type: boolean }
+        manifest_kinds:
+          type: array
+          items: { type: string }
+
     IncidentSummary:
       type: object
       properties:
         incident_id: { type: string }
+        storage_path:
+          type: string
+          description: Absolute path of the evidence package on the Jetson NVMe.
         site_id: { type: string, nullable: true }
         operator_id: { type: string, nullable: true }
         device_id: { type: string, nullable: true }
@@ -1394,3 +2456,18 @@ components:
           items: { $ref: "#/components/schemas/BehaviorAlert" }
         dispatched: { type: integer,
                        description: "count of alerts routed to AlertEngine" }
+
+    WebhookSubscriber:
+      type: object
+      properties:
+        id: { type: string }
+        url: { type: string }
+        event_filter: { type: array, items: { type: string } }
+        description: { type: string }
+        enabled: { type: boolean }
+        created_at: { type: string }
+        updated_at: { type: string }
+        last_status: { type: string, nullable: true }
+        last_error: { type: string, nullable: true }
+        last_delivered_at: { type: string, nullable: true }
+        consecutive_failures: { type: integer }
