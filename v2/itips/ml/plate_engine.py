@@ -49,7 +49,7 @@ class PlateEngine:
         self,
         *,
         min_confidence: float = 0.4,
-        use_gpu: bool = True,
+        use_gpu: bool = False,
         lang: str = "en",
     ) -> None:
         self._min_confidence = float(min_confidence)

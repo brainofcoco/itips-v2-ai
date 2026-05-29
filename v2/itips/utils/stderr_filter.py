@@ -35,7 +35,7 @@ _DEFAULT_DROP_SUBSTRINGS: tuple[bytes, ...] = (
     # segments that decode fine but trigger this warning on every frame.
     b"Corrupt JPEG data",
     # PaddlePaddle: cosmetic warning about ccache not being installed
-    # inside the container — same message every cold start of EasyOCR.
+    # inside the container — same message on every PaddleOCR cold start.
     b"No ccache found",
 )
 

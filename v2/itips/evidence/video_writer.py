@@ -1,16 +1,16 @@
 """Video writer abstraction — H.265 via ffmpeg, falls back to cv2/mp4v.
 
-PRD §4.3 REQ-EV-01 mandates H.265 for evidence clips. Default encoder
-is libx265 (CPU); operator sets ITIPS_VIDEO_ENCODER=hevc_nvenc on
-Jetson to use NVENC hardware HEVC instead. If ffmpeg isn't on PATH at
-all, we degrade to cv2/mp4v (H.264) with a loud warning — the package
-still seals and signs, just doesn't meet the codec spec.
+PRD §4.3 REQ-EV-01 mandates H.265. Default encoder is libx265 (CPU),
+which works on Mac and Jetson alike. The `*_nvenc` encoders target
+discrete NVIDIA GPUs only — Jetson/Tegra hardware encode runs through
+GStreamer (nvv4l2h265enc), not ffmpeg NVENC, so the Jetson stays on
+libx265. If ffmpeg isn't on PATH we degrade to cv2/mp4v (H.264) with a
+loud warning — the package still seals and signs, just off-spec codec.
 """
 
 from __future__ import annotations
 
 import logging
-import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -19,6 +19,8 @@ from typing import Optional
 import cv2
 import numpy as np
 
+from config.settings import settings
+
 logger = logging.getLogger(__name__)
 
 
@@ -26,10 +28,10 @@ def open_writer(path: Path, fps: float, size: tuple[int, int],
                 *, encoder: Optional[str] = None):
     """Return a writer with cv2-compatible .write() / .release() / .isOpened().
 
-    `encoder` overrides the default (env `ITIPS_VIDEO_ENCODER`, else libx265).
+    `encoder` overrides the default (`settings.ml.video_encoder`, else libx265).
     Pass `libx264` for clips that must play in a browser `<video>` — HEVC/MP4
     won't decode in Chrome/Firefox."""
-    enc = encoder or os.environ.get("ITIPS_VIDEO_ENCODER", "libx265")
+    enc = encoder or settings.ml.video_encoder
     if _ffmpeg_available():
         try:
             return _FfmpegWriter(path, fps=fps, size=size, encoder=enc)

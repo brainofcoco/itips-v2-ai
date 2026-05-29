@@ -8,7 +8,10 @@ DOCKER ?= docker
 COMPOSE ?= docker compose
 PYTHON ?= python3
 
-.PHONY: help install build up down logs restart shell ps test lint fmt typecheck check clean fresh \
+COMPOSE_JETSON ?= $(COMPOSE) -f docker-compose.yml -f docker-compose.jetson.yml
+
+.PHONY: help install build build-ml up down logs restart shell ps test lint fmt typecheck check clean fresh \
+        build-jetson up-jetson logs-jetson \
         dash-up dash-build dash-down dash-logs dash-dev
 
 help:  ## Show available targets
@@ -18,10 +21,13 @@ help:  ## Show available targets
 install:  ## Install Python deps locally (dev only, not needed for docker)
 	$(PYTHON) -m pip install -e ".[dev]"
 
-build:  ## Build the docker image
+build:  ## Build the lightweight core image (no ML, no GPU)
 	$(COMPOSE) build
 
-up:  ## Start the container (works on Mac and Jetson identically)
+build-ml:  ## Build the CPU ML image for Mac/x86 validation
+	$(DOCKER) build --target ml-cpu -t itips/edge:2.1.0-ml .
+
+up:  ## Start the core container (Mac/lab)
 	@mkdir -p ./var ./evidence_store
 	$(COMPOSE) up -d
 	@echo ""
@@ -29,6 +35,19 @@ up:  ## Start the container (works on Mac and Jetson identically)
 	@echo "  API docs:   http://localhost:5050/docs"
 	@echo "  Inbound:    http://localhost:8443/docs (bearer required)"
 	@echo ""
+
+build-jetson:  ## Build the Jetson GPU image (run on the Jetson)
+	$(COMPOSE_JETSON) build
+
+up-jetson:  ## Start the Jetson GPU stack (run on the Jetson)
+	@mkdir -p ./var ./evidence_store
+	$(COMPOSE_JETSON) up -d
+	@echo ""
+	@echo "  Dashboard:  http://localhost:5050/dashboard"
+	@echo ""
+
+logs-jetson:  ## Follow Jetson container logs
+	$(COMPOSE_JETSON) logs -f --tail=200 itips
 
 down:  ## Stop the container
 	$(COMPOSE) down

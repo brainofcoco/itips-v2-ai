@@ -62,14 +62,19 @@ class FaceEngine:
         *,
         similarity_threshold: float = 0.35,
         det_size: tuple[int, int] = (640, 640),
+        use_gpu: bool = False,
         providers: Optional[list[str]] = None,
     ) -> None:
         self._store = embedding_store
         self._threshold = float(similarity_threshold)
         self._det_size = det_size
-        # CUDAExecutionProvider first; ONNX runtime will silently
-        # fall back to CPU if CUDA isn't available on the host.
-        self._providers = providers or ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        # CPU-only unless GPU is requested — probing CUDA on a CPU host
+        # logs a confusing "provider not available" miss on every boot.
+        default = (
+            ["CUDAExecutionProvider", "CPUExecutionProvider"]
+            if use_gpu else ["CPUExecutionProvider"]
+        )
+        self._providers = providers or default
         self._app = None
         self._init_lock = threading.Lock()
         self._warmup_thread: Optional[threading.Thread] = None

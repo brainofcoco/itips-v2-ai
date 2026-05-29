@@ -28,31 +28,20 @@ dev = [
     "mypy==1.11.2",
     "freezegun==1.5.1",
 ]
-# Jetson-side ML fallback layer. Optional — the v2 runtime works
-# without these; the engines raise *EngineUnavailable on first use
-# and the event worker degrades to the native-only path.
-#
-# Jetson deploy notes:
-#   * replace `onnxruntime` with the JetPack-matched `onnxruntime-gpu`
-#     wheel (built against L4T) at install time;
-#   * `easyocr` pulls `torch` — use the NVIDIA-published torch wheel
-#     for the Jetson's JetPack version, not the generic PyPI build.
+# ML fallback layer (CPU). Optional — the v2 runtime works without these;
+# engines raise *EngineUnavailable on first use and degrade to the native
+# path. For the Jetson GPU build see Dockerfile.jetson (L4T torch +
+# onnxruntime-gpu); torch here is installed CPU-only via the Dockerfile.
 ml = [
     "insightface==0.7.3",
     "onnxruntime>=1.16,<2",
-    # insightface pulls `onnx` transitively but pins nothing, so the
-    # resolver grabs a release whose compiled extension mismatches the
-    # protobuf paddlepaddle caps us at — `import onnx` then dies with
-    # "partially initialized module 'onnx' has no attribute 'defs'
-    # (circular import)", which crashes the whole face engine. Pin both
+    # insightface leaves onnx unpinned; the resolver's pick mismatches the
+    # protobuf paddlepaddle caps us at and crashes `import onnx`. Pin both
     # to a coherent, known-good pair.
     "onnx==1.16.1",
     "protobuf==3.20.2",
-    # PaddleOCR + PaddlePaddle for the plate-OCR fallback. Pinned to
-    # the 2.x line for a stable `ocr()` API; bump to 3.x only when
-    # we've validated the new `predict()` shape downstream.
-    # Jetson swap: replace `paddlepaddle` with the NVIDIA-published
-    # JetPack-matched wheel; `paddleocr` itself is pure Python.
+    # PaddleOCR + PaddlePaddle for the plate-OCR fallback. Pinned to the
+    # 2.x line for a stable `ocr()` API; 3.x changes the result shape.
     "paddleocr>=2.10,<3",
     "paddlepaddle>=2.6,<4",
     "ultralytics>=8.2,<9",

@@ -12,9 +12,12 @@ Dahua HTTP API.
 
 ## Run it locally on your Mac, against real cameras
 
-The Docker image is small (~280 MB), multi-arch, and has no GPU
-dependency. The same image builds on a Mac for live validation and on
-the Jetson for production.
+The default (`core`) Docker image is ~1 GB (ffmpeg + OpenCV dominate),
+multi-arch, and has no GPU or ML dependency — built for Mac/lab live
+validation against real cameras. Production on the Jetson uses a separate
+GPU build (`make build-jetson`, `Dockerfile.jetson`) that adds the ML
+fallback layer on CUDA/TensorRT. See `DEPLOY.md §0` for the three image
+shapes.
 
 ### 1. One-time setup
 

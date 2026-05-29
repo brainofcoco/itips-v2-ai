@@ -1,0 +1,90 @@
+# ITIPS V2.1 — Jetson (JetPack 6.x / L4T r36.x) production image.
+#
+# GPU-accelerated build. The L4T base ships CUDA + cuDNN + TensorRT and an
+# L4T-native torch/torchvision, so torch is NOT installed from PyPI here.
+# Same Python code as the x86 image — only the native wheels differ.
+#
+# Pin the base tag and the onnxruntime-gpu wheel to YOUR flashed JetPack.
+# Defaults target JetPack 6.0 (L4T r36.2). Override without editing:
+#   docker build -f Dockerfile.jetson \
+#     --build-arg L4T_BASE=nvcr.io/nvidia/l4t-pytorch:<your-tag> .
+
+ARG L4T_BASE=nvcr.io/nvidia/l4t-pytorch:r36.2.0-pth2.2-py3
+FROM ${L4T_BASE} AS jetson
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPATH=/app \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libgl1 libglib2.0-0 libgomp1 \
+        curl ca-certificates tini ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Core runtime. torch/torchvision come from the L4T base, not pip.
+RUN pip install --no-cache-dir \
+        "numpy<2" \
+        flask==3.0.3 werkzeug==3.0.3 \
+        python-dotenv==1.0.1 \
+        requests==2.32.3 \
+        pydantic==2.8.2 \
+        pyyaml==6.0.2 \
+        opencv-python-headless==4.10.0.84 \
+        pillow==10.4.0 \
+        "reportlab>=4.0,<5"
+
+# GPU ONNX Runtime — must match the flashed JetPack/CUDA. NVIDIA publishes
+# Jetson wheels at jetson-ai-lab; override ORT_GPU_WHEEL with the wheel URL
+# for your JetPack if the plain package doesn't resolve a GPU build.
+ARG ORT_GPU_WHEEL=onnxruntime-gpu
+RUN pip install --no-cache-dir "${ORT_GPU_WHEEL}"
+
+# Rest of the ML stack. paddlepaddle stays CPU: NVIDIA ships no official
+# Jetson paddle-gpu wheel, and plate OCR is a low-frequency fallback, so
+# CPU is the reliable choice. onnx/protobuf pinned to a coherent pair.
+RUN pip install --no-cache-dir \
+        "insightface==0.7.3" \
+        "onnx==1.16.1" \
+        "protobuf==3.20.2" \
+        "paddleocr>=2.10,<3" \
+        "paddlepaddle>=2.6,<4" \
+        "ultralytics>=8.2,<9" \
+        "hikaxpro>=2.0" \
+        "openai>=1.40,<2"
+
+COPY pyproject.toml ./
+COPY itips/ ./itips/
+COPY config/ ./config/
+COPY openapi/ ./openapi/
+
+# ML weight caches → mounted /opt/itips/models volume (survives restarts).
+ENV INSIGHTFACE_HOME=/opt/itips/models/insightface \
+    PADDLEOCR_HOME=/opt/itips/models/paddleocr \
+    YOLO_CONFIG_DIR=/opt/itips/models/yolo \
+    TORCH_HOME=/opt/itips/models/torch \
+    HF_HOME=/opt/itips/models/huggingface
+
+RUN useradd --uid 1000 --create-home --shell /bin/bash itips \
+    && mkdir -p /opt/itips/var \
+                /opt/itips/evidence_store \
+                /opt/itips/models/insightface \
+                /opt/itips/models/paddleocr \
+                /opt/itips/models/yolo \
+                /opt/itips/models/torch \
+                /opt/itips/models/huggingface \
+    && ln -s /opt/itips/models/paddleocr /home/itips/.paddleocr \
+    && chown -R itips:itips /opt/itips /app /home/itips/.paddleocr
+USER itips
+
+EXPOSE 5050 8443
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD curl -fsS http://localhost:5050/health || exit 1
+
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["python3", "-m", "itips"]

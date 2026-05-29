@@ -59,7 +59,8 @@ class IntakeWriter(threading.Thread):
         self._batch_size = batch_size
         self._flush_ms = flush_ms
         self._inbox: "queue.Queue[IntakePacket]" = queue.Queue(maxsize=10_000)
-        self._stop = threading.Event()
+        # Not `_stop`: that name shadows threading.Thread._stop() and breaks join().
+        self._stop_event = threading.Event()
         self._db: sqlite3.Connection | None = None
 
     # ─── public surface ────────────────────────────────────────────
@@ -97,7 +98,7 @@ class IntakeWriter(threading.Thread):
         self.enqueue(packet)
 
     def stop(self) -> None:
-        self._stop.set()
+        self._stop_event.set()
 
     # ─── thread body ───────────────────────────────────────────────
 
@@ -111,14 +112,14 @@ class IntakeWriter(threading.Thread):
         logger.info("Intake writer ready at %s", self._db_path)
 
         batch: list[IntakePacket] = []
-        while not self._stop.is_set() or not self._inbox.empty() or batch:
+        while not self._stop_event.is_set() or not self._inbox.empty() or batch:
             try:
                 packet = self._inbox.get(timeout=self._flush_ms / 1000)
                 batch.append(packet)
             except queue.Empty:
                 pass
 
-            if batch and (len(batch) >= self._batch_size or self._stop.is_set() or self._inbox.empty()):
+            if batch and (len(batch) >= self._batch_size or self._stop_event.is_set() or self._inbox.empty()):
                 self._flush(batch)
                 batch = []
 

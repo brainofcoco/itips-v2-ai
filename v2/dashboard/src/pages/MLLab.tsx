@@ -322,7 +322,7 @@ function PlateLab(props: { cameras: Camera[]; dispatch: boolean; onRunDone: () =
   return (
     <FileLab
       title="Plate read"
-      helpText="EasyOCR against the chosen image. Returns plate text + per-character confidence."
+      helpText="PaddleOCR against the chosen image. Returns plate text + per-character confidence."
       cameras={props.cameras}
       dispatch={props.dispatch}
       run={async (file, camId) => {

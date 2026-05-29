@@ -6,7 +6,7 @@ PlateEngine + CapabilityRouter to confirm the dispatcher routes a
 read plate through the same `handle_plate_capture` path that the
 native TrafficCarMeasurement event uses.
 
-No EasyOCR, no Dahua. Pure routing test.
+No PaddleOCR, no Dahua. Pure routing test.
 """
 
 from __future__ import annotations

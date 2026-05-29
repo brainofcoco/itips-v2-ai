@@ -40,7 +40,9 @@ class ObjectDetector:
         device: Optional[str] = None,
     ) -> None:
         import os
-        self._model_name = model_name
+        # On the Jetson, point this at a TensorRT FP16 .engine (faster +
+        # lower memory) exported via scripts/export_yolo_tensorrt.sh.
+        self._model_name = os.environ.get("ITIPS_BEHAVIOR_MODEL") or model_name
         # Confidence floor and inference resolution. The cameras feed 4K
         # (3840×2160) frames; at YOLO's default imgsz=640 a 4K frame is
         # downscaled ~6× and mid-distance road objects shrink below the

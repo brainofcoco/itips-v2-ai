@@ -663,33 +663,39 @@ def _build_ml_layer(*, embedding_db_path, zones_path,
         return state
 
     state.router = CapabilityRouter(overrides_path=overrides_path)
+    ml = settings.ml
 
-    # Face fallback — InsightFace SCRFD+ArcFace.
+    # Face recognition — InsightFace SCRFD+ArcFace. Always loaded:
+    # recognition is ML-only and the ThreatEvaluator depends on it.
     try:
         state.embedding_store = EmbeddingStore(db_path=embedding_db_path)
-        state.face_engine = FaceEngine(embedding_store=state.embedding_store)
+        state.face_engine = FaceEngine(
+            embedding_store=state.embedding_store, use_gpu=ml.use_gpu,
+        )
         state.face_engine.warmup_async()  # lazy; never blocks boot
     except Exception:
-        logger.exception("face fallback disabled (will degrade to bare bbox)")
+        logger.exception("face engine init failed (will degrade to bare bbox)")
 
-    # ANPR fallback — EasyOCR.
-    try:
-        state.plate_engine = PlateEngine()
-        state.plate_engine.warmup_async()
-    except Exception:
-        logger.exception("plate fallback disabled (will degrade to log-only)")
+    # ANPR fallback — PaddleOCR.
+    if ml.plate_fallback:
+        try:
+            state.plate_engine = PlateEngine(use_gpu=ml.use_gpu)
+            state.plate_engine.warmup_async()
+        except Exception:
+            logger.exception("plate fallback disabled (will degrade to log-only)")
 
     # Behavior fallback — YOLOv8 + IoU tracker + zone polygons.
-    try:
-        state.zone_store = ZoneStore(path=zones_path)
-        state.object_detector = ObjectDetector()
-        state.behavior_engine = BehaviorEngine(
-            zone_store=state.zone_store,
-            object_detector=state.object_detector,
-            preset_state=preset_state,
-        )
-        state.behavior_engine.warmup_async()
-    except Exception:
-        logger.exception("behavior fallback disabled (will degrade to motion-only)")
+    if ml.behavior_fallback:
+        try:
+            state.zone_store = ZoneStore(path=zones_path)
+            state.object_detector = ObjectDetector()
+            state.behavior_engine = BehaviorEngine(
+                zone_store=state.zone_store,
+                object_detector=state.object_detector,
+                preset_state=preset_state,
+            )
+            state.behavior_engine.warmup_async()
+        except Exception:
+            logger.exception("behavior fallback disabled (will degrade to motion-only)")
 
     return state

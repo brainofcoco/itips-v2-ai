@@ -145,6 +145,24 @@ class WebhookConfig:
 
 
 @dataclass(frozen=True)
+class MLConfig:
+    """ML engine config — GPU selection and the optional fallback toggles.
+
+    `use_gpu` is off by default so Mac/CPU boots pick CPU-only providers
+    instead of probing CUDA and logging misses that look like failures;
+    the Jetson compose override sets it true. The face engine is always
+    loaded (recognition is ML-only and the ThreatEvaluator depends on it).
+    Plate/behavior are genuine per-camera fallbacks — a site can disable
+    one it never needs to stay inside the Orin Nano's 8 GB unified memory.
+    """
+
+    use_gpu: bool = field(default_factory=lambda: _env_bool("ITIPS_USE_GPU", False))
+    video_encoder: str = field(default_factory=lambda: _env("ITIPS_VIDEO_ENCODER", "libx265"))
+    plate_fallback: bool = field(default_factory=lambda: _env_bool("ITIPS_PLATE_FALLBACK_ENABLED", True))
+    behavior_fallback: bool = field(default_factory=lambda: _env_bool("ITIPS_BEHAVIOR_FALLBACK_ENABLED", True))
+
+
+@dataclass(frozen=True)
 class ApiConfig:
     public_host: str = field(default_factory=lambda: _env("ITIPS_PUBLIC_API_HOST", "0.0.0.0"))
     public_port: int = field(default_factory=lambda: _env_int("ITIPS_PUBLIC_API_PORT", 5050))
@@ -171,6 +189,7 @@ class Settings:
     api: ApiConfig = field(default_factory=ApiConfig)
     webhooks: WebhookConfig = field(default_factory=WebhookConfig)
     threat_evaluator: ThreatEvaluatorConfig = field(default_factory=ThreatEvaluatorConfig)
+    ml: MLConfig = field(default_factory=MLConfig)
 
 
 # Singleton — components import this, never re-instantiate.

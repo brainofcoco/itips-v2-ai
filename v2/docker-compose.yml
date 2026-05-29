@@ -1,60 +1,39 @@
 # ITIPS V2.1 — Dahua-native edge node.
 #
-# Same compose works on a Mac (for validating against real cameras over
-# the LAN before Jetson rollout) and on the Jetson at a site.
+# This base file builds the lightweight `core` image (no ML, no GPU) and
+# runs the same on Mac (validating against real cameras over the LAN) and
+# on a Jetson. For GPU-accelerated ML on the Jetson, layer the override:
+#   docker compose -f docker-compose.yml -f docker-compose.jetson.yml up -d
+# (or `make up-jetson`). For CPU ML validation on a Mac, `make build-ml`.
 #
-# Networking:
-#   - The container reaches your cameras outbound (192.168.x.x) through the
-#     normal Docker bridge — works on Mac Docker Desktop without host-mode.
-#   - Ports 5050 (dashboard) and 8443 (inbound API) are mapped to the host
-#     so you can open http://localhost:5050/dashboard in your Mac browser.
-#
-# Storage:
-#   - ./var/            → /opt/itips/var/            (intake.sqlite, logs, personnel.sqlite)
-#   - ./evidence_store/ → /opt/itips/evidence_store/ (signed incident packages)
-#   - ./models/         → /opt/itips/models/         (InsightFace / EasyOCR / YOLO / torch caches)
-#   The dirs are created on first `up`. Inspect them on the host.
-#
-# Memory:
-#   mem_limit is sized for the ML fallback layer loaded into CPU RAM
-#   (Mac dev). On the Jetson, models live in GPU memory so the host
-#   side stays lower — but the limit applies to the container's RSS
-#   so leave it generous.
+# Ports 5050 (dashboard) and 8443 (inbound API) map to the host.
+# Host dirs ./var and ./evidence_store persist intake/logs and signed
+# evidence; model caches live in the itips-models named volume.
 
 services:
   itips:
     build:
       context: .
       dockerfile: Dockerfile
+      target: core
     image: itips/edge:2.1.0
     container_name: itips
     restart: unless-stopped
     env_file:
       - .env
     ports:
-      - "5050:5050"   # dashboard + Test Console
-      - "8443:8443"   # backend → Jetson inbound API
+      - "5050:5050"
+      - "8443:8443"
     volumes:
       - ./var:/opt/itips/var
       - ./evidence_store:/opt/itips/evidence_store
-      # Persist ML model caches across restarts. First container start
-      # downloads ~500 MB of weights (InsightFace buffalo_l, EasyOCR
-      # detector + recognizer, YOLOv8n) into this volume; subsequent
-      # starts are instant. Named volume (not a host bind mount) so
-      # Docker initialises the directory with the container user's
-      # uid:gid — a bind mount would clash with the host's owner and
-      # leave the dirs unwritable, forcing repeated re-downloads.
+      # Named volume (not a bind mount) so Docker initialises it with the
+      # container user's uid:gid — a bind mount clashes with the host owner
+      # and leaves the model cache unwritable, forcing re-downloads.
       - itips-models:/opt/itips/models
-    # tmpfs for transient frame copies — keeps SD/NVMe wear down.
     tmpfs:
       - /tmp:size=128m
-    # The three CPU ML engines (InsightFace buffalo_l + EasyOCR + YOLO)
-    # plus onnxruntime/torch and frame buffers sit at ~3.9 GiB resident.
-    # At a 4 GiB cap the first inference spike pushes against the limit,
-    # the kernel stalls reclaiming, and nginx sees the upstream go quiet
-    # → intermittent 502 on the first ML call. 6 GiB leaves headroom for
-    # the load spike. On a Mac, raise the Docker Desktop VM memory
-    # (Settings → Resources) above 8 GiB and you can push this to 8g.
+    # Mac default. The Jetson override drops this to fit 8 GB unified RAM.
     mem_limit: 8g
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:5050/health"]
@@ -62,26 +41,9 @@ services:
       timeout: 5s
       start_period: 10s
       retries: 3
-    # ─── Jetson GPU access ───────────────────────────────────────────
-    # Uncomment on the Jetson so the ML engines actually use CUDA.
-    # Requires the NVIDIA Container Toolkit (preinstalled on JetPack)
-    # and that the base image and the torch / onnxruntime wheels were
-    # swapped to JetPack-matched builds in the Dockerfile.
-    #
-    # runtime: nvidia
-    # deploy:
-    #   resources:
-    #     reservations:
-    #       devices:
-    #         - driver: nvidia
-    #           count: all
-    #           capabilities: [gpu]
 
-  # ─── Vite/React dashboard — opt-in via the `dev` compose profile ───
-  # Mac + lab use:  COMPOSE_PROFILES=dev make up  (or `docker compose --profile dev up`)
-  # Jetson prod:    plain `make up` — this service never starts and its
-  #                 image is never built, so no frontend bytes ship to
-  #                 the edge.
+  # Vite/React dashboard — opt-in via the `dev` profile (never starts on
+  # the Jetson). Mac/lab: `COMPOSE_PROFILES=dev make up`.
   dashboard:
     profiles: ["dev"]
     build:
@@ -96,8 +58,4 @@ services:
       - itips
 
 volumes:
-  # Named volume — Docker manages perms so the container user (uid 1000)
-  # can write to it. Inspect contents from the host via:
-  #   docker run --rm -v itips_itips-models:/m alpine ls /m
-  # or wipe with: docker volume rm itips_itips-models
   itips-models:

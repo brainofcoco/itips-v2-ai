@@ -1,0 +1,27 @@
+# Jetson GPU override — layer on top of docker-compose.yml:
+#   docker compose -f docker-compose.yml -f docker-compose.jetson.yml up -d
+# (or `make up-jetson`). Requires the NVIDIA Container Runtime, which is
+# preinstalled on JetPack.
+
+services:
+  itips:
+    build:
+      dockerfile: Dockerfile.jetson
+      # Override the base file's `target: core` — Dockerfile.jetson is
+      # single-stage (`AS jetson`) and has no `core` stage.
+      target: jetson
+    image: itips/edge:2.1.0-jetson
+    # NVIDIA Container Runtime exposes the Tegra GPU to the container.
+    runtime: nvidia
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: all
+      # Engines select CUDA providers / device when this is true.
+      ITIPS_USE_GPU: "true"
+      # Encoder stays libx265 (CPU): Tegra HW encode is GStreamer, not
+      # ffmpeg NVENC. See itips/evidence/video_writer.py.
+      ITIPS_VIDEO_ENCODER: libx265
+    # Orin Nano Super has 8 GB unified CPU+GPU RAM. GPU allocations draw
+    # from the same pool, so cap the container well under 8 GB to leave
+    # headroom for the OS and GPU driver and avoid OOM.
+    mem_limit: 6g

@@ -2,8 +2,18 @@
 
 Audience: the engineer flashing a Jetson and installing it at a tower site.
 
-> Prerequisite reading: `README.md` (what it is), `ARCHITECTURE.md` (how it
-> fits together), `RULE.md` (how we work).
+> Prerequisite reading: `README.md` (what it is), `docs/PRD.md` (requirements),
+> `docs/RULE.md` (how we work).
+
+## 0. Image shapes
+
+One codebase, three builds:
+
+| Shape | Build | Use |
+|---|---|---|
+| **core** (default) | `make build` | Dahua-native only. ~1 GB (ffmpeg + OpenCV), no GPU, no ML. |
+| **ml-cpu** | `make build-ml` | + CPU ML fallback (~3-4 GB). Mac/x86 validation, no GPU. |
+| **jetson** | `make build-jetson` | + GPU ML (L4T torch, onnxruntime-gpu, TensorRT). Production. |
 
 ---
 
@@ -36,12 +46,14 @@ sudo mount /dev/nvme0n1 /opt/itips
 echo "/dev/nvme0n1  /opt/itips  ext4  defaults,nofail  0 2" | sudo tee -a /etc/fstab
 ```
 
-Three directories live on the NVMe and are bind-mounted into the container:
+The container persists three things (see `docker-compose.yml`):
 
-- `/opt/itips/evidence_store` — signed incident packages
-- `/opt/itips/dataset` — enrolled face gallery
-- `/opt/itips/var` — `intake.sqlite`, logs, runtime state
-- `/opt/itips/models` — YOLO + TensorRT engines
+- `./var` → `/opt/itips/var` — `intake.sqlite`, webhooks db, logs, runtime state
+- `./evidence_store` → `/opt/itips/evidence_store` — signed incident packages
+- `itips-models` (named volume) → `/opt/itips/models` — InsightFace / PaddleOCR /
+  YOLO / torch weight caches and the exported TensorRT engine
+
+Clone the repo onto the NVMe so `./var` and `./evidence_store` land there.
 
 ---
 
@@ -82,13 +94,21 @@ The mandatory keys for production:
 
 ### 2.3 Convert the YOLO model to TensorRT (once per Jetson)
 
+Run inside the Jetson container (it needs CUDA/TensorRT + ultralytics):
+
 ```bash
-./scripts/export_yolo_tensorrt.sh
+docker compose -f docker-compose.yml -f docker-compose.jetson.yml \
+  run --rm itips ./scripts/export_yolo_tensorrt.sh
 ```
 
-This downloads `yolo11n.pt`, exports it to `yolo11n.engine` at FP16, and
-places it under `/opt/itips/models/`. The engine is architecture-specific —
-do not copy across machines.
+This exports `yolov8n.pt` to `yolov8n.engine` at FP16 under `/opt/itips/models/`.
+Then point the detector at it by setting in `.env`:
+
+```bash
+ITIPS_BEHAVIOR_MODEL=/opt/itips/models/yolov8n.engine
+```
+
+The engine is architecture-specific — do not copy across machines.
 
 ---
 
@@ -97,31 +117,31 @@ do not copy across machines.
 ### 3.1 Production (on the Jetson)
 
 ```bash
-make build
-make up
-make logs
+make build-jetson
+make up-jetson
+make logs-jetson
 ```
+
+`up-jetson` layers `docker-compose.jetson.yml` over the base: it builds
+`Dockerfile.jetson`, attaches the GPU via the NVIDIA runtime, sets
+`ITIPS_USE_GPU=true`, and caps memory at 6 GB for the 8 GB unified board.
 
 The container exposes:
 
 - `:5050` — MJPEG live feeds, SSE alert stream, evidence retrieval, ops UI
 - `:8443` — inbound backend API (bearer token; mTLS in Phase 1)
 
-### 3.2 Simulation (on a dev laptop, no GPU required)
+### 3.2 Dev laptop (no GPU)
 
 ```bash
-make sim
+make up        # core image, against real cameras over the LAN
+make build-ml  # add the CPU ML layer when validating the fallback engines
 ```
 
-`docker-compose.sim.yml` adds:
-
-- A **MediaMTX** container that serves looped MP4 files as RTSP streams.
-- An **ffmpeg looper** that publishes test footage from `assets/sim/*.mp4`
-  into MediaMTX.
-- The ITIPS container with `ITIPS_SIMULATE=true`, which lets the CUDA guard
-  pass on CPU and uses smaller models.
-
-Drop your own MP4 fixtures into `assets/sim/` to extend the simulation.
+`ITIPS_USE_GPU` stays `false` so the engines run on CPU. To drive the
+pipeline without cameras, the dashboard's **Simulate** button injects sensor
+events; `scripts/simulate_cameras.sh` can publish looped MP4s as RTSP via a
+local MediaMTX if you want live frames.
 
 ---
 
@@ -141,9 +161,10 @@ flags the device as offline.
 
 ## 5. Updates
 
-For POC and Phase 1, updates are done by `make pull && make up`. Zero-touch
-firmware rollout (B5 endpoint) is implemented in V2 but the staged-rollout
-controller lives in the backend Device Management Service.
+For POC and Phase 1, updates are done by `git pull && make build-jetson &&
+make up-jetson` on the Jetson. Zero-touch firmware rollout (B5 endpoint) is
+implemented in V2 but the staged-rollout controller lives in the backend
+Device Management Service.
 
 ---
 
